@@ -822,15 +822,36 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
     }
 
     // Save name to profile + set 7-day trial (profile row created by trigger)
-    // Use admin client here since the user isn't authenticated yet
+    // Retry up to 5 times — trigger may not have created the profile row yet
     if (data.user?.id) {
       const trialEndsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-      await supabase.from('profiles').update({
-        name,
-        subscription_tier: 'iron',
-        subscription_status: 'trial',
-        trial_ends_at: trialEndsAt
-      }).eq('id', data.user.id);
+      let profileSet = false;
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        await new Promise(r => setTimeout(r, 300 * attempt)); // 300ms, 600ms, 900ms...
+        const { data: updated, error: updateErr } = await supabase
+          .from('profiles')
+          .update({
+            name,
+            subscription_tier: 'iron',
+            subscription_status: 'trial',
+            trial_ends_at: trialEndsAt
+          })
+          .eq('id', data.user.id)
+          .select('id')
+          .maybeSingle();
+        if (updated?.id) { profileSet = true; break; }
+        if (attempt === 5) console.error('Profile update failed after 5 attempts:', updateErr?.message);
+      }
+      // If profile row still doesn't exist, upsert it
+      if (!profileSet) {
+        await supabase.from('profiles').upsert({
+          id: data.user.id,
+          name,
+          subscription_tier: 'iron',
+          subscription_status: 'trial',
+          trial_ends_at: trialEndsAt
+        });
+      }
     }
 
     // Return success — user must confirm email before logging in
@@ -2118,7 +2139,7 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
 
     let trialDaysLeft = 0;
     if (status === 'trial' && trialEndsAt) {
-      trialDaysLeft = Math.max(0, Math.floor((new Date(trialEndsAt) - new Date()) / (1000 * 60 * 60 * 24)));
+      trialDaysLeft = Math.max(0, Math.ceil((new Date(trialEndsAt) - new Date()) / (1000 * 60 * 60 * 24)));
     }
 
     const coachUsage = await getCoachUsage(req.user.id);
