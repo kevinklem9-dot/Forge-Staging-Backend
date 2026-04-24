@@ -895,7 +895,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
 
     console.log('Generating plan for:', profile.name, '| goal:', profile.goal, '| injuries:', profile.injuries);
 
-    const language = normalizeLang(req.body?.language);
+    const language = req.body?.language || 'en';
 
     // Fetch MuscleWiki exercise list to inject into prompt
     const mwExercises = await getMuscleWikiExercises();
@@ -970,10 +970,10 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     // Delete any existing plan for this user first (clean slate)
     await supabase.from('plans').delete().eq('user_id', req.user.id);
 
-    // Save to DB
+    // Save to DB — reset translations cache
     const { data, error } = await supabase
       .from('plans')
-      .insert({ user_id: req.user.id, workout_plan: plan.workout, nutrition_plan: plan.nutrition })
+      .insert({ user_id: req.user.id, workout_plan: plan.workout, nutrition_plan: plan.nutrition, translations: {} })
       .select()
       .maybeSingle();
 
@@ -992,72 +992,46 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       is_active: true
     });
 
-    // Mark onboarding complete + persist language preference
-    await supabase.from('profiles')
-      .update({ onboarding_complete: true, preferred_language: language })
-      .eq('id', req.user.id);
+    // Mark onboarding complete
+    await supabase.from('profiles').update({ onboarding_complete: true }).eq('id', req.user.id);
 
     console.log('Plan generated successfully for:', profile.name);
-
-    // Return the plan in the requested language so the frontend can render it
-    // immediately without a follow-up translation round-trip.
-    if (language !== 'en') {
-      try {
-        const translated = await getPlanForLanguage(data, language);
-        return res.json({
-          plan: {
-            ...data,
-            workout_plan: translated.workout_plan,
-            nutrition_plan: translated.nutrition_plan,
-            _language: language
-          }
-        });
-      } catch (e) {
-        console.error('generate-plan translation failed, returning English:', e.message);
-      }
-    }
-    res.json({ plan: { ...data, _language: 'en' } });
+    res.json({ plan: data });
   } catch (err) {
     console.error('Generate plan error:', err.message);
     res.status(500).json({ error: 'Failed to generate plan — please try again', detail: err.message });
   }
 });
 
-// ═══════════════════════════════════════════════════════
-// LANGUAGE — single source of truth
-// ═══════════════════════════════════════════════════════
+// ── TRANSLATE PLAN ─────────────────────────────
+// ── LANGUAGE HELPERS ───────────────────────────────────────────────────────
 const LANG_NAMES = {
-  en: 'English', es: 'Spanish', fr: 'French', de: 'German', it: 'Italian',
-  pt: 'Portuguese', nl: 'Dutch', uk: 'Ukrainian', fi: 'Finnish',
-  ar: 'Arabic', zh: 'Chinese (Simplified)', ja: 'Japanese'
+  es:'Spanish', fr:'French', de:'German', it:'Italian', pt:'Portuguese',
+  nl:'Dutch', uk:'Ukrainian', fi:'Finnish', ar:'Arabic',
+  'zh':'Chinese (Simplified)', ja:'Japanese'
 };
-const SUPPORTED_LANGS = Object.keys(LANG_NAMES);
+const SUPPORTED_LANGS = new Set(['en','es','fr','de','it','pt','nl','uk','fi','ar','zh','ja']);
 
 function normalizeLang(code) {
-  const c = (code || '').toLowerCase().slice(0, 5);
-  return SUPPORTED_LANGS.includes(c) ? c : 'en';
+  if (!code) return 'en';
+  const c = String(code).toLowerCase().trim();
+  return SUPPORTED_LANGS.has(c) ? c : 'en';
 }
 
-// Pure translator: takes English plan objects, returns translated copies.
-// Exercise names stay in English (universal gym terminology).
-async function translatePlanText(workoutPlan, nutritionPlan, language) {
-  const langName = LANG_NAMES[language];
-  if (!langName || language === 'en') {
-    return { workout_plan: workoutPlan, nutrition_plan: nutritionPlan };
-  }
-
+async function translatePlanText(workout, nutrition, lang) {
+  const langName = LANG_NAMES[lang] || lang;
   const toTranslate = {
-    split_name: workoutPlan?.split_name || '',
-    split_description: workoutPlan?.split_description || '',
-    strategy: nutritionPlan?.strategy || '',
-    days: (workoutPlan?.days || []).map(d => ({
+    split_name: workout?.split_name || '',
+    split_description: workout?.split_description || '',
+    strategy: nutrition?.strategy || '',
+    days: (workout?.days || []).map(d => ({
       day_name: d.day_name || '',
       label: d.label || '',
       muscles: d.muscles || [],
       exercise_notes: (d.exercises || []).map(e => e.note || ''),
     })),
-    meal_names: (nutritionPlan?.meals || []).map(m => m.name || ''),
-    food_names: (nutritionPlan?.meals || []).flatMap(m => (m.foods || []).map(f => f.name || '')),
+    meal_names: (nutrition?.meals || []).map(m => m.name || ''),
+    food_names: (nutrition?.meals || []).flatMap(m => (m.foods || []).map(f => f.name || '')),
   };
 
   const prompt = `Translate the following fitness plan text fields from English into ${langName}.
@@ -1080,70 +1054,61 @@ ${JSON.stringify(toTranslate, null, 2)}`;
   const clean = text.replace(/```json\n?|```/g, '').trim();
   const translated = JSON.parse(clean);
 
-  const newPlan = workoutPlan ? JSON.parse(JSON.stringify(workoutPlan)) : null;
-  const newNutrition = nutritionPlan ? JSON.parse(JSON.stringify(nutritionPlan)) : null;
+  // Apply translations back to deep clones
+  const newPlan = JSON.parse(JSON.stringify(workout));
+  const newNutrition = JSON.parse(JSON.stringify(nutrition));
 
-  if (newPlan) {
-    if (translated.split_name) newPlan.split_name = translated.split_name;
-    if (translated.split_description) newPlan.split_description = translated.split_description;
-    (translated.days || []).forEach((td, i) => {
-      if (!newPlan.days?.[i]) return;
-      if (td.day_name) newPlan.days[i].day_name = td.day_name;
-      if (td.label) newPlan.days[i].label = td.label;
-      if (td.muscles?.length) newPlan.days[i].muscles = td.muscles;
-      (td.exercise_notes || []).forEach((note, j) => {
-        if (newPlan.days[i].exercises?.[j] && note) newPlan.days[i].exercises[j].note = note;
-      });
-    });
-  }
+  if (translated.split_name) newPlan.split_name = translated.split_name;
+  if (translated.split_description) newPlan.split_description = translated.split_description;
+  if (translated.strategy && newNutrition) newNutrition.strategy = translated.strategy;
 
-  if (newNutrition) {
-    if (translated.strategy) newNutrition.strategy = translated.strategy;
-    const mealNames = translated.meal_names || [];
-    const foodNames = translated.food_names || [];
-    let foodIdx = 0;
-    (newNutrition.meals || []).forEach((meal, mi) => {
-      if (mealNames[mi]) meal.name = mealNames[mi];
-      (meal.foods || []).forEach(food => {
-        if (foodNames[foodIdx]) food.name = foodNames[foodIdx];
-        foodIdx++;
-      });
+  (translated.days || []).forEach((td, i) => {
+    if (!newPlan.days?.[i]) return;
+    if (td.day_name) newPlan.days[i].day_name = td.day_name;
+    if (td.label) newPlan.days[i].label = td.label;
+    if (td.muscles?.length) newPlan.days[i].muscles = td.muscles;
+    (td.exercise_notes || []).forEach((note, j) => {
+      if (newPlan.days[i].exercises?.[j] && note) newPlan.days[i].exercises[j].note = note;
     });
-  }
+  });
+
+  const mealNames = translated.meal_names || [];
+  const foodNames = translated.food_names || [];
+  let foodIdx = 0;
+  (newNutrition?.meals || []).forEach((meal, mi) => {
+    if (mealNames[mi]) meal.name = mealNames[mi];
+    (meal.foods || []).forEach(food => {
+      if (foodNames[foodIdx]) food.name = foodNames[foodIdx];
+      foodIdx++;
+    });
+  });
 
   return { workout_plan: newPlan, nutrition_plan: newNutrition };
 }
 
-// Cached lookup. Returns plan in requested language. Caches translations on plans.translations.
-async function getPlanForLanguage(planRow, language) {
-  const lang = normalizeLang(language);
+async function getPlanForLanguage(planRow, lang) {
   if (lang === 'en') {
     return { workout_plan: planRow.workout_plan, nutrition_plan: planRow.nutrition_plan };
   }
-
-  const cache = planRow.translations || {};
-  if (cache[lang]?.workout_plan) {
-    return {
-      workout_plan: cache[lang].workout_plan,
-      nutrition_plan: cache[lang].nutrition_plan || planRow.nutrition_plan
-    };
+  // Check server-side translation cache
+  const cached = planRow.translations?.[lang];
+  if (cached?.workout_plan) {
+    return { workout_plan: cached.workout_plan, nutrition_plan: cached.nutrition_plan };
   }
-
+  // Translate and persist
   const translated = await translatePlanText(planRow.workout_plan, planRow.nutrition_plan, lang);
-
-  // Persist to cache. Best-effort — if it fails we still return the translation.
-  const newCache = { ...cache, [lang]: { workout_plan: translated.workout_plan, nutrition_plan: translated.nutrition_plan } };
-  supabase.from('plans').update({ translations: newCache }).eq('id', planRow.id).then(() => {}, () => {});
-
+  const translations = { ...(planRow.translations || {}), [lang]: translated };
+  await supabase.from('plans')
+    .update({ translations })
+    .eq('id', planRow.id);
   return translated;
 }
 
-// ── TRANSLATE PLAN ─────────────────────────────
-// Legacy endpoint — now thin wrapper over the cached helper.
+// ── TRANSLATE PLAN (thin wrapper) ──────────────────────────────────────────
 app.post('/api/translate-plan', requireAuth, async (req, res) => {
   try {
-    const language = normalizeLang(req.body.language);
-    if (language === 'en') return res.json({ ok: true, skipped: true });
+    const lang = normalizeLang(req.body.language);
+    if (lang === 'en') return res.json({ ok: true, skipped: true });
 
     const { data: planRow } = await supabase
       .from('plans')
@@ -1155,8 +1120,8 @@ app.post('/api/translate-plan', requireAuth, async (req, res) => {
 
     if (!planRow) return res.status(404).json({ error: 'No plan found' });
 
-    const translated = await getPlanForLanguage(planRow, language);
-    res.json({ ok: true, workout_plan: translated.workout_plan, nutrition_plan: translated.nutrition_plan });
+    const result = await getPlanForLanguage(planRow, lang);
+    res.json({ ok: true, ...result });
   } catch (err) {
     console.error('translate-plan error:', err);
     res.status(500).json({ error: err.message });
@@ -1164,8 +1129,6 @@ app.post('/api/translate-plan', requireAuth, async (req, res) => {
 });
 
 // ── GET PLAN ───────────────────────────────────
-// Accepts ?lang=xx — server returns the plan already in that language.
-// Translation is cached in plans.translations and reset whenever the plan is rewritten.
 app.get('/api/plan', requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -1179,21 +1142,22 @@ app.get('/api/plan', requireAuth, async (req, res) => {
     if (!data) return res.json({ plan: null });
 
     const lang = normalizeLang(req.query.lang);
-    if (lang === 'en') {
-      const { translations, ...rest } = data;
-      return res.json({ plan: { ...rest, _language: 'en' } });
+    let workout_plan = data.workout_plan;
+    let nutrition_plan = data.nutrition_plan;
+
+    if (lang !== 'en') {
+      try {
+        const translated = await getPlanForLanguage(data, lang);
+        workout_plan = translated.workout_plan;
+        nutrition_plan = translated.nutrition_plan;
+      } catch (e) {
+        console.error('Plan translation error, falling back to English:', e.message);
+      }
     }
 
-    const translated = await getPlanForLanguage(data, lang);
-    const { translations, workout_plan, nutrition_plan, ...rest } = data;
-    res.json({
-      plan: {
-        ...rest,
-        workout_plan: translated.workout_plan,
-        nutrition_plan: translated.nutrition_plan,
-        _language: lang
-      }
-    });
+    // Strip translations blob — never send to client
+    const { translations, ...planWithoutCache } = data;
+    res.json({ plan: { ...planWithoutCache, workout_plan, nutrition_plan } });
   } catch (err) {
     console.error('Get plan error:', err.message);
     res.status(500).json({ error: err.message });
@@ -1346,8 +1310,8 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
           .update({
             workout_plan: currentPlan.workout,
             nutrition_plan: currentPlan.nutrition,
-            translations: {},
-            generated_at: new Date().toISOString()
+            generated_at: new Date().toISOString(),
+            translations: {} // reset cache — next fetch re-translates
           })
           .eq('id', (freshPlan || planData).id);
       }
@@ -1518,8 +1482,8 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
         await supabase.from('plans').update({
           workout_plan: updatedPlan.workout,
           nutrition_plan: updatedPlan.nutrition,
-          translations: {},
-          generated_at: new Date().toISOString()
+          generated_at: new Date().toISOString(),
+          translations: {} // reset cache — next fetch re-translates
         }).eq('id', planData.id);
         planUpdate = { type: updateInstruction.type, summary: updateInstruction.summary };
       } catch(e) {
