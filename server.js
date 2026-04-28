@@ -3329,6 +3329,90 @@ app.post('/api/exercise/remap-plan', requireAuth, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════
+// LAUNCH PRICING SYSTEM
+// ═══════════════════════════════════════════════════════
+
+const LAUNCH_PROMO_THRESHOLD = 500;
+
+// Get current launch pricing status
+async function getLaunchPricingStatus() {
+  try {
+    const { data } = await supabase
+      .from('launch_pricing_config')
+      .select('*')
+      .maybeSingle();
+    if (!data) {
+      // Default state — both active, 0 sold
+      return {
+        steel_active: true, steel_sold: 0, steel_threshold: LAUNCH_PROMO_THRESHOLD,
+        forge_active: true, forge_sold: 0, forge_threshold: LAUNCH_PROMO_THRESHOLD,
+      };
+    }
+    return {
+      steel_active: data.steel_active && data.steel_sold < LAUNCH_PROMO_THRESHOLD,
+      steel_sold: data.steel_sold || 0,
+      steel_threshold: LAUNCH_PROMO_THRESHOLD,
+      forge_active: data.forge_active && data.forge_sold < LAUNCH_PROMO_THRESHOLD,
+      forge_sold: data.forge_sold || 0,
+      forge_threshold: LAUNCH_PROMO_THRESHOLD,
+    };
+  } catch(e) {
+    console.error('getLaunchPricingStatus error:', e.message);
+    return { steel_active: false, steel_sold: 0, forge_active: false, forge_sold: 0 };
+  }
+}
+
+// Public endpoint — frontend polls this to show/hide promo UI
+app.get('/api/launch-pricing', async (req, res) => {
+  const status = await getLaunchPricingStatus();
+  res.json(status);
+});
+
+// Increment counter when a paid subscription completes
+app.post('/api/launch-pricing/record-subscription', requireAuth, async (req, res) => {
+  try {
+    const { tier } = req.body; // 'steel' or 'forge'
+    if (!['steel','forge'].includes(tier)) return res.status(400).json({ error: 'Invalid tier' });
+    const status = await getLaunchPricingStatus();
+    if (!status[`${tier}_active`]) return res.json({ ok: true, promo_active: false });
+    const { data: config } = await supabase.from('launch_pricing_config').select('*').maybeSingle();
+    const newSold = (config?.[`${tier}_sold`] || 0) + 1;
+    const nowEnded = newSold >= LAUNCH_PROMO_THRESHOLD;
+    await supabase.from('launch_pricing_config').upsert({
+      id: 1,
+      steel_active: config?.steel_active ?? true,
+      steel_sold: tier === 'steel' ? newSold : (config?.steel_sold || 0),
+      forge_active: config?.forge_active ?? true,
+      forge_sold: tier === 'forge' ? newSold : (config?.forge_sold || 0),
+      ...(tier === 'steel' && nowEnded ? { steel_active: false } : {}),
+      ...(tier === 'forge' && nowEnded ? { forge_active: false } : {}),
+    });
+    res.json({ ok: true, promo_active: !nowEnded, remaining: LAUNCH_PROMO_THRESHOLD - newSold });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: view and control launch pricing
+app.get('/api/admin/launch-pricing', requireAuth, requireAdmin, async (req, res) => {
+  const status = await getLaunchPricingStatus();
+  res.json(status);
+});
+
+app.patch('/api/admin/launch-pricing', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { steel_active, forge_active } = req.body;
+    const { data: config } = await supabase.from('launch_pricing_config').select('*').maybeSingle();
+    await supabase.from('launch_pricing_config').upsert({
+      id: 1,
+      steel_active: steel_active !== undefined ? steel_active : (config?.steel_active ?? true),
+      steel_sold: config?.steel_sold || 0,
+      forge_active: forge_active !== undefined ? forge_active : (config?.forge_active ?? true),
+      forge_sold: config?.forge_sold || 0,
+    });
+    res.json({ ok: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
 
 // ── DEBUG — View raw plan (admin only) ────────
@@ -3424,8 +3508,13 @@ app.post('/api/push/grace-period', requireAuth, async (req, res) => {
     const { data: slots } = await supabase.from('founding_member_config').select('*').maybeSingle();
     const ironAvailable = (slots?.iron_sold || 0) < (slots?.iron_total || 500);
     const steelAvailable = (slots?.steel_sold || 0) < (slots?.steel_total || 250);
+    // Check Steel launch promo
+    const promoStatus = await getLaunchPricingStatus();
+    // Priority: A (founding) → C (steel promo) → B (fallback)
     if (ironAvailable || steelAvailable) {
       await sendPushToUser(userId, 'Founding Member slots are going', 'Lifetime access to FORGE — pay once, train forever. Limited slots remaining.');
+    } else if (promoStatus.steel_active) {
+      await sendPushToUser(userId, 'Launch pricing is still live', 'Steel is CHF 19.99/mo while spots remain. That price locks in permanently — it never increases.');
     } else {
       await sendPushToUser(userId, 'Your coaching is on hold', 'It takes 30 seconds to restart it.');
     }
