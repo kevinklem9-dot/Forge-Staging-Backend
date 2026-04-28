@@ -970,10 +970,10 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     // Delete any existing plan for this user first (clean slate)
     await supabase.from('plans').delete().eq('user_id', req.user.id);
 
-    // Save to DB — reset translations cache
+    // Save to DB — reset translations cache, store source language
     const { data, error } = await supabase
       .from('plans')
-      .insert({ user_id: req.user.id, workout_plan: plan.workout, nutrition_plan: plan.nutrition, translations: {} })
+      .insert({ user_id: req.user.id, workout_plan: plan.workout, nutrition_plan: plan.nutrition, translations: {}, source_language: language || 'en' })
       .select()
       .maybeSingle();
 
@@ -1087,20 +1087,31 @@ ${JSON.stringify(toTranslate, null, 2)}`;
 }
 
 async function getPlanForLanguage(planRow, lang) {
-  if (lang === 'en') {
-    return { workout_plan: planRow.workout_plan, nutrition_plan: planRow.nutrition_plan };
-  }
-  // Check server-side translation cache
+  // Check server-side translation cache first (works for all languages including English)
   const cached = planRow.translations?.[lang];
   if (cached?.workout_plan) {
     return { workout_plan: cached.workout_plan, nutrition_plan: cached.nutrition_plan };
   }
-  // Translate and persist
+
+  if (lang === 'en') {
+    // Check if we have a source_language stored — if the plan was generated
+    // in a non-English language, we need to translate it to English
+    const sourceLang = planRow.source_language || 'en';
+    if (sourceLang === 'en') {
+      // Plan is in English already — return as-is
+      return { workout_plan: planRow.workout_plan, nutrition_plan: planRow.nutrition_plan };
+    }
+    // Plan was generated in another language — translate to English
+    const translated = await translatePlanText(planRow.workout_plan, planRow.nutrition_plan, 'en');
+    const translations = { ...(planRow.translations || {}), en: translated };
+    await supabase.from('plans').update({ translations }).eq('id', planRow.id);
+    return translated;
+  }
+
+  // Non-English: translate from stored plan (which is in source_language) and cache
   const translated = await translatePlanText(planRow.workout_plan, planRow.nutrition_plan, lang);
   const translations = { ...(planRow.translations || {}), [lang]: translated };
-  await supabase.from('plans')
-    .update({ translations })
-    .eq('id', planRow.id);
+  await supabase.from('plans').update({ translations }).eq('id', planRow.id);
   return translated;
 }
 
@@ -1145,14 +1156,16 @@ app.get('/api/plan', requireAuth, async (req, res) => {
     let workout_plan = data.workout_plan;
     let nutrition_plan = data.nutrition_plan;
 
-    if (lang !== 'en') {
-      try {
-        const translated = await getPlanForLanguage(data, lang);
-        workout_plan = translated.workout_plan;
-        nutrition_plan = translated.nutrition_plan;
-      } catch (e) {
-        console.error('Plan translation error, falling back to English:', e.message);
-      }
+    // Always go through getPlanForLanguage — even for English.
+    // This handles plans that were originally generated in a non-English language
+    // by back-translating them to English via the translations cache.
+    try {
+      const translated = await getPlanForLanguage(data, lang);
+      workout_plan = translated.workout_plan;
+      nutrition_plan = translated.nutrition_plan;
+    } catch (e) {
+      console.error('Plan translation error, falling back to stored plan:', e.message);
+      // Keep the stored plan as fallback
     }
 
     // Strip translations blob — never send to client
