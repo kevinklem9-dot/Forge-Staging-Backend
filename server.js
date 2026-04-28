@@ -1020,6 +1020,22 @@ function normalizeLang(code) {
 
 async function translatePlanText(workout, nutrition, lang) {
   const langName = LANG_NAMES[lang] || lang;
+
+  // Collect ALL food names including weekly_meals overrides
+  const baseFoodNames = (nutrition?.meals || []).flatMap(m => (m.foods || []).map(f => f.name || ''));
+  const baseMealNames = (nutrition?.meals || []).map(m => m.name || '');
+
+  // weekly_meals is a map of dayIndex -> meals array (per-day overrides)
+  const weeklyMealNames = {};
+  const weeklyFoodNames = {};
+  if (nutrition?.weekly_meals) {
+    Object.entries(nutrition.weekly_meals).forEach(([dayIdx, meals]) => {
+      if (!Array.isArray(meals)) return;
+      weeklyMealNames[dayIdx] = meals.map(m => m.name || '');
+      weeklyFoodNames[dayIdx] = meals.flatMap(m => (m.foods || []).map(f => f.name || ''));
+    });
+  }
+
   const toTranslate = {
     split_name: workout?.split_name || '',
     split_description: workout?.split_description || '',
@@ -1030,29 +1046,57 @@ async function translatePlanText(workout, nutrition, lang) {
       muscles: d.muscles || [],
       exercise_notes: (d.exercises || []).map(e => e.note || ''),
     })),
-    meal_names: (nutrition?.meals || []).map(m => m.name || ''),
-    food_names: (nutrition?.meals || []).flatMap(m => (m.foods || []).map(f => f.name || '')),
+    meal_names: baseMealNames,
+    food_names: baseFoodNames,
+    weekly_meal_names: weeklyMealNames,
+    weekly_food_names: weeklyFoodNames,
   };
 
   const prompt = `Translate the following fitness plan text fields from English into ${langName}.
 Rules:
-- Keep exercise names (e.g. "Barbell Bench Press", "Squat") in English — these are universal gym terms
-- Translate everything else: day names, labels, muscle names, exercise notes, meal names, food names, strategy
+- Keep exercise names (e.g. "Barbell Bench Press", "Squat") in English — universal gym terms
+- Translate everything else: day names, labels, muscle names, exercise notes, meal names, food ingredient names, nutrition strategy
+- Food names like "Chicken Breast", "Whole Eggs", "Greek Yogurt", "Brown Rice" MUST be translated
 - Keep all numbers, units (kg, g, kcal, min), time formats exactly as-is
-- Return ONLY valid JSON with the same structure, no explanation
+- Return ONLY valid JSON matching the exact same structure, no explanation, no markdown
 
 Input JSON:
 ${JSON.stringify(toTranslate, null, 2)}`;
 
   const aiRes = await anthropic.messages.create({
     model: 'claude-haiku-4-5-20251001',
-    max_tokens: 2000,
+    max_tokens: 4000,
     messages: [{ role: 'user', content: prompt }],
   });
 
   const text = aiRes.content[0]?.text || '';
   const clean = text.replace(/```json\n?|```/g, '').trim();
-  const translated = JSON.parse(clean);
+
+  let translated;
+  try {
+    translated = JSON.parse(clean);
+  } catch (parseErr) {
+    console.error(`Translation JSON parse failed for lang=${lang}, retrying with food names only`);
+    // Retry with just the food/meal names to keep it small
+    const retryPayload = {
+      meal_names: toTranslate.meal_names,
+      food_names: toTranslate.food_names,
+      weekly_meal_names: toTranslate.weekly_meal_names,
+      weekly_food_names: toTranslate.weekly_food_names,
+      split_name: toTranslate.split_name,
+      split_description: toTranslate.split_description,
+      strategy: toTranslate.strategy,
+    };
+    const retryRes = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 3000,
+      messages: [{ role: 'user', content: `Translate into ${langName}. Return ONLY valid JSON, same structure:\n${JSON.stringify(retryPayload)}` }],
+    });
+    const retryText = retryRes.content[0]?.text || '';
+    translated = JSON.parse(retryText.replace(/```json\n?|```/g, '').trim());
+    // For the retry, skip day translations (workout part)
+    translated.days = [];
+  }
 
   // Apply translations back to deep clones
   const newPlan = JSON.parse(JSON.stringify(workout));
@@ -1072,6 +1116,7 @@ ${JSON.stringify(toTranslate, null, 2)}`;
     });
   });
 
+  // Apply base meal + food name translations
   const mealNames = translated.meal_names || [];
   const foodNames = translated.food_names || [];
   let foodIdx = 0;
@@ -1083,32 +1128,54 @@ ${JSON.stringify(toTranslate, null, 2)}`;
     });
   });
 
+  // Apply weekly_meals translations
+  if (newNutrition?.weekly_meals && translated.weekly_meal_names) {
+    Object.entries(translated.weekly_meal_names).forEach(([dayIdx, tMealNames]) => {
+      const tFoodNames = translated.weekly_food_names?.[dayIdx] || [];
+      const dayMeals = newNutrition.weekly_meals[dayIdx];
+      if (!Array.isArray(dayMeals)) return;
+      let wFoodIdx = 0;
+      dayMeals.forEach((meal, mi) => {
+        if (tMealNames[mi]) meal.name = tMealNames[mi];
+        (meal.foods || []).forEach(food => {
+          if (tFoodNames[wFoodIdx]) food.name = tFoodNames[wFoodIdx];
+          wFoodIdx++;
+        });
+      });
+    });
+  }
+
   return { workout_plan: newPlan, nutrition_plan: newNutrition };
 }
 
 async function getPlanForLanguage(planRow, lang) {
-  // Check server-side translation cache first (works for all languages including English)
+  // Check server-side translation cache first
   const cached = planRow.translations?.[lang];
-  if (cached?.workout_plan) {
-    return { workout_plan: cached.workout_plan, nutrition_plan: cached.nutrition_plan };
+  // Validate cache is complete — check that food names exist and are translated
+  // (old cached translations may have missed food names due to token limits)
+  if (cached?.workout_plan && cached?.nutrition_plan) {
+    const cachedFoods = cached.nutrition_plan?.meals?.flatMap(m => m.foods?.map(f => f.name) || []) || [];
+    const storedFoods = planRow.nutrition_plan?.meals?.flatMap(m => m.foods?.map(f => f.name) || []) || [];
+    // Cache is valid if food count matches (foods were included in translation)
+    if (cachedFoods.length === storedFoods.length && cachedFoods.length > 0) {
+      return { workout_plan: cached.workout_plan, nutrition_plan: cached.nutrition_plan };
+    }
+    // Cache exists but food names weren't translated — invalidate and re-translate
+    console.log(`Cache for lang=${lang} missing food names, re-translating...`);
   }
 
   if (lang === 'en') {
-    // Check if we have a source_language stored — if the plan was generated
-    // in a non-English language, we need to translate it to English
     const sourceLang = planRow.source_language || 'en';
     if (sourceLang === 'en') {
-      // Plan is in English already — return as-is
       return { workout_plan: planRow.workout_plan, nutrition_plan: planRow.nutrition_plan };
     }
-    // Plan was generated in another language — translate to English
     const translated = await translatePlanText(planRow.workout_plan, planRow.nutrition_plan, 'en');
     const translations = { ...(planRow.translations || {}), en: translated };
     await supabase.from('plans').update({ translations }).eq('id', planRow.id);
     return translated;
   }
 
-  // Non-English: translate from stored plan (which is in source_language) and cache
+  // Non-English: translate from stored plan and cache
   const translated = await translatePlanText(planRow.workout_plan, planRow.nutrition_plan, lang);
   const translations = { ...(planRow.translations || {}), [lang]: translated };
   await supabase.from('plans').update({ translations }).eq('id', planRow.id);
