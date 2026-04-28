@@ -3514,7 +3514,7 @@ app.post('/api/push/grace-period', requireAuth, async (req, res) => {
     if (ironAvailable || steelAvailable) {
       await sendPushToUser(userId, 'Founding Member slots are going', 'Lifetime access to FORGE — pay once, train forever. Limited slots remaining.');
     } else if (promoStatus.steel_active) {
-      await sendPushToUser(userId, 'Launch pricing is still live', 'Steel is CHF 19.99/mo while spots remain. That price locks in permanently — it never increases.');
+      await sendPushToUser(userId, 'Launch pricing is still live', 'Steel is CHF 11.99/mo while spots remain. That price locks in permanently — it never increases.');
     } else {
       await sendPushToUser(userId, 'Your coaching is on hold', 'It takes 30 seconds to restart it.');
     }
