@@ -1149,19 +1149,27 @@ ${JSON.stringify(toTranslate, null, 2)}`;
 }
 
 async function getPlanForLanguage(planRow, lang) {
-  // Check server-side translation cache first
+  // Check server-side translation cache
   const cached = planRow.translations?.[lang];
-  // Validate cache is complete — check that food names exist and are translated
-  // (old cached translations may have missed food names due to token limits)
+
   if (cached?.workout_plan && cached?.nutrition_plan) {
-    const cachedFoods = cached.nutrition_plan?.meals?.flatMap(m => m.foods?.map(f => f.name) || []) || [];
-    const storedFoods = planRow.nutrition_plan?.meals?.flatMap(m => m.foods?.map(f => f.name) || []) || [];
-    // Cache is valid if food count matches (foods were included in translation)
-    if (cachedFoods.length === storedFoods.length && cachedFoods.length > 0) {
+    // Validate cache is complete — check weekly_meals food names are translated
+    const storedWeeklyFoods = Object.values(planRow.nutrition_plan?.weekly_meals || {})
+      .flatMap(meals => meals.flatMap(m => m.foods?.map(f => f.name) || []));
+    const cachedWeeklyFoods = Object.values(cached.nutrition_plan?.weekly_meals || {})
+      .flatMap(meals => meals.flatMap(m => m.foods?.map(f => f.name) || []));
+
+    // Also check base meals food count
+    const storedBaseFoods = (planRow.nutrition_plan?.meals || []).flatMap(m => m.foods?.map(f => f.name) || []);
+    const cachedBaseFoods = (cached.nutrition_plan?.meals || []).flatMap(m => m.foods?.map(f => f.name) || []);
+
+    const weeklyMatch = storedWeeklyFoods.length === 0 || cachedWeeklyFoods.length === storedWeeklyFoods.length;
+    const baseMatch = storedBaseFoods.length === 0 || cachedBaseFoods.length === storedBaseFoods.length;
+
+    if (weeklyMatch && baseMatch) {
       return { workout_plan: cached.workout_plan, nutrition_plan: cached.nutrition_plan };
     }
-    // Cache exists but food names weren't translated — invalidate and re-translate
-    console.log(`Cache for lang=${lang} missing food names, re-translating...`);
+    console.log(`Cache for lang=${lang} incomplete (weekly:${cachedWeeklyFoods.length}/${storedWeeklyFoods.length} base:${cachedBaseFoods.length}/${storedBaseFoods.length}), re-translating...`);
   }
 
   if (lang === 'en') {
@@ -1175,7 +1183,6 @@ async function getPlanForLanguage(planRow, lang) {
     return translated;
   }
 
-  // Non-English: translate from stored plan and cache
   const translated = await translatePlanText(planRow.workout_plan, planRow.nutrition_plan, lang);
   const translations = { ...(planRow.translations || {}), [lang]: translated };
   await supabase.from('plans').update({ translations }).eq('id', planRow.id);
