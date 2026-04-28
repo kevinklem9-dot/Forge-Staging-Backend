@@ -1148,28 +1148,19 @@ ${JSON.stringify(toTranslate, null, 2)}`;
   return { workout_plan: newPlan, nutrition_plan: newNutrition };
 }
 
+// Cache version — increment this to force all cached translations to be rebuilt
+const TRANSLATION_CACHE_VERSION = 2;
+
 async function getPlanForLanguage(planRow, lang) {
   // Check server-side translation cache
   const cached = planRow.translations?.[lang];
 
   if (cached?.workout_plan && cached?.nutrition_plan) {
-    // Validate cache is complete — check weekly_meals food names are translated
-    const storedWeeklyFoods = Object.values(planRow.nutrition_plan?.weekly_meals || {})
-      .flatMap(meals => meals.flatMap(m => m.foods?.map(f => f.name) || []));
-    const cachedWeeklyFoods = Object.values(cached.nutrition_plan?.weekly_meals || {})
-      .flatMap(meals => meals.flatMap(m => m.foods?.map(f => f.name) || []));
-
-    // Also check base meals food count
-    const storedBaseFoods = (planRow.nutrition_plan?.meals || []).flatMap(m => m.foods?.map(f => f.name) || []);
-    const cachedBaseFoods = (cached.nutrition_plan?.meals || []).flatMap(m => m.foods?.map(f => f.name) || []);
-
-    const weeklyMatch = storedWeeklyFoods.length === 0 || cachedWeeklyFoods.length === storedWeeklyFoods.length;
-    const baseMatch = storedBaseFoods.length === 0 || cachedBaseFoods.length === storedBaseFoods.length;
-
-    if (weeklyMatch && baseMatch) {
+    // Invalidate old caches by version number
+    if (cached._v === TRANSLATION_CACHE_VERSION) {
       return { workout_plan: cached.workout_plan, nutrition_plan: cached.nutrition_plan };
     }
-    console.log(`Cache for lang=${lang} incomplete (weekly:${cachedWeeklyFoods.length}/${storedWeeklyFoods.length} base:${cachedBaseFoods.length}/${storedBaseFoods.length}), re-translating...`);
+    console.log(`Cache for lang=${lang} is version ${cached._v || 1}, current is ${TRANSLATION_CACHE_VERSION} — re-translating...`);
   }
 
   if (lang === 'en') {
@@ -1178,13 +1169,15 @@ async function getPlanForLanguage(planRow, lang) {
       return { workout_plan: planRow.workout_plan, nutrition_plan: planRow.nutrition_plan };
     }
     const translated = await translatePlanText(planRow.workout_plan, planRow.nutrition_plan, 'en');
-    const translations = { ...(planRow.translations || {}), en: translated };
+    const entry = { ...translated, _v: TRANSLATION_CACHE_VERSION };
+    const translations = { ...(planRow.translations || {}), en: entry };
     await supabase.from('plans').update({ translations }).eq('id', planRow.id);
     return translated;
   }
 
   const translated = await translatePlanText(planRow.workout_plan, planRow.nutrition_plan, lang);
-  const translations = { ...(planRow.translations || {}), [lang]: translated };
+  const entry = { ...translated, _v: TRANSLATION_CACHE_VERSION };
+  const translations = { ...(planRow.translations || {}), [lang]: entry };
   await supabase.from('plans').update({ translations }).eq('id', planRow.id);
   return translated;
 }
