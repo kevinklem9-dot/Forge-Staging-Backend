@@ -8,6 +8,7 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const Anthropic = require('@anthropic-ai/sdk').default;
 const { createClient } = require('@supabase/supabase-js');
+const Stripe = require('stripe');
 
 const app = express();
 app.set('trust proxy', 1); // Required for Railway — enables X-Forwarded-For
@@ -575,6 +576,25 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// ── STRIPE ─────────────────────────────────────────────
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+
+// Price ID map — swap these for live IDs when going to production
+const STRIPE_PRICES = {
+  iron_monthly:        process.env.STRIPE_PRICE_IRON_MONTHLY        || 'price_1TRVyYCP6MFAx438g7OtULUQ',
+  iron_annual:         process.env.STRIPE_PRICE_IRON_ANNUAL         || 'price_1TRVz4CP6MFAx438Bph4XBhA',
+  steel_monthly:       process.env.STRIPE_PRICE_STEEL_MONTHLY       || 'price_1TRVzOCP6MFAx438TZ91bkEL',
+  steel_annual:        process.env.STRIPE_PRICE_STEEL_ANNUAL        || 'price_1TRW00CP6MFAx4383yXNBGFU',
+  forge_monthly:       process.env.STRIPE_PRICE_FORGE_MONTHLY       || 'price_1TRW0OCP6MFAx438U9PU9vMV',
+  forge_annual:        process.env.STRIPE_PRICE_FORGE_ANNUAL        || 'price_1TRW0jCP6MFAx438kn5AaNUk',
+  steel_monthly_promo: process.env.STRIPE_PRICE_STEEL_MONTHLY_PROMO || 'price_1TRW19CP6MFAx438Z9q3divk',
+  steel_annual_promo:  process.env.STRIPE_PRICE_STEEL_ANNUAL_PROMO  || 'price_1TRW1hCP6MFAx438y1Ce7oNs',
+  forge_monthly_promo: process.env.STRIPE_PRICE_FORGE_MONTHLY_PROMO || 'price_1TRW27CP6MFAx438cccyiUmk',
+  forge_annual_promo:  process.env.STRIPE_PRICE_FORGE_ANNUAL_PROMO  || 'price_1TRW2YCP6MFAx438qTEPAtwj',
+  iron_founding:       process.env.STRIPE_PRICE_IRON_FOUNDING       || 'price_1TRW33CP6MFAx438rk9GZZ6P',
+  steel_founding:      process.env.STRIPE_PRICE_STEEL_FOUNDING      || 'price_1TRW3PCP6MFAx438tgVOex9V',
+};
+
 // ── MIDDLEWARE ─────────────────────────────────
 const corsOptions = {
   origin: (origin, callback) => {
@@ -595,6 +615,139 @@ const corsOptions = {
 app.use(helmet({ contentSecurityPolicy: false })); // Security headers
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle all preflight requests
+// Stripe webhook needs raw body — must come BEFORE express.json()
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+  } catch (err) {
+    console.error('Webhook signature error:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        const userId = session.metadata?.user_id;
+        const tier = session.metadata?.tier;
+        const billing = session.metadata?.billing; // 'monthly', 'annual', 'lifetime'
+        const isPromo = session.metadata?.is_promo === 'true';
+        if (!userId || !tier) break;
+
+        if (billing === 'lifetime') {
+          // Founding member — set lifetime status
+          await supabase.from('profiles').update({
+            subscription_tier: tier,
+            subscription_status: 'lifetime',
+            lifetime_tier: tier,
+            stripe_customer_id: session.customer,
+          }).eq('id', userId);
+          // Increment founding member counter
+          const { data: fmConfig } = await supabase.from('founding_member_config').select('*').maybeSingle();
+          await supabase.from('founding_member_config').upsert({
+            id: 1,
+            [`${tier}_sold`]: (fmConfig?.[`${tier}_sold`] || 0) + 1,
+            iron_total: fmConfig?.iron_total || 500,
+            steel_total: fmConfig?.steel_total || 250,
+          });
+        } else {
+          // Subscription — set active
+          await supabase.from('profiles').update({
+            subscription_tier: tier,
+            subscription_status: 'active',
+            stripe_customer_id: session.customer,
+            stripe_subscription_id: session.subscription,
+          }).eq('id', userId);
+          // Increment launch promo counter if applicable
+          if (isPromo && ['steel','forge'].includes(tier)) {
+            await stripe_recordLaunchSub(tier);
+          }
+          // Handle referral credit
+          await handleReferralConversion(userId);
+        }
+        break;
+      }
+
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
+        // Find user by stripe subscription id
+        const { data: profile } = await supabase.from('profiles')
+          .select('id').eq('stripe_subscription_id', sub.id).maybeSingle();
+        if (profile) {
+          await supabase.from('profiles').update({
+            subscription_status: 'expired',
+            subscription_tier: 'iron',
+          }).eq('id', profile.id);
+        }
+        break;
+      }
+
+      case 'customer.subscription.updated': {
+        const sub = event.data.object;
+        const { data: profile } = await supabase.from('profiles')
+          .select('id').eq('stripe_subscription_id', sub.id).maybeSingle();
+        if (profile) {
+          const status = sub.status === 'active' ? 'active' : sub.status === 'past_due' ? 'past_due' : 'expired';
+          await supabase.from('profiles').update({ subscription_status: status }).eq('id', profile.id);
+        }
+        break;
+      }
+
+      case 'invoice.payment_failed': {
+        const invoice = event.data.object;
+        const { data: profile } = await supabase.from('profiles')
+          .select('id').eq('stripe_customer_id', invoice.customer).maybeSingle();
+        if (profile) {
+          await supabase.from('profiles').update({ subscription_status: 'past_due' }).eq('id', profile.id);
+        }
+        break;
+      }
+    }
+    res.json({ received: true });
+  } catch(err) {
+    console.error('Webhook handler error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Helper: record launch promo subscription
+async function stripe_recordLaunchSub(tier) {
+  try {
+    const { data: config } = await supabase.from('launch_pricing_config').select('*').maybeSingle();
+    const newSold = (config?.[`${tier}_sold`] || 0) + 1;
+    const nowEnded = newSold >= 500;
+    await supabase.from('launch_pricing_config').upsert({
+      id: 1,
+      steel_active: tier === 'steel' ? !nowEnded : (config?.steel_active ?? true),
+      steel_sold: tier === 'steel' ? newSold : (config?.steel_sold || 0),
+      forge_active: tier === 'forge' ? !nowEnded : (config?.forge_active ?? true),
+      forge_sold: tier === 'forge' ? newSold : (config?.forge_sold || 0),
+    });
+  } catch(e) { console.error('stripe_recordLaunchSub error:', e.message); }
+}
+
+// Helper: handle referral conversion credit
+async function handleReferralConversion(userId) {
+  try {
+    const { data: profile } = await supabase.from('profiles')
+      .select('referred_by').eq('id', userId).maybeSingle();
+    if (!profile?.referred_by) return;
+    const referrerId = profile.referred_by;
+    const { data: referrer } = await supabase.from('profiles')
+      .select('referral_stats, stripe_subscription_id').eq('id', referrerId).maybeSingle();
+    if (!referrer) return;
+    const stats = referrer.referral_stats || {};
+    stats.conversions = (stats.conversions || 0) + 1;
+    stats.credits = (stats.credits || 0) + 1;
+    await supabase.from('profiles').update({ referral_stats: stats }).eq('id', referrerId);
+    // Send push notification to referrer
+    await sendPushToUser(referrerId, 'FORGE', 'Someone you referred just joined FORGE. A free month has been added to your account.');
+  } catch(e) { console.error('handleReferralConversion error:', e.message); }
+}
+
 app.use(express.json({ limit: '500kb' }));
 
 // Rate limiting — protect against abuse
@@ -2304,6 +2457,89 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ═══════════════════════════════════════════════════════
+// STRIPE CHECKOUT
+// ═══════════════════════════════════════════════════════
+
+app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
+  try {
+    const { tier, billing, is_promo } = req.body;
+    if (!tier || !billing) return res.status(400).json({ error: 'Missing tier or billing' });
+
+    const userId = req.user.id;
+    const userEmail = req.user.email;
+
+    // Determine price ID
+    let priceKey;
+    if (billing === 'lifetime') {
+      priceKey = `${tier}_founding`;
+    } else if (is_promo && (tier === 'steel' || tier === 'forge')) {
+      priceKey = `${tier}_${billing}_promo`;
+    } else {
+      priceKey = `${tier}_${billing}`;
+    }
+
+    const priceId = STRIPE_PRICES[priceKey];
+    if (!priceId) return res.status(400).json({ error: `No price found for ${priceKey}` });
+
+    // Get or create Stripe customer
+    const { data: profile } = await supabase.from('profiles')
+      .select('stripe_customer_id, name').eq('id', userId).maybeSingle();
+
+    let customerId = profile?.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: userEmail,
+        name: profile?.name || '',
+        metadata: { user_id: userId },
+      });
+      customerId = customer.id;
+      await supabase.from('profiles').update({ stripe_customer_id: customerId }).eq('id', userId);
+    }
+
+    const isSubscription = billing !== 'lifetime';
+    const frontendUrl = process.env.FRONTEND_URL || 'https://klemforge.com';
+
+    const sessionParams = {
+      customer: customerId,
+      payment_method_types: ['card'],
+      line_items: [{ price: priceId, quantity: 1 }],
+      mode: isSubscription ? 'subscription' : 'payment',
+      success_url: `${frontendUrl}?payment=success&tier=${tier}&billing=${billing}`,
+      cancel_url: `${frontendUrl}?payment=cancelled`,
+      metadata: { user_id: userId, tier, billing, is_promo: String(!!is_promo) },
+      allow_promotion_codes: true,
+    };
+
+    if (isSubscription) {
+      sessionParams.subscription_data = { metadata: { user_id: userId, tier, billing } };
+    } else {
+      sessionParams.payment_intent_data = { metadata: { user_id: userId, tier, billing } };
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionParams);
+    res.json({ url: session.url, session_id: session.id });
+  } catch (err) {
+    console.error('Stripe checkout error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Stripe billing portal — manage/cancel subscription
+app.post('/api/stripe/portal', requireAuth, async (req, res) => {
+  try {
+    const { data: profile } = await supabase.from('profiles')
+      .select('stripe_customer_id').eq('id', req.user.id).maybeSingle();
+    if (!profile?.stripe_customer_id) return res.status(400).json({ error: 'No Stripe customer' });
+    const frontendUrl = process.env.FRONTEND_URL || 'https://klemforge.com';
+    const session = await stripe.billingPortal.sessions.create({
+      customer: profile.stripe_customer_id,
+      return_url: frontendUrl,
+    });
+    res.json({ url: session.url });
+  } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── ADMIN — Get all users ──────────────────────────────
