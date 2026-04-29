@@ -2450,6 +2450,15 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
       .eq('id', req.user.id)
       .maybeSingle();
 
+    // Fetch renewal date from Stripe if active subscriber
+    let renewalDate = null;
+    if (status === 'active' && profile?.stripe_subscription_id) {
+      try {
+        const stripeSub = await stripe.subscriptions.retrieve(profile.stripe_subscription_id);
+        renewalDate = new Date(stripeSub.current_period_end * 1000).toISOString();
+      } catch(e) { /* non-fatal */ }
+    }
+
     res.json({
       tier,
       accessTier,
@@ -2461,6 +2470,7 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
       coachLimit: 20,
       hasUnlimitedCoach: hasAccess('unlimited_coach', accessTier, isExempt),
       stripe_subscription_id: profile?.stripe_subscription_id || null,
+      renewalDate,
     });
   } catch(err) {
     res.status(500).json({ error: err.message });
