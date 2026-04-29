@@ -2443,6 +2443,13 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
 
     const coachUsage = await getCoachUsage(req.user.id);
 
+    // Include stripe_subscription_id so frontend can detect paid subscribers
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('stripe_subscription_id')
+      .eq('id', req.user.id)
+      .maybeSingle();
+
     res.json({
       tier,
       accessTier,
@@ -2453,6 +2460,7 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
       coachUsage,
       coachLimit: 20,
       hasUnlimitedCoach: hasAccess('unlimited_coach', accessTier, isExempt),
+      stripe_subscription_id: profile?.stripe_subscription_id || null,
     });
   } catch(err) {
     res.status(500).json({ error: err.message });
