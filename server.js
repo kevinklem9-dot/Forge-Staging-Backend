@@ -2575,7 +2575,7 @@ app.post('/api/stripe/portal', requireAuth, async (req, res) => {
     const frontendUrl = process.env.FRONTEND_URL || 'https://klemforge.com';
     const session = await stripe.billingPortal.sessions.create({
       customer: profile.stripe_customer_id,
-      return_url: frontendUrl,
+      return_url: `${frontendUrl}?portal_return=true`,
     });
     res.json({ url: session.url });
   } catch(err) { res.status(500).json({ error: err.message }); }
