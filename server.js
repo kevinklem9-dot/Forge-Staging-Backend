@@ -1090,7 +1090,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       try {
         console.log(`Attempt ${attempt}: calling Anthropic...`);
         const message = await anthropic.messages.create({
-          model: 'claude-sonnet-4-5-20251001',
+          model: 'claude-sonnet-4-6',
           max_tokens: 12000,
           messages: [{ role: 'user', content: prompt }]
         });
@@ -1521,7 +1521,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         response = await anthropic.messages.create({
-          model: 'claude-sonnet-4-5-20251001',
+          model: 'claude-sonnet-4-6',
           max_tokens: 6000,
           system: systemPrompt,
           messages: sanitised
@@ -1719,7 +1719,7 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         response = await anthropic.messages.create({
-          model: 'claude-sonnet-4-5-20251001',
+          model: 'claude-sonnet-4-6',
           max_tokens: 1500,
           system: systemPrompt,
           messages: messages || [{ role: 'user', content: `I just finished training. Feeling: ${feeling}. Difficulty: ${difficulty}.` }]
