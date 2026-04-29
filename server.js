@@ -1105,11 +1105,12 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       try {
         console.log(`Attempt ${attempt}: calling Anthropic...`);
         const message = await anthropic.messages.create({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 12000,
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 8000,
           messages: [{ role: 'user', content: prompt }]
         });
-        console.log(`Attempt ${attempt}: Anthropic responded, length:`, message.content[0].text.length);
+        const raw = message.content[0].text;
+        console.log(`Attempt ${attempt}: Anthropic responded, length:`, raw.length);
 
         // Strip markdown fences
         let clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
