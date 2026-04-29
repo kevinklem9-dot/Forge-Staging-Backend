@@ -1059,6 +1059,21 @@ app.post('/api/reset-password', resetLimiter, async (req, res) => {
 
 // ── GENERATE PLAN ──────────────────────────────
 app.post('/api/generate-plan', requireAuth, async (req, res) => {
+  // Keep connection alive during long generation — Railway times out at 60s
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  // Send a heartbeat comment every 20 seconds to prevent proxy timeout
+  const heartbeat = setInterval(() => {
+    try { res.write(''); } catch(e) { clearInterval(heartbeat); }
+  }, 20000);
+
+  const sendResponse = (status, data) => {
+    clearInterval(heartbeat);
+    res.status(status).end(JSON.stringify(data));
+  };
+
   try {
     const { data: profile, error: profileErr } = await supabase
       .from('profiles')
@@ -1068,7 +1083,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
 
     if (profileErr || !profile) {
       console.error('Profile fetch error:', profileErr?.message);
-      return res.status(404).json({ error: 'Profile not found. Please try again.' });
+      return sendResponse(404, { error: 'Profile not found. Please try again.' });
     }
 
     console.log('=== GENERATE PLAN START ===');
@@ -1144,7 +1159,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     }
 
     if (!plan) {
-      return res.status(500).json({ error: 'Failed to generate plan — please try again', detail: lastError?.message });
+      return sendResponse(500, { error: 'Failed to generate plan — please try again', detail: lastError?.message });
     }
 
     // Delete any existing plan for this user first (clean slate)
@@ -1179,10 +1194,10 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     await supabase.from('profiles').update({ onboarding_complete: true }).eq('id', req.user.id);
 
     console.log('Plan generated successfully for:', profile.name);
-    res.json({ plan: data });
+    sendResponse(200, { plan: data });
   } catch (err) {
     console.error('Generate plan error:', err.message);
-    res.status(500).json({ error: 'Failed to generate plan — please try again', detail: err.message });
+    sendResponse(500, { error: 'Failed to generate plan — please try again', detail: err.message });
   }
 });
 
@@ -3672,7 +3687,11 @@ app.patch('/api/admin/launch-pricing', requireAuth, requireAdmin, async (req, re
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
-app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
+// Increase timeout to 3 minutes — plan generation with Sonnet can take up to 90 seconds
+server.timeout = 180000;
+server.keepAliveTimeout = 180000;
+server.headersTimeout = 185000;
 
 // ── DEBUG — View raw plan (admin only) ────────
 app.get('/api/debug/plan', requireAuth, requireAdmin, async (req, res) => {
