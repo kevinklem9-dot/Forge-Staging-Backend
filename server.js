@@ -1071,7 +1071,10 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Profile not found. Please try again.' });
     }
 
-    console.log('Generating plan for:', profile.name, '| goal:', profile.goal, '| injuries:', profile.injuries);
+    console.log('=== GENERATE PLAN START ===');
+    console.log('User:', profile.name, '| goal:', profile.goal, '| language:', req.body?.language);
+    console.log('ANTHROPIC_API_KEY set:', !!process.env.ANTHROPIC_API_KEY);
+    console.log('SUPABASE_URL set:', !!process.env.SUPABASE_URL);
 
     const language = req.body?.language || 'en';
 
@@ -1085,14 +1088,13 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
+        console.log(`Attempt ${attempt}: calling Anthropic...`);
         const message = await anthropic.messages.create({
           model: 'claude-sonnet-4-5-20251001',
           max_tokens: 12000,
           messages: [{ role: 'user', content: prompt }]
         });
-
-        const raw = message.content[0].text;
-        console.log(`Attempt ${attempt} - raw response length:`, raw.length);
+        console.log(`Attempt ${attempt}: Anthropic responded, length:`, message.content[0].text.length);
 
         // Strip markdown fences
         let clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
@@ -1146,9 +1148,11 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     }
 
     // Delete any existing plan for this user first (clean slate)
+    console.log('Deleting existing plan...');
     await supabase.from('plans').delete().eq('user_id', req.user.id);
 
     // Save to DB — reset translations cache, store source language
+    console.log('Inserting new plan...');
     const { data, error } = await supabase
       .from('plans')
       .insert({ user_id: req.user.id, workout_plan: plan.workout, nutrition_plan: plan.nutrition, translations: {}, source_language: language || 'en' })
@@ -1156,9 +1160,10 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
       .maybeSingle();
 
     if (error) {
-      console.error('DB insert error:', error.message);
+      console.error('DB insert error:', error.message, error.details, error.hint);
       throw error;
     }
+    console.log('Plan saved to DB successfully');
 
     // Also save to programmes table (deactivate existing, add new active one)
     const planName = `${profile?.goal || 'My'} Plan — ${new Date().toLocaleDateString('en-GB', { month: 'short', year: 'numeric' })}`;
