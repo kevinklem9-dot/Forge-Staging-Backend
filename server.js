@@ -2584,14 +2584,41 @@ app.post('/api/stripe/portal', requireAuth, async (req, res) => {
   try {
     const { data: profile } = await supabase.from('profiles')
       .select('stripe_customer_id').eq('id', req.user.id).maybeSingle();
-    if (!profile?.stripe_customer_id) return res.status(400).json({ error: 'No Stripe customer' });
+    if (!profile?.stripe_customer_id) return res.status(400).json({ error: 'No Stripe customer found. Please make a purchase first.' });
     const frontendUrl = process.env.FRONTEND_URL || 'https://klemforge.com';
     const session = await stripe.billingPortal.sessions.create({
       customer: profile.stripe_customer_id,
       return_url: `${frontendUrl}?portal_return=true`,
     });
     res.json({ url: session.url });
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  } catch(err) {
+    console.error('Billing portal error:', err.message);
+    // Common cause: portal not configured in Stripe dashboard
+    if (err.message?.includes('configuration')) {
+      return res.status(500).json({ error: 'Billing portal not configured. Go to Stripe Dashboard → Settings → Billing → Customer portal and save the settings.' });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Sync subscription tier from Stripe — called after billing portal return
+app.post('/api/stripe/sync-subscription', requireAuth, async (req, res) => {
+  try {
+    const { data: profile } = await supabase.from('profiles')
+      .select('stripe_subscription_id, stripe_customer_id').eq('id', req.user.id).maybeSingle();
+    if (!profile?.stripe_subscription_id) return res.json({ ok: true, synced: false });
+    const sub = await stripe.subscriptions.retrieve(profile.stripe_subscription_id);
+    const status = sub.status === 'active' ? 'active' : sub.status === 'past_due' ? 'past_due' : 'expired';
+    const priceId = sub.items?.data?.[0]?.price?.id;
+    const tier = priceId ? getTierFromPriceId(priceId) : null;
+    const updateData = { subscription_status: status };
+    if (tier) updateData.subscription_tier = tier;
+    await supabase.from('profiles').update(updateData).eq('id', req.user.id);
+    res.json({ ok: true, synced: true, tier, status });
+  } catch(err) {
+    console.error('Sync subscription error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── ADMIN — Get all users ──────────────────────────────
