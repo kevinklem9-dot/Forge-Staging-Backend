@@ -576,7 +576,17 @@ const supabase = createClient(
 );
 
 // ── STRIPE ─────────────────────────────────────────────
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+let stripe = null;
+try {
+  if (process.env.STRIPE_SECRET_KEY) {
+    stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+    console.log('Stripe initialised ✓');
+  } else {
+    console.warn('STRIPE_SECRET_KEY not set — Stripe features disabled');
+  }
+} catch(e) {
+  console.error('Stripe init failed:', e.message);
+}
 
 // Price ID map — swap these for live IDs when going to production
 const STRIPE_PRICES = {
@@ -2519,7 +2529,7 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
 
 app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
   try {
-    const { tier, billing, is_promo } = req.body;
+    if (!stripe) return res.status(503).json({ error: 'Stripe not configured — check STRIPE_SECRET_KEY env var' });    const { tier, billing, is_promo } = req.body;
     if (!tier || !billing) return res.status(400).json({ error: 'Missing tier or billing' });
 
     const userId = req.user.id;
@@ -2555,14 +2565,15 @@ app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
 
     const isSubscription = billing !== 'lifetime';
     const frontendUrl = process.env.FRONTEND_URL || 'https://klemforge.com';
+    const appUrl = frontendUrl.replace(/\/$/, '') + '/app.html';
 
     const sessionParams = {
       customer: customerId,
       payment_method_types: ['card'],
       line_items: [{ price: priceId, quantity: 1 }],
       mode: isSubscription ? 'subscription' : 'payment',
-      success_url: `${frontendUrl}?payment=success&tier=${tier}&billing=${billing}`,
-      cancel_url: `${frontendUrl}?payment=cancelled`,
+      success_url: `${appUrl}?payment=success&tier=${tier}&billing=${billing}`,
+      cancel_url: `${appUrl}?payment=cancelled`,
       metadata: { user_id: userId, tier, billing, is_promo: String(!!is_promo) },
       allow_promotion_codes: true,
     };
@@ -2584,13 +2595,14 @@ app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
 // Stripe billing portal — manage/cancel subscription
 app.post('/api/stripe/portal', requireAuth, async (req, res) => {
   try {
-    const { data: profile } = await supabase.from('profiles')
+    if (!stripe) return res.status(503).json({ error: 'Stripe not configured — check STRIPE_SECRET_KEY env var' });    const { data: profile } = await supabase.from('profiles')
       .select('stripe_customer_id').eq('id', req.user.id).maybeSingle();
     if (!profile?.stripe_customer_id) return res.status(400).json({ error: 'No Stripe customer found. Please make a purchase first.' });
     const frontendUrl = process.env.FRONTEND_URL || 'https://klemforge.com';
+    const appUrl = frontendUrl.replace(/\/$/, '') + '/app.html';
     const session = await stripe.billingPortal.sessions.create({
       customer: profile.stripe_customer_id,
-      return_url: `${frontendUrl}?portal_return=true`,
+      return_url: `${appUrl}?portal_return=true`,
     });
     res.json({ url: session.url });
   } catch(err) {
@@ -2606,7 +2618,7 @@ app.post('/api/stripe/portal', requireAuth, async (req, res) => {
 // Sync subscription tier from Stripe — called after billing portal return
 app.post('/api/stripe/sync-subscription', requireAuth, async (req, res) => {
   try {
-    const { data: profile } = await supabase.from('profiles')
+    if (!stripe) return res.status(503).json({ error: 'Stripe not configured — check STRIPE_SECRET_KEY env var' });    const { data: profile } = await supabase.from('profiles')
       .select('stripe_subscription_id, stripe_customer_id').eq('id', req.user.id).maybeSingle();
     if (!profile?.stripe_subscription_id) return res.json({ ok: true, synced: false });
     const sub = await stripe.subscriptions.retrieve(profile.stripe_subscription_id);
