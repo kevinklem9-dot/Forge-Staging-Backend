@@ -576,8 +576,16 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// ── STRIPE ─────────────────────────────────────────────
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+// Map price IDs back to tiers — used by webhook to update tier on subscription changes
+function getTierFromPriceId(priceId) {
+  const map = {};
+  Object.entries(STRIPE_PRICES).forEach(([key, id]) => {
+    if (key.startsWith('iron')) map[id] = 'iron';
+    else if (key.startsWith('steel')) map[id] = 'steel';
+    else if (key.startsWith('forge')) map[id] = 'forge';
+  });
+  return map[priceId] || null;
+}
 
 // Price ID map — swap these for live IDs when going to production
 const STRIPE_PRICES = {
@@ -691,7 +699,12 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
           .select('id').eq('stripe_subscription_id', sub.id).maybeSingle();
         if (profile) {
           const status = sub.status === 'active' ? 'active' : sub.status === 'past_due' ? 'past_due' : 'expired';
-          await supabase.from('profiles').update({ subscription_status: status }).eq('id', profile.id);
+          // Determine tier from the active price ID
+          const priceId = sub.items?.data?.[0]?.price?.id;
+          const tierFromPrice = priceId ? getTierFromPriceId(priceId) : null;
+          const updateData = { subscription_status: status };
+          if (tierFromPrice) updateData.subscription_tier = tierFromPrice;
+          await supabase.from('profiles').update(updateData).eq('id', profile.id);
         }
         break;
       }
