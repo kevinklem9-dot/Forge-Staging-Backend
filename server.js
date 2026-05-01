@@ -8,7 +8,6 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const Anthropic = require('@anthropic-ai/sdk').default;
 const { createClient } = require('@supabase/supabase-js');
-const Stripe = require('stripe');
 
 const app = express();
 app.set('trust proxy', 1); // Required for Railway — enables X-Forwarded-For
@@ -577,7 +576,7 @@ const supabase = createClient(
 );
 
 // ── STRIPE ─────────────────────────────────────────────
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // Price ID map — swap these for live IDs when going to production
 const STRIPE_PRICES = {
