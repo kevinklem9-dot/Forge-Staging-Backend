@@ -576,16 +576,8 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// Map price IDs back to tiers — used by webhook to update tier on subscription changes
-function getTierFromPriceId(priceId) {
-  const map = {};
-  Object.entries(STRIPE_PRICES).forEach(([key, id]) => {
-    if (key.startsWith('iron')) map[id] = 'iron';
-    else if (key.startsWith('steel')) map[id] = 'steel';
-    else if (key.startsWith('forge')) map[id] = 'forge';
-  });
-  return map[priceId] || null;
-}
+// ── STRIPE ─────────────────────────────────────────────
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 // Price ID map — swap these for live IDs when going to production
 const STRIPE_PRICES = {
@@ -602,6 +594,17 @@ const STRIPE_PRICES = {
   iron_founding:       process.env.STRIPE_PRICE_IRON_FOUNDING       || 'price_1TRW33CP6MFAx438rk9GZZ6P',
   steel_founding:      process.env.STRIPE_PRICE_STEEL_FOUNDING      || 'price_1TRW3PCP6MFAx438tgVOex9V',
 };
+
+// Map price IDs back to tiers — used by webhook and sync endpoint
+function getTierFromPriceId(priceId) {
+  const map = {};
+  Object.entries(STRIPE_PRICES).forEach(([key, id]) => {
+    if (key.startsWith('iron')) map[id] = 'iron';
+    else if (key.startsWith('steel')) map[id] = 'steel';
+    else if (key.startsWith('forge')) map[id] = 'forge';
+  });
+  return map[priceId] || null;
+}
 
 // ── MIDDLEWARE ─────────────────────────────────
 const corsOptions = {
