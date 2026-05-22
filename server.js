@@ -4228,7 +4228,7 @@ async function isReviewDisabledByCoach(userId, settingField) {
 async function requireCoach(req, res, next) {
   try {
     const { data: profile } = await supabase.from('profiles')
-      .select('account_type, coach_plan, coach_plan_status')
+      .select('account_type, coach_plan, coach_plan_status, name, coach_title, coach_commission_rate')
       .eq('id', req.user.id).maybeSingle();
     if (profile?.account_type !== 'coach' || !['active','trial'].includes(profile?.coach_plan_status)) {
       return res.status(403).json({ error: 'not_coach', message: 'Coach account required.' });
