@@ -4394,21 +4394,10 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
       return res.status(403).json({ error: 'seat_limit', plan, limit, used });
     }
 
-    // Does the email match an existing FORGE user?
-    // Email lives in auth.users, not profiles — look it up via admin API
+    // Does the email match an existing profile?
     const cleanEmail = email.trim().toLowerCase();
-    let existingUser = null;
-    try {
-      const { data: authList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
-      const matchedAuthUser = authList?.users?.find(u => u.email?.toLowerCase() === cleanEmail);
-      if (matchedAuthUser) {
-        const { data: profileRow } = await supabase
-          .from('profiles').select('id, name').eq('id', matchedAuthUser.id).maybeSingle();
-        if (profileRow) existingUser = profileRow;
-      }
-    } catch(e) {
-      console.warn('auth.admin.listUsers failed, falling back to new-user flow:', e.message);
-    }
+    const { data: existingUser } = await supabase
+      .from('profiles').select('id, name').ilike('email', cleanEmail).maybeSingle();
 
     // De-dupe — coach cannot invite the same client twice
     if (existingUser) {
@@ -4494,8 +4483,8 @@ app.get('/api/coach/clients/:clientId/overview', requireAuth, requireCoach, asyn
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
 
     const [sessionsRes, weekSessionsRes, prsRes, metricsRes, streakRes, profileRes] = await Promise.all([
-      supabase.from('workout_logs').select('id, created_at, day_label').eq('user_id', clientId).order('created_at', { ascending: false }).limit(1),
-      supabase.from('workout_logs').select('id', { count: 'exact', head: true }).eq('user_id', clientId).gte('created_at', weekStart.toISOString()),
+      supabase.from('session_logs').select('id, logged_at, day_label').eq('user_id', clientId).order('logged_at', { ascending: false }).limit(1),
+      supabase.from('session_logs').select('id', { count: 'exact', head: true }).eq('user_id', clientId).gte('logged_at', weekStart.toISOString()),
       supabase.from('personal_records').select('id', { count: 'exact', head: true }).eq('user_id', clientId).gte('achieved_at', monthStart.toISOString().split('T')[0]),
       supabase.from('body_metrics').select('*').eq('user_id', clientId).gte('recorded_at', thirtyDaysAgo.toISOString()).order('recorded_at', { ascending: true }),
       supabase.from('streaks').select('*').eq('user_id', clientId).maybeSingle(),
@@ -4515,13 +4504,31 @@ app.get('/api/coach/clients/:clientId/overview', requireAuth, requireCoach, asyn
       profile: profileRes.data,
       sessions_this_week: weekSessionsRes.count || 0,
       current_streak: streakRes.data?.current_streak || 0,
-      last_session: sessionsRes.data?.[0]?.created_at || null,
+      last_session: sessionsRes.data?.[0]?.logged_at || null,
       prs_this_month: prsRes.count || 0,
       body_metrics: metricsRes.data || [],
       upcoming_sessions: upcoming,
     });
   } catch(err) {
     console.error('Coach overview error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+app.get('/api/coach/clients/:clientId/plan', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data: plan } = await supabase.from('plans')
+      .select('workout_plan, generated_at')
+      .eq('user_id', clientId)
+      .order('generated_at', { ascending: false })
+      .limit(1).maybeSingle();
+    res.json({ plan: plan?.workout_plan || null });
+  } catch(err) {
     res.status(500).json({ error: err.message });
   }
 });
