@@ -4394,10 +4394,21 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
       return res.status(403).json({ error: 'seat_limit', plan, limit, used });
     }
 
-    // Does the email match an existing profile?
+    // Does the email match an existing FORGE user?
+    // Email lives in auth.users, not profiles — look it up via admin API
     const cleanEmail = email.trim().toLowerCase();
-    const { data: existingUser } = await supabase
-      .from('profiles').select('id, name').ilike('email', cleanEmail).maybeSingle();
+    let existingUser = null;
+    try {
+      const { data: authList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+      const matchedAuthUser = authList?.users?.find(u => u.email?.toLowerCase() === cleanEmail);
+      if (matchedAuthUser) {
+        const { data: profileRow } = await supabase
+          .from('profiles').select('id, name').eq('id', matchedAuthUser.id).maybeSingle();
+        if (profileRow) existingUser = profileRow;
+      }
+    } catch(e) {
+      console.warn('auth.admin.listUsers failed, falling back to new-user flow:', e.message);
+    }
 
     // De-dupe — coach cannot invite the same client twice
     if (existingUser) {
