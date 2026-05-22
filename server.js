@@ -4356,15 +4356,15 @@ app.get('/api/coach/clients', requireAuth, requireCoach, async (req, res) => {
         .select('id, name, goal, experience, subscription_tier').in('id', clientIds);
       for (const p of (profiles || [])) profilesById[p.id] = p;
     }
-    // Last active per client — most recent workout_log
+    // Last active per client — most recent session_log (logged_at is YYYY-MM-DD)
     let lastActiveById = {};
     if (clientIds.length) {
-      const { data: logs } = await supabase.from('workout_logs')
-        .select('user_id, created_at')
+      const { data: logs } = await supabase.from('session_logs')
+        .select('user_id, logged_at')
         .in('user_id', clientIds)
-        .order('created_at', { ascending: false });
+        .order('logged_at', { ascending: false });
       for (const log of (logs || [])) {
-        if (!lastActiveById[log.user_id]) lastActiveById[log.user_id] = log.created_at;
+        if (!lastActiveById[log.user_id]) lastActiveById[log.user_id] = log.logged_at;
       }
     }
     const clients = rows.map(r => ({
@@ -4476,17 +4476,20 @@ app.get('/api/coach/clients/:clientId/overview', requireAuth, requireCoach, asyn
     }
 
     const now = new Date();
-    const weekStart = new Date(now);
-    weekStart.setDate(now.getDate() - now.getDay()); // Sunday
-    weekStart.setHours(0,0,0,0);
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    // Week starts Monday — use date strings since logged_at is YYYY-MM-DD
+    const dayOfWeek = now.getDay(); // 0=Sun
+    const daysFromMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+    const weekStartDate = new Date(now);
+    weekStartDate.setDate(now.getDate() - daysFromMonday);
+    const weekStartStr = weekStartDate.toISOString().split('T')[0];
+    const monthStartStr = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
+    const thirtyDaysAgoStr = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
     const [sessionsRes, weekSessionsRes, prsRes, metricsRes, streakRes, profileRes] = await Promise.all([
       supabase.from('session_logs').select('id, logged_at, day_label').eq('user_id', clientId).order('logged_at', { ascending: false }).limit(1),
-      supabase.from('session_logs').select('id', { count: 'exact', head: true }).eq('user_id', clientId).gte('logged_at', weekStart.toISOString()),
-      supabase.from('personal_records').select('id', { count: 'exact', head: true }).eq('user_id', clientId).gte('achieved_at', monthStart.toISOString().split('T')[0]),
-      supabase.from('body_metrics').select('*').eq('user_id', clientId).gte('recorded_at', thirtyDaysAgo.toISOString()).order('recorded_at', { ascending: true }),
+      supabase.from('session_logs').select('id', { count: 'exact', head: true }).eq('user_id', clientId).gte('logged_at', weekStartStr),
+      supabase.from('personal_records').select('id', { count: 'exact', head: true }).eq('user_id', clientId).gte('achieved_at', monthStartStr),
+      supabase.from('body_metrics').select('*').eq('user_id', clientId).gte('recorded_at', thirtyDaysAgoStr).order('recorded_at', { ascending: true }),
       supabase.from('streaks').select('*').eq('user_id', clientId).maybeSingle(),
       supabase.from('profiles').select('name, goal, experience, days_per_week').eq('id', clientId).maybeSingle(),
     ]);
@@ -4540,7 +4543,7 @@ app.get('/api/coach/clients/:clientId/ai-activity', requireAuth, requireCoach, a
       return res.status(403).json({ error: 'no_connection' });
     }
     const [convsRes, weeklyRes, monthlyRes, settingsRes] = await Promise.all([
-      supabase.from('conversations').select('*').eq('user_id', clientId).order('created_at', { ascending: false }).limit(50),
+      supabase.from('chat_conversations').select('*').eq('user_id', clientId).order('created_at', { ascending: false }).limit(50),
       supabase.from('weekly_reviews').select('*').eq('user_id', clientId).order('created_at', { ascending: false }).limit(12),
       supabase.from('monthly_reviews').select('*').eq('user_id', clientId).order('generated_at', { ascending: false }).limit(12),
       supabase.from('coach_ai_review_settings').select('*').eq('coach_id', req.user.id).eq('client_id', clientId).maybeSingle(),
@@ -4644,6 +4647,45 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
       await sendPushToUser(client_id, 'New programme assigned',
         `Your coach has assigned you a new programme: ${name}`,
         '/app.html?panel=workout').catch(() => {});
+
+      // Also update the client's actual plan so it shows in their workout panel
+      const coachPlanData = {
+        days: (programme_data?.sessions || []).map((s, i) => ({
+          day_index: i,
+          day_name: s.name || `Day ${i + 1}`,
+          label: s.name || `Day ${i + 1}`,
+          coach_note: s.note || null,
+          exercises: (s.exercises || []).map(e => ({
+            name: e.name,
+            sets: e.sets,
+            reps: e.reps,
+            rest: e.rpe || e.weight || null,
+            note: `${e.rpe ? 'RPE ' + e.rpe : ''}${e.weight ? e.weight : ''}`.trim() || null,
+          }))
+        })),
+        coach_assigned: true,
+        coach_name: req.coachProfile.name || 'Your coach',
+        programme_name: name,
+      };
+
+      // Get existing plan to update or create new
+      const { data: existingPlan } = await supabase.from('plans')
+        .select('id').eq('user_id', client_id)
+        .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+
+      if (existingPlan?.id) {
+        await supabase.from('plans').update({
+          workout_plan: coachPlanData,
+          translations: {},
+          generated_at: new Date().toISOString(),
+        }).eq('id', existingPlan.id);
+      } else {
+        await supabase.from('plans').insert({
+          user_id: client_id,
+          workout_plan: coachPlanData,
+          generated_at: new Date().toISOString(),
+        });
+      }
     }
     res.json({ ok: true, programme: data });
   } catch(err) { res.status(500).json({ error: err.message }); }
@@ -4662,6 +4704,34 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
     if (data?.client_id) {
       await sendPushToUser(data.client_id, 'Programme updated',
         'Your coach has updated your programme.', '/app.html?panel=workout').catch(() => {});
+
+      // Update client's actual plan
+      if (programme_data) {
+        const updatedPlanData = {
+          days: (programme_data?.sessions || []).map((s, i) => ({
+            day_index: i,
+            day_name: s.name || `Day ${i + 1}`,
+            label: s.name || `Day ${i + 1}`,
+            coach_note: s.note || null,
+            exercises: (s.exercises || []).map(e => ({
+              name: e.name, sets: e.sets, reps: e.reps,
+              rest: e.rpe || e.weight || null,
+            }))
+          })),
+          coach_assigned: true,
+          coach_name: req.coachProfile.name || 'Your coach',
+          programme_name: data.name,
+        };
+        const { data: existingPlan } = await supabase.from('plans')
+          .select('id').eq('user_id', data.client_id)
+          .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+        if (existingPlan?.id) {
+          await supabase.from('plans').update({
+            workout_plan: updatedPlanData, translations: {},
+            generated_at: new Date().toISOString(),
+          }).eq('id', existingPlan.id);
+        }
+      }
     }
     res.json({ ok: true, programme: data });
   } catch(err) { res.status(500).json({ error: err.message }); }
