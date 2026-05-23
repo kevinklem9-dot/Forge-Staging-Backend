@@ -4485,14 +4485,34 @@ app.get('/api/coach/clients/:clientId/overview', requireAuth, requireCoach, asyn
     const monthStartStr = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
     const thirtyDaysAgoStr = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
-    const [sessionsRes, weekSessionsRes, prsRes, metricsRes, streakRes, profileRes] = await Promise.all([
-      supabase.from('session_logs').select('id, logged_at, day_label').eq('user_id', clientId).order('logged_at', { ascending: false }).limit(1),
-      supabase.from('session_logs').select('id', { count: 'exact', head: true }).eq('user_id', clientId).gte('logged_at', weekStartStr),
+    const [lastSessionRes, weekSessionsRes, prsRes, metricsRes, streakRes, profileRes] = await Promise.all([
+      supabase.from('session_logs').select('id, logged_at, day_label, exercises').eq('user_id', clientId).order('logged_at', { ascending: false }).limit(1),
+      supabase.from('session_logs').select('id, logged_at, day_label, exercises').eq('user_id', clientId).gte('logged_at', weekStartStr).order('logged_at', { ascending: false }),
       supabase.from('personal_records').select('id', { count: 'exact', head: true }).eq('user_id', clientId).gte('achieved_at', monthStartStr),
       supabase.from('body_metrics').select('*').eq('user_id', clientId).gte('recorded_at', thirtyDaysAgoStr).order('recorded_at', { ascending: true }),
-      supabase.from('streaks').select('*').eq('user_id', clientId).maybeSingle(),
+      supabase.from('streaks').select('current_streak, longest_streak').eq('user_id', clientId).maybeSingle(),
       supabase.from('profiles').select('name, goal, experience, days_per_week').eq('id', clientId).maybeSingle(),
     ]);
+
+    const weekSessions = weekSessionsRes.data || [];
+
+    // Streak fallback — if no streaks row, count consecutive days back from today using session_logs
+    let currentStreak = streakRes.data?.current_streak ?? null;
+    if (currentStreak === null || currentStreak === undefined) {
+      const { data: allLogs } = await supabase.from('session_logs')
+        .select('logged_at').eq('user_id', clientId).order('logged_at', { ascending: false }).limit(120);
+      const dateSet = new Set((allLogs || []).map(l => (l.logged_at + '').split('T')[0]));
+      let streak = 0;
+      const cursor = new Date();
+      // allow today OR yesterday as the starting anchor so a streak doesn't break before today is logged
+      const todayStr = cursor.toISOString().split('T')[0];
+      if (!dateSet.has(todayStr)) cursor.setDate(cursor.getDate() - 1);
+      while (dateSet.has(cursor.toISOString().split('T')[0])) {
+        streak++;
+        cursor.setDate(cursor.getDate() - 1);
+      }
+      currentStreak = streak;
+    }
 
     // Upcoming sessions — pull from active plan
     let upcoming = [];
@@ -4505,9 +4525,10 @@ app.get('/api/coach/clients/:clientId/overview', requireAuth, requireCoach, asyn
 
     res.json({
       profile: profileRes.data,
-      sessions_this_week: weekSessionsRes.count || 0,
-      current_streak: streakRes.data?.current_streak || 0,
-      last_session: sessionsRes.data?.[0]?.logged_at || null,
+      sessions_this_week: weekSessions.length,
+      recent_sessions: weekSessions,
+      current_streak: currentStreak,
+      last_session: lastSessionRes.data?.[0] || null,
       prs_this_month: prsRes.count || 0,
       body_metrics: metricsRes.data || [],
       upcoming_sessions: upcoming,
@@ -4586,6 +4607,78 @@ app.post('/api/coach/clients/:clientId/notes', requireAuth, requireCoach, async 
     }, { onConflict: 'coach_id,client_id' }).select().maybeSingle();
     if (error) throw error;
     res.json({ ok: true, notes: data });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Coach session feedback ────────────────────────────
+app.get('/api/coach/clients/:clientId/feedback', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data, error } = await supabase.from('coach_session_feedback')
+      .select('id, feedback_text, session_log_id, is_general, created_at, updated_at')
+      .eq('coach_id', req.user.id).eq('client_id', clientId)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ feedback: data || [] });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/coach/clients/:clientId/feedback', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { feedback_text, session_log_id, is_general } = req.body;
+    const text = (feedback_text || '').toString().trim();
+    if (!text) return res.status(400).json({ error: 'empty_feedback' });
+    if (text.length > 1000) return res.status(400).json({ error: 'too_long' });
+    const row = {
+      coach_id: req.user.id,
+      client_id: clientId,
+      feedback_text: text,
+      session_log_id: session_log_id || null,
+      is_general: !!is_general,
+    };
+    const { data, error } = await supabase.from('coach_session_feedback').insert(row).select().maybeSingle();
+    if (error) throw error;
+    res.json({ ok: true, feedback: data });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/coach/feedback/:feedbackId', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { feedbackId } = req.params;
+    const text = (req.body?.feedback_text || '').toString().trim();
+    if (!text) return res.status(400).json({ error: 'empty_feedback' });
+    if (text.length > 1000) return res.status(400).json({ error: 'too_long' });
+    const { data: existing } = await supabase.from('coach_session_feedback')
+      .select('id, coach_id').eq('id', feedbackId).maybeSingle();
+    if (!existing || existing.coach_id !== req.user.id) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+    const { data, error } = await supabase.from('coach_session_feedback')
+      .update({ feedback_text: text, updated_at: new Date().toISOString() })
+      .eq('id', feedbackId).select().maybeSingle();
+    if (error) throw error;
+    res.json({ ok: true, feedback: data });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/coach/feedback/:feedbackId', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { feedbackId } = req.params;
+    const { data: existing } = await supabase.from('coach_session_feedback')
+      .select('id, coach_id').eq('id', feedbackId).maybeSingle();
+    if (!existing || existing.coach_id !== req.user.id) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+    const { error } = await supabase.from('coach_session_feedback').delete().eq('id', feedbackId);
+    if (error) throw error;
+    res.json({ ok: true });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
