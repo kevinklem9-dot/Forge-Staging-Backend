@@ -4632,7 +4632,7 @@ app.post('/api/coach/clients/:clientId/feedback', requireAuth, requireCoach, asy
     if (!await verifyClientConnection(req.user.id, clientId)) {
       return res.status(403).json({ error: 'no_connection' });
     }
-    const { feedback_text, session_log_id, is_general } = req.body;
+    const { feedback_text, session_log_id, is_general, visible_to_client } = req.body;
     const text = (feedback_text || '').toString().trim();
     if (!text) return res.status(400).json({ error: 'empty_feedback' });
     if (text.length > 1000) return res.status(400).json({ error: 'too_long' });
@@ -4642,6 +4642,7 @@ app.post('/api/coach/clients/:clientId/feedback', requireAuth, requireCoach, asy
       feedback_text: text,
       session_log_id: session_log_id || null,
       is_general: !!is_general,
+      visible_to_client: !!visible_to_client,
     };
     const { data, error } = await supabase.from('coach_session_feedback').insert(row).select().maybeSingle();
     if (error) throw error;
@@ -4652,17 +4653,25 @@ app.post('/api/coach/clients/:clientId/feedback', requireAuth, requireCoach, asy
 app.patch('/api/coach/feedback/:feedbackId', requireAuth, requireCoach, async (req, res) => {
   try {
     const { feedbackId } = req.params;
-    const text = (req.body?.feedback_text || '').toString().trim();
-    if (!text) return res.status(400).json({ error: 'empty_feedback' });
-    if (text.length > 1000) return res.status(400).json({ error: 'too_long' });
+    const { feedback_text, visible_to_client } = req.body || {};
     const { data: existing } = await supabase.from('coach_session_feedback')
       .select('id, coach_id').eq('id', feedbackId).maybeSingle();
     if (!existing || existing.coach_id !== req.user.id) {
       return res.status(404).json({ error: 'not_found' });
     }
+    const patch = { updated_at: new Date().toISOString() };
+    if (typeof feedback_text === 'string') {
+      const text = feedback_text.trim();
+      if (!text) return res.status(400).json({ error: 'empty_feedback' });
+      if (text.length > 1000) return res.status(400).json({ error: 'too_long' });
+      patch.feedback_text = text;
+    }
+    if (typeof visible_to_client === 'boolean') {
+      patch.visible_to_client = visible_to_client;
+    }
+    if (Object.keys(patch).length === 1) return res.status(400).json({ error: 'no_changes' });
     const { data, error } = await supabase.from('coach_session_feedback')
-      .update({ feedback_text: text, updated_at: new Date().toISOString() })
-      .eq('id', feedbackId).select().maybeSingle();
+      .update(patch).eq('id', feedbackId).select().maybeSingle();
     if (error) throw error;
     res.json({ ok: true, feedback: data });
   } catch(err) { res.status(500).json({ error: err.message }); }
@@ -4679,6 +4688,190 @@ app.delete('/api/coach/feedback/:feedbackId', requireAuth, requireCoach, async (
     const { error } = await supabase.from('coach_session_feedback').delete().eq('id', feedbackId);
     if (error) throw error;
     res.json({ ok: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Client-facing: feedback shared by my coach ────────
+app.get('/api/my-coach-feedback', requireAuth, async (req, res) => {
+  try {
+    const { data: link } = await supabase.from('coach_clients')
+      .select('coach_id').eq('client_id', req.user.id).eq('status', 'active').maybeSingle();
+    if (!link) return res.json({ feedback: [] });
+    const { data, error } = await supabase.from('coach_session_feedback')
+      .select('id, feedback_text, session_log_id, is_general, created_at, updated_at')
+      .eq('coach_id', link.coach_id).eq('client_id', req.user.id).eq('visible_to_client', true)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    const items = data || [];
+    const sessionIds = items.map(f => f.session_log_id).filter(Boolean);
+    let sessionLabelById = {};
+    if (sessionIds.length) {
+      const { data: sessions } = await supabase.from('session_logs')
+        .select('id, day_label, logged_at').in('id', sessionIds);
+      for (const s of (sessions || [])) sessionLabelById[s.id] = { day_label: s.day_label, logged_at: s.logged_at };
+    }
+    res.json({
+      feedback: items.map(f => ({
+        ...f,
+        session_label: f.session_log_id ? (sessionLabelById[f.session_log_id]?.day_label || null) : null,
+        session_logged_at: f.session_log_id ? (sessionLabelById[f.session_log_id]?.logged_at || null) : null,
+      })),
+    });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Coach ↔ Client messaging ──────────────────────────
+app.get('/api/my-coach-messages', requireAuth, async (req, res) => {
+  try {
+    const { data: link } = await supabase.from('coach_clients')
+      .select('coach_id').eq('client_id', req.user.id).eq('status', 'active').maybeSingle();
+    if (!link) return res.json({ messages: [], coach_id: null });
+    const { data, error } = await supabase.from('coach_messages')
+      .select('id, sender_role, message_text, read_at, created_at')
+      .eq('coach_id', link.coach_id).eq('client_id', req.user.id)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    // Mark unread coach-sent messages as read
+    await supabase.from('coach_messages')
+      .update({ read_at: new Date().toISOString() })
+      .eq('coach_id', link.coach_id).eq('client_id', req.user.id)
+      .eq('sender_role', 'coach').is('read_at', null);
+    res.json({ messages: data || [], coach_id: link.coach_id });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/my-coach-messages', requireAuth, async (req, res) => {
+  try {
+    const { data: link } = await supabase.from('coach_clients')
+      .select('coach_id').eq('client_id', req.user.id).eq('status', 'active').maybeSingle();
+    if (!link) return res.status(403).json({ error: 'no_coach' });
+    const text = (req.body?.message_text || '').toString().trim();
+    if (!text) return res.status(400).json({ error: 'empty_message' });
+    if (text.length > 2000) return res.status(400).json({ error: 'too_long' });
+    const { data, error } = await supabase.from('coach_messages').insert({
+      coach_id: link.coach_id, client_id: req.user.id,
+      sender_role: 'client', message_text: text,
+    }).select().maybeSingle();
+    if (error) throw error;
+    // Push to coach
+    const { data: clientProfile } = await supabase.from('profiles').select('name').eq('id', req.user.id).maybeSingle();
+    const clientName = clientProfile?.name || 'Your client';
+    await sendPushToUser(link.coach_id, 'New client message',
+      `${clientName} sent you a message`,
+      '/app.html?panel=clients').catch(() => {});
+    res.json({ ok: true, message: data });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data, error } = await supabase.from('coach_messages')
+      .select('id, sender_role, message_text, read_at, created_at')
+      .eq('coach_id', req.user.id).eq('client_id', clientId)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    // Mark unread client-sent messages as read
+    await supabase.from('coach_messages')
+      .update({ read_at: new Date().toISOString() })
+      .eq('coach_id', req.user.id).eq('client_id', clientId)
+      .eq('sender_role', 'client').is('read_at', null);
+    res.json({ messages: data || [] });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const text = (req.body?.message_text || '').toString().trim();
+    if (!text) return res.status(400).json({ error: 'empty_message' });
+    if (text.length > 2000) return res.status(400).json({ error: 'too_long' });
+    const { data, error } = await supabase.from('coach_messages').insert({
+      coach_id: req.user.id, client_id: clientId,
+      sender_role: 'coach', message_text: text,
+    }).select().maybeSingle();
+    if (error) throw error;
+    const coachName = req.coachProfile?.name || 'Your coach';
+    await sendPushToUser(clientId, 'Coach replied',
+      `${coachName} replied to your message`,
+      '/app.html?panel=my-coach').catch(() => {});
+    res.json({ ok: true, message: data });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Manual coach reviews (when AI review disabled) ────
+app.post('/api/coach/clients/:clientId/manual-review', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { review_type, review_content, review_period } = req.body || {};
+    if (!['weekly', 'monthly'].includes(review_type)) return res.status(400).json({ error: 'bad_type' });
+    const content = (review_content || '').toString().trim();
+    if (!content) return res.status(400).json({ error: 'empty_content' });
+    if (content.length > 2000) return res.status(400).json({ error: 'too_long' });
+    const period = (review_period || '').toString().slice(0, 32) || null;
+
+    // Upsert on (coach_id, client_id, review_type, review_period) — find first, then update or insert
+    const { data: existing } = await supabase.from('coach_manual_reviews')
+      .select('id').eq('coach_id', req.user.id).eq('client_id', clientId)
+      .eq('review_type', review_type).eq('review_period', period).maybeSingle();
+    let row;
+    if (existing) {
+      const { data, error } = await supabase.from('coach_manual_reviews')
+        .update({ review_content: content, updated_at: new Date().toISOString() })
+        .eq('id', existing.id).select().maybeSingle();
+      if (error) throw error;
+      row = data;
+    } else {
+      const { data, error } = await supabase.from('coach_manual_reviews').insert({
+        coach_id: req.user.id, client_id: clientId,
+        review_type, review_content: content, review_period: period,
+      }).select().maybeSingle();
+      if (error) throw error;
+      row = data;
+    }
+    // Push the client so they see it
+    await sendPushToUser(clientId, 'Coach review',
+      `Your coach posted a ${review_type} review`,
+      '/app.html?panel=coach').catch(() => {});
+    res.json({ ok: true, review: row });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/coach/clients/:clientId/manual-reviews', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data, error } = await supabase.from('coach_manual_reviews')
+      .select('id, review_type, review_content, review_period, created_at, updated_at')
+      .eq('coach_id', req.user.id).eq('client_id', clientId)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ reviews: data || [] });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/my-manual-reviews', requireAuth, async (req, res) => {
+  try {
+    const { data: link } = await supabase.from('coach_clients')
+      .select('coach_id').eq('client_id', req.user.id).eq('status', 'active').maybeSingle();
+    if (!link) return res.json({ reviews: [] });
+    const { data, error } = await supabase.from('coach_manual_reviews')
+      .select('id, review_type, review_content, review_period, created_at, updated_at')
+      .eq('coach_id', link.coach_id).eq('client_id', req.user.id)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ reviews: data || [] });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
