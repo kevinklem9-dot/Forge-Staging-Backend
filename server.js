@@ -4901,19 +4901,65 @@ app.get('/api/notifications/unread-counts', requireAuth, async (req, res) => {
     const isCoach = profile?.account_type === 'coach' && ['active', 'trial'].includes(profile?.coach_plan_status);
 
     if (isCoach) {
-      const [coachMsgsRes, newConnRes] = await Promise.all([
+      const fortyEightHoursAgoIso = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+      const fortyEightHoursAgoDateStr = fortyEightHoursAgoIso.split('T')[0];
+
+      // Active client IDs to scope activity queries
+      const { data: links } = await supabase.from('coach_clients')
+        .select('client_id').eq('coach_id', uid).eq('status', 'active');
+      const clientIds = (links || []).map(l => l.client_id).filter(Boolean);
+
+      const [coachMsgsRes, newConnRes, sessionsRes, prsRes, metricsRes, convRes, weeklyRes, monthlyRes, manualRes] = await Promise.all([
         supabase.from('coach_messages').select('client_id')
           .eq('coach_id', uid).eq('sender_role', 'client').is('read_at', null),
         supabase.from('coach_clients').select('id', { count: 'exact', head: true })
           .eq('coach_id', uid).eq('status', 'active').eq('coach_seen', false),
+        clientIds.length
+          ? supabase.from('session_logs').select('user_id').in('user_id', clientIds).gte('logged_at', fortyEightHoursAgoDateStr)
+          : Promise.resolve({ data: [] }),
+        clientIds.length
+          ? supabase.from('personal_records').select('user_id').in('user_id', clientIds).gte('achieved_at', fortyEightHoursAgoIso)
+          : Promise.resolve({ data: [] }),
+        clientIds.length
+          ? supabase.from('body_metrics').select('user_id').in('user_id', clientIds).gte('recorded_at', fortyEightHoursAgoIso)
+          : Promise.resolve({ data: [] }),
+        clientIds.length
+          ? supabase.from('chat_conversations').select('user_id').in('user_id', clientIds).gte('created_at', fortyEightHoursAgoIso)
+          : Promise.resolve({ data: [] }),
+        clientIds.length
+          ? supabase.from('weekly_reviews').select('user_id').in('user_id', clientIds).gte('created_at', fortyEightHoursAgoIso)
+          : Promise.resolve({ data: [] }),
+        clientIds.length
+          ? supabase.from('monthly_reviews').select('user_id').in('user_id', clientIds).gte('generated_at', fortyEightHoursAgoIso)
+          : Promise.resolve({ data: [] }),
+        clientIds.length
+          ? supabase.from('coach_manual_reviews').select('client_id').eq('coach_id', uid).in('client_id', clientIds).gte('created_at', fortyEightHoursAgoIso)
+          : Promise.resolve({ data: [] }),
       ]);
+
       const byClient = {};
       for (const row of (coachMsgsRes.data || [])) {
         byClient[row.client_id] = (byClient[row.client_id] || 0) + 1;
       }
+
+      const activityByClient = {};
+      const bump = (cid, key) => {
+        if (!cid) return;
+        if (!activityByClient[cid]) activityByClient[cid] = { workouts: 0, prs: 0, metrics: 0, ai: 0 };
+        activityByClient[cid][key]++;
+      };
+      for (const r of (sessionsRes.data || [])) bump(r.user_id, 'workouts');
+      for (const r of (prsRes.data || [])) bump(r.user_id, 'prs');
+      for (const r of (metricsRes.data || [])) bump(r.user_id, 'metrics');
+      for (const r of (convRes.data || [])) bump(r.user_id, 'ai');
+      for (const r of (weeklyRes.data || [])) bump(r.user_id, 'ai');
+      for (const r of (monthlyRes.data || [])) bump(r.user_id, 'ai');
+      for (const r of (manualRes.data || [])) bump(r.client_id, 'ai');
+
       out.client_messages_unread = (coachMsgsRes.data || []).length;
       out.client_messages_by_client = byClient;
       out.new_client_connections = newConnRes.count || 0;
+      out.client_new_activity = activityByClient;
     }
 
     res.json(out);
