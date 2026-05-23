@@ -855,13 +855,15 @@ async function handleReferralConversion(userId) {
 
 app.use(express.json({ limit: '500kb' }));
 
-// Rate limiting — protect against abuse
-const limiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
-const chatLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
-const planLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: { error: 'Too many plan generations — try again in an hour.' } });
-const checkinLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, message: { error: 'Too many check-ins — slow down.' } });
-const signupLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, message: { error: 'Too many signups — try again later.' } });
-const resetLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: { error: 'Too many reset attempts — try again later.' } });
+// Rate limiting — protect against abuse. Skipped entirely outside production so
+// staging (NODE_ENV=development) never blocks testing.
+const skipNonProd = (req) => process.env.NODE_ENV !== 'production';
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 500, skip: skipNonProd });
+const chatLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, skip: skipNonProd });
+const planLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 20, skip: skipNonProd, message: { error: 'Too many plan generations — try again in an hour.' } });
+const checkinLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, skip: skipNonProd, message: { error: 'Too many check-ins — slow down.' } });
+const signupLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 50, skip: skipNonProd, message: { error: 'Too many signups — try again later.' } });
+const resetLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, skip: skipNonProd, message: { error: 'Too many reset attempts — try again later.' } });
 app.use('/api/', limiter);
 app.use('/api/chat', chatLimiter);
 app.use('/api/generate-plan', planLimiter);
