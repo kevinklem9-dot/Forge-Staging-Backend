@@ -4877,6 +4877,90 @@ app.get('/api/my-manual-reviews', requireAuth, async (req, res) => {
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Notifications: unread counts ──────────────────────
+app.get('/api/notifications/unread-counts', requireAuth, async (req, res) => {
+  try {
+    const uid = req.user.id;
+    const [profileRes, msgsRes, fbRes, revRes] = await Promise.all([
+      supabase.from('profiles').select('account_type, coach_plan_status').eq('id', uid).maybeSingle(),
+      supabase.from('coach_messages').select('id', { count: 'exact', head: true })
+        .eq('client_id', uid).eq('sender_role', 'coach').is('read_at', null),
+      supabase.from('coach_session_feedback').select('id', { count: 'exact', head: true })
+        .eq('client_id', uid).eq('visible_to_client', true).eq('seen_by_client', false),
+      supabase.from('coach_manual_reviews').select('id', { count: 'exact', head: true })
+        .eq('client_id', uid).eq('seen_by_client', false),
+    ]);
+
+    const out = {
+      coach_messages_unread: msgsRes.count || 0,
+      coach_feedback_unread: fbRes.count || 0,
+      coach_review_unread: revRes.count || 0,
+    };
+
+    const profile = profileRes.data;
+    const isCoach = profile?.account_type === 'coach' && ['active', 'trial'].includes(profile?.coach_plan_status);
+
+    if (isCoach) {
+      const [coachMsgsRes, newConnRes] = await Promise.all([
+        supabase.from('coach_messages').select('client_id')
+          .eq('coach_id', uid).eq('sender_role', 'client').is('read_at', null),
+        supabase.from('coach_clients').select('id', { count: 'exact', head: true })
+          .eq('coach_id', uid).eq('status', 'active').eq('coach_seen', false),
+      ]);
+      const byClient = {};
+      for (const row of (coachMsgsRes.data || [])) {
+        byClient[row.client_id] = (byClient[row.client_id] || 0) + 1;
+      }
+      out.client_messages_unread = (coachMsgsRes.data || []).length;
+      out.client_messages_by_client = byClient;
+      out.new_client_connections = newConnRes.count || 0;
+    }
+
+    res.json(out);
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/notifications/mark-seen', requireAuth, async (req, res) => {
+  try {
+    const { type } = req.body || {};
+    const uid = req.user.id;
+    if (type === 'coach_messages') {
+      await supabase.from('coach_messages')
+        .update({ read_at: new Date().toISOString() })
+        .eq('client_id', uid).eq('sender_role', 'coach').is('read_at', null);
+    } else if (type === 'coach_feedback') {
+      await supabase.from('coach_session_feedback')
+        .update({ seen_by_client: true })
+        .eq('client_id', uid).eq('seen_by_client', false);
+    } else if (type === 'coach_review') {
+      await supabase.from('coach_manual_reviews')
+        .update({ seen_by_client: true })
+        .eq('client_id', uid).eq('seen_by_client', false);
+    } else if (type === 'client_connection') {
+      await supabase.from('coach_clients')
+        .update({ coach_seen: true })
+        .eq('coach_id', uid).eq('status', 'active').eq('coach_seen', false);
+    } else {
+      return res.status(400).json({ error: 'bad_type' });
+    }
+    res.json({ ok: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/notifications/mark-client-messages-seen/:clientId', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    await supabase.from('coach_messages')
+      .update({ read_at: new Date().toISOString() })
+      .eq('coach_id', req.user.id).eq('client_id', clientId)
+      .eq('sender_role', 'client').is('read_at', null);
+    res.json({ ok: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
 app.patch('/api/coach/clients/:clientId/review-settings', requireAuth, requireCoach, async (req, res) => {
   try {
     const { clientId } = req.params;
@@ -5074,7 +5158,8 @@ app.post('/api/coach-connection/:connectionId/respond', requireAuth, async (req,
 
     if (action === 'accept') {
       await supabase.from('coach_clients').update({
-        status: 'active', connected_at: new Date().toISOString()
+        status: 'active', connected_at: new Date().toISOString(),
+        coach_seen: false,
       }).eq('id', connectionId);
       // Default review settings (enabled)
       await supabase.from('coach_ai_review_settings').upsert({
