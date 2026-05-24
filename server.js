@@ -2971,6 +2971,53 @@ app.patch('/api/admin/users/:userId/tier', requireAuth, requireAdmin, async (req
   }
 });
 
+// ── ADMIN — Coach plan controls (trial expiry / extend / activate) ──
+app.patch('/api/admin/users/:userId/coach-plan', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { action } = req.body || {};
+    const updates = {};
+    if (action === 'expire_trial') {
+      updates.coach_plan_status = 'cancelled';
+    } else if (action === 'extend_trial') {
+      // Trial is a fixed 14-day window from coach_trial_start; setting start to 7 days ago
+      // leaves 7 days remaining.
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      updates.coach_trial_start = sevenDaysAgo;
+      updates.coach_plan_status = 'trial';
+    } else if (action === 'set_active') {
+      updates.coach_plan_status = 'active';
+    } else {
+      return res.status(400).json({ error: 'bad_action' });
+    }
+    const { data, error } = await supabase.from('profiles')
+      .update(updates).eq('id', userId).select().maybeSingle();
+    if (error) throw error;
+    res.json({ success: true, profile: data });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── ADMIN — Coach exempt toggle (bypasses requireCoach plan-status check) ──
+app.patch('/api/admin/users/:userId/coach-exempt', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { exempt } = req.body || {};
+    if (typeof exempt !== 'boolean') return res.status(400).json({ error: 'bad_exempt' });
+    const { data, error } = await supabase.from('profiles')
+      .update({ is_coach_exempt: exempt }).eq('id', userId).select().maybeSingle();
+    if (error) throw error;
+    res.json({ success: true, profile: data });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── App version (used by frontend auto-update banner) ──
+app.get('/api/version', (req, res) => {
+  res.json({
+    version: process.env.APP_VERSION || '1.0.0',
+    deployed_at: process.env.DEPLOYED_AT || new Date().toISOString(),
+  });
+});
+
 
 // ── PROGRAMMES — Multiple saved plans ─────────
 app.get('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
@@ -4230,9 +4277,13 @@ async function isReviewDisabledByCoach(userId, settingField) {
 async function requireCoach(req, res, next) {
   try {
     const { data: profile } = await supabase.from('profiles')
-      .select('account_type, coach_plan, coach_plan_status, name, coach_title, coach_commission_rate')
+      .select('account_type, coach_plan, coach_plan_status, name, coach_title, coach_commission_rate, is_coach_exempt')
       .eq('id', req.user.id).maybeSingle();
-    if (profile?.account_type !== 'coach' || !['active','trial'].includes(profile?.coach_plan_status)) {
+    if (profile?.account_type !== 'coach') {
+      return res.status(403).json({ error: 'not_coach', message: 'Coach account required.' });
+    }
+    // Exempt accounts bypass the plan-status check (still must be account_type='coach')
+    if (!profile.is_coach_exempt && !['active','trial'].includes(profile?.coach_plan_status)) {
       return res.status(403).json({ error: 'not_coach', message: 'Coach account required.' });
     }
     req.coachProfile = profile;
