@@ -10,6 +10,19 @@ const Anthropic = require('@anthropic-ai/sdk').default;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// Skip review generation if the user's active coach has disabled this review type.
+async function isReviewDisabledByCoach(userId, settingField) {
+  try {
+    const { data: link } = await supabase.from('coach_clients')
+      .select('coach_id').eq('client_id', userId).eq('status', 'active').maybeSingle();
+    if (!link?.coach_id) return false;
+    const { data: settings } = await supabase.from('coach_ai_review_settings')
+      .select(settingField).eq('coach_id', link.coach_id).eq('client_id', userId).maybeSingle();
+    if (!settings) return false;
+    return settings[settingField] === false;
+  } catch(e) { return false; }
+}
+
 async function generateWeeklyReviews() {
   const weekStart = new Date();
   weekStart.setDate(weekStart.getDate() - 7);
@@ -26,6 +39,10 @@ async function generateWeeklyReviews() {
 
   for (const userId of userIds) {
     try {
+      if (await isReviewDisabledByCoach(userId, 'weekly_review_enabled')) {
+        console.log(`Weekly review disabled by coach for ${userId}, skipping`);
+        continue;
+      }
       // Get week's sessions
       const { data: sessions } = await supabase
         .from('session_logs')

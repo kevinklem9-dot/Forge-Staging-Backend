@@ -1866,6 +1866,12 @@ function applyPlanUpdate(plan, instruction) {
 // ── POST-WORKOUT CHECK-IN ──────────────────────
 app.post('/api/checkin', requireAuth, async (req, res) => {
   try {
+    // If this user's coach has disabled post-workout check-ins, skip silently
+    // and tell the client there's nothing to show.
+    if (await isReviewDisabledByCoach(req.user.id, 'post_workout_checkin_enabled')) {
+      return res.json({ disabled: true });
+    }
+
     const { session_summary, feeling, difficulty, messages, language } = req.body;
 
     const [{ data: profile }, { data: planData }] = await Promise.all([

@@ -20,6 +20,19 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 console.log('Monthly review job starting — Supabase and Anthropic clients initialised ✓');
 
+// Skip review generation if the user's active coach has disabled this review type.
+async function isReviewDisabledByCoach(userId, settingField) {
+  try {
+    const { data: link } = await supabase.from('coach_clients')
+      .select('coach_id').eq('client_id', userId).eq('status', 'active').maybeSingle();
+    if (!link?.coach_id) return false;
+    const { data: settings } = await supabase.from('coach_ai_review_settings')
+      .select(settingField).eq('coach_id', link.coach_id).eq('client_id', userId).maybeSingle();
+    if (!settings) return false;
+    return settings[settingField] === false;
+  } catch(e) { return false; }
+}
+
 function billingMonth() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
@@ -50,6 +63,10 @@ async function generateMonthlyReviews() {
 
   for (const profile of forgeProfiles) {
     try {
+      if (await isReviewDisabledByCoach(profile.id, 'monthly_review_enabled')) {
+        console.log(`Monthly review disabled by coach for ${profile.id}, skipping`);
+        continue;
+      }
       // Skip if review already generated this month
       const { data: existing } = await supabase
         .from('monthly_reviews')
