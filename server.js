@@ -689,19 +689,25 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
           const coachPlan = session.metadata?.coach_plan;
           const coachBio = session.metadata?.coach_bio || null;
           const coachTitle = session.metadata?.coach_title || null;
+          const isPostTrial = session.metadata?.coach_post_trial === 'true';
           const planConfig = COACH_PLAN_CONFIG[coachPlan];
           if (planConfig) {
-            await supabase.from('profiles').update({
+            const update = {
               account_type: 'coach',
               coach_plan: coachPlan,
-              coach_plan_status: 'trial',
-              coach_trial_start: new Date().toISOString(),
+              coach_plan_status: 'active',
               coach_stripe_subscription_id: session.subscription,
               coach_commission_rate: planConfig.commissionRate,
-              coach_bio: coachBio,
-              coach_title: coachTitle,
               stripe_customer_id: session.customer,
-            }).eq('id', userId);
+            };
+            // Post-trial reactivation: do NOT touch coach_trial_start (trial already happened),
+            // and don't overwrite title/bio if not provided.
+            if (!isPostTrial) {
+              update.coach_trial_start = new Date().toISOString();
+              if (coachBio) update.coach_bio = coachBio;
+              if (coachTitle) update.coach_title = coachTitle;
+            }
+            await supabase.from('profiles').update(update).eq('id', userId);
           }
           break;
         }
@@ -4283,14 +4289,33 @@ async function isReviewDisabledByCoach(userId, settingField) {
 async function requireCoach(req, res, next) {
   try {
     const { data: profile } = await supabase.from('profiles')
-      .select('account_type, coach_plan, coach_plan_status, name, coach_title, coach_commission_rate, is_coach_exempt')
+      .select('account_type, coach_plan, coach_plan_status, coach_trial_start, name, coach_title, coach_commission_rate, is_coach_exempt')
       .eq('id', req.user.id).maybeSingle();
     if (profile?.account_type !== 'coach') {
       return res.status(403).json({ error: 'not_coach', message: 'Coach account required.' });
     }
-    // Exempt accounts bypass the plan-status check (still must be account_type='coach')
-    if (!profile.is_coach_exempt && !['active','trial'].includes(profile?.coach_plan_status)) {
+    // Exempt accounts bypass ALL coach plan-status / trial-expiry checks
+    if (profile.is_coach_exempt) {
+      req.coachProfile = profile;
+      return next();
+    }
+    if (!['active','trial'].includes(profile?.coach_plan_status)) {
+      // If they were already marked expired/cancelled, surface that to the client
+      if (profile?.coach_plan_status === 'expired') {
+        return res.status(403).json({ error: 'coach_trial_expired', message: 'Your coach trial has ended.' });
+      }
       return res.status(403).json({ error: 'not_coach', message: 'Coach account required.' });
+    }
+    // Active trial — check the 14-day window
+    if (profile.coach_plan_status === 'trial' && profile.coach_trial_start) {
+      const trialEnd = new Date(profile.coach_trial_start);
+      trialEnd.setDate(trialEnd.getDate() + 14);
+      if (new Date() > trialEnd) {
+        await supabase.from('profiles')
+          .update({ coach_plan_status: 'expired' })
+          .eq('id', req.user.id);
+        return res.status(403).json({ error: 'coach_trial_expired', message: 'Your coach trial has ended.' });
+      }
     }
     req.coachProfile = profile;
     next();
@@ -4317,44 +4342,77 @@ async function countActiveClients(coachId) {
 }
 
 // ── Coach setup — Stripe checkout for new coach plan ──
+// ── Coach setup — activates trial immediately, NO Stripe at this step.
+// Card is collected only after the 14-day trial expires (see /api/coach/create-checkout).
 app.post('/api/coach/setup', requireAuth, async (req, res) => {
   try {
-    if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
     const { title, bio, plan, billing } = req.body;
-    if (!title || !plan || !billing) return res.status(400).json({ error: 'Missing title, plan, or billing' });
-    if (!COACH_PLAN_CONFIG[plan]) return res.status(400).json({ error: 'Invalid plan' });
-    if (!['monthly','annual'].includes(billing)) return res.status(400).json({ error: 'Invalid billing' });
+    if (!title) return res.status(400).json({ error: 'Missing title' });
+    if (!plan || !COACH_PLAN_CONFIG[plan]) return res.status(400).json({ error: 'Invalid plan' });
 
-    const priceKey = `coach_${plan}_${billing}`;
+    const planConfig = COACH_PLAN_CONFIG[plan];
+    const userId = req.user.id;
+
+    const updates = {
+      account_type: 'coach',
+      coach_plan: plan,
+      coach_plan_status: 'trial',
+      coach_trial_start: new Date().toISOString(),
+      coach_commission_rate: planConfig.commissionRate,
+      coach_bio: (bio || '').toString().slice(0, 200) || null,
+      coach_title: (title || '').toString().slice(0, 100),
+    };
+    // Remember the billing preference for when the user hits Stripe at trial end.
+    if (['monthly', 'annual'].includes(billing)) updates.coach_billing_preference = billing;
+
+    const { error } = await supabase.from('profiles').update(updates).eq('id', userId);
+    if (error) throw error;
+
+    res.json({ ok: true, plan, status: 'trial' });
+  } catch(err) {
+    console.error('Coach setup error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Coach checkout — called only when the trial has expired (or user upgrades early).
+// Creates a Stripe subscription session with NO trial (the in-app trial was already used).
+app.post('/api/coach/create-checkout', requireAuth, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
+    const { plan, billing } = req.body || {};
+
+    const { data: profile } = await supabase.from('profiles')
+      .select('stripe_customer_id, name, coach_plan, coach_billing_preference').eq('id', req.user.id).maybeSingle();
+
+    const chosenPlan = plan || profile?.coach_plan;
+    const chosenBilling = billing || profile?.coach_billing_preference || 'annual';
+    if (!chosenPlan || !COACH_PLAN_CONFIG[chosenPlan]) return res.status(400).json({ error: 'Invalid plan' });
+    if (!['monthly','annual'].includes(chosenBilling)) return res.status(400).json({ error: 'Invalid billing' });
+
+    const priceKey = `coach_${chosenPlan}_${chosenBilling}`;
     const priceId = STRIPE_PRICES[priceKey];
     if (!priceId) return res.status(400).json({ error: `Coach price ID not configured for ${priceKey}` });
 
-    const userId = req.user.id;
-    const userEmail = req.user.email;
-
     // Get or create Stripe customer
-    const { data: profile } = await supabase.from('profiles')
-      .select('stripe_customer_id, name').eq('id', userId).maybeSingle();
     let customerId = profile?.stripe_customer_id;
     if (!customerId) {
       const customer = await stripe.customers.create({
-        email: userEmail, name: profile?.name || '', metadata: { user_id: userId },
+        email: req.user.email, name: profile?.name || '', metadata: { user_id: req.user.id },
       });
       customerId = customer.id;
-      await supabase.from('profiles').update({ stripe_customer_id: customerId }).eq('id', userId);
+      await supabase.from('profiles').update({ stripe_customer_id: customerId }).eq('id', req.user.id);
     }
 
     const frontendUrl = process.env.FRONTEND_URL || 'https://klemforge.com';
     const appUrl = frontendUrl.replace(/\/$/, '') + '/app.html';
 
-    // Metadata stored on both session and subscription so webhook can recover it
     const coachMetadata = {
-      user_id: userId,
+      user_id: req.user.id,
       account_type: 'coach',
-      coach_plan: plan,
-      coach_billing: billing,
-      coach_title: (title || '').slice(0, 100),
-      coach_bio: (bio || '').slice(0, 200),
+      coach_plan: chosenPlan,
+      coach_billing: chosenBilling,
+      coach_post_trial: 'true', // signals to webhook: don't reset coach_trial_start
     };
 
     const session = await stripe.checkout.sessions.create({
@@ -4362,18 +4420,31 @@ app.post('/api/coach/setup', requireAuth, async (req, res) => {
       payment_method_types: ['card'],
       line_items: [{ price: priceId, quantity: 1 }],
       mode: 'subscription',
-      success_url: `${appUrl}?coach_setup=success`,
-      cancel_url: `${appUrl}?coach_setup=cancelled`,
+      success_url: `${appUrl}?coach_payment=success`,
+      cancel_url: `${appUrl}?coach_payment=cancelled`,
       metadata: coachMetadata,
-      subscription_data: { trial_period_days: 14, metadata: coachMetadata },
+      // trial already used — charge immediately
+      subscription_data: { metadata: coachMetadata },
       allow_promotion_codes: true,
     });
 
     res.json({ url: session.url, session_id: session.id });
   } catch(err) {
-    console.error('Coach setup error:', err.message);
+    console.error('Coach create-checkout error:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── Downgrade a coach account back to individual user (called from trial-expired paywall)
+app.post('/api/coach/downgrade', requireAuth, async (req, res) => {
+  try {
+    const { error } = await supabase.from('profiles').update({
+      account_type: 'user',
+      coach_plan_status: 'cancelled',
+    }).eq('id', req.user.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Coach profile ──────────────────────────────────────
