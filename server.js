@@ -4578,6 +4578,9 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
           .from('coach_clients').insert(insertRow).select().maybeSingle();
         if (insertErr) throw insertErr;
         newLink = inserted;
+        console.log('[invite] coach_clients insert result:', JSON.stringify(inserted));
+        console.log('[invite] client_id stored:', insertRow.client_id);
+        console.log('[invite] invited_email stored:', insertRow.invited_email);
         console.log('[invite] created coach_clients row:', newLink?.id, 'for client', existingUser.id);
       }
 
@@ -4605,6 +4608,9 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
         .from('coach_clients').insert(insertRow).select().maybeSingle();
       if (insertErr) throw insertErr;
       newLink = inserted;
+      console.log('[invite] coach_clients insert result:', JSON.stringify(inserted));
+      console.log('[invite] client_id stored:', insertRow.client_id);
+      console.log('[invite] invited_email stored:', insertRow.invited_email);
       console.log('[invite] created coach_clients row:', newLink?.id, 'for email', cleanEmail);
       // Email send is wired up to existing email system when available.
       // For now we log and rely on the recipient signing up — they'll see the invite on first login.
@@ -5374,6 +5380,7 @@ app.get('/api/my-pending-coach-request', requireAuth, async (req, res) => {
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
+    console.log('[my-pending] result for user', req.user.id, ':', JSON.stringify(row));
     if (!row) return res.json({ pending: false });
     const { data: coachProfile } = await supabase.from('profiles')
       .select('name, coach_title, coach_bio').eq('id', row.coach_id).maybeSingle();
