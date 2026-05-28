@@ -4529,35 +4529,58 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
     const { data: existingUser } = await supabase
       .from('profiles').select('id, name').ilike('email', cleanEmail).maybeSingle();
 
-    // De-dupe — coach cannot invite the same client twice
-    if (existingUser) {
-      const { data: existingLink } = await supabase.from('coach_clients')
-        .select('id, status').eq('coach_id', req.user.id).eq('client_id', existingUser.id)
-        .neq('status', 'disconnected').maybeSingle();
-      if (existingLink) return res.status(400).json({ error: 'already_invited', status: existingLink.status });
-    } else {
-      const { data: existingInvite } = await supabase.from('coach_clients')
-        .select('id').eq('coach_id', req.user.id).eq('invited_email', cleanEmail)
-        .neq('status', 'disconnected').maybeSingle();
-      if (existingInvite) return res.status(400).json({ error: 'already_invited', status: 'pending' });
-    }
-
-    const insertRow = {
-      coach_id: req.user.id,
-      status: 'pending',
-      created_at: new Date().toISOString(),
-    };
-    if (existingUser) {
-      insertRow.client_id = existingUser.id;
-    } else {
-      insertRow.invited_email = cleanEmail;
-    }
-    const { data: newLink, error: insertErr } = await supabase
-      .from('coach_clients').insert(insertRow).select().maybeSingle();
-    if (insertErr) throw insertErr;
+    let newLink = null;
 
     if (existingUser) {
-      const coachName = req.coachProfile.coach_title ? `${req.user.email}` : req.user.email;
+      // Block if the client already has an active coach (any coach, not just this one)
+      const { data: activeCoach } = await supabase.from('coach_clients')
+        .select('id, coach_id').eq('client_id', existingUser.id).eq('status', 'active').maybeSingle();
+      if (activeCoach && activeCoach.coach_id !== req.user.id) {
+        return res.status(409).json({
+          error: 'already_has_coach',
+          message: 'This user already has an active coach.'
+        });
+      }
+
+      // Look for any prior link between this coach and this client
+      const { data: existing } = await supabase.from('coach_clients')
+        .select('id, status').eq('coach_id', req.user.id).eq('client_id', existingUser.id).maybeSingle();
+
+      if (existing) {
+        if (existing.status === 'pending') {
+          return res.json({ type: 'existing', message: 'Invite already sent.', connection_id: existing.id });
+        }
+        if (existing.status === 'active') {
+          return res.status(409).json({ error: 'already_connected', message: 'You are already connected with this client.' });
+        }
+        if (existing.status === 'disconnected') {
+          // Re-invite: update the existing row in place rather than insert a new one
+          const { data: updated, error: updateErr } = await supabase.from('coach_clients').update({
+            status: 'pending',
+            disconnected_at: null,
+            created_at: new Date().toISOString(),
+            coach_seen: false,
+          }).eq('id', existing.id).select().maybeSingle();
+          if (updateErr) throw updateErr;
+          newLink = updated;
+          console.log('[invite] re-invited disconnected coach_clients row:', newLink?.id);
+        }
+      }
+
+      if (!newLink) {
+        const insertRow = {
+          coach_id: req.user.id,
+          client_id: existingUser.id,
+          status: 'pending',
+          created_at: new Date().toISOString(),
+        };
+        const { data: inserted, error: insertErr } = await supabase
+          .from('coach_clients').insert(insertRow).select().maybeSingle();
+        if (insertErr) throw insertErr;
+        newLink = inserted;
+        console.log('[invite] created coach_clients row:', newLink?.id, 'for client', existingUser.id);
+      }
+
       await sendPushToUser(
         existingUser.id,
         'New coach request',
@@ -4566,6 +4589,23 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
       ).catch(() => {});
       return res.json({ type: 'existing', message: 'Connection request sent.', connection_id: newLink.id });
     } else {
+      // No existing user — invite by email
+      const { data: existingInvite } = await supabase.from('coach_clients')
+        .select('id').eq('coach_id', req.user.id).eq('invited_email', cleanEmail)
+        .neq('status', 'disconnected').maybeSingle();
+      if (existingInvite) return res.status(400).json({ error: 'already_invited', status: 'pending' });
+
+      const insertRow = {
+        coach_id: req.user.id,
+        invited_email: cleanEmail,
+        status: 'pending',
+        created_at: new Date().toISOString(),
+      };
+      const { data: inserted, error: insertErr } = await supabase
+        .from('coach_clients').insert(insertRow).select().maybeSingle();
+      if (insertErr) throw insertErr;
+      newLink = inserted;
+      console.log('[invite] created coach_clients row:', newLink?.id, 'for email', cleanEmail);
       // Email send is wired up to existing email system when available.
       // For now we log and rely on the recipient signing up — they'll see the invite on first login.
       console.log(`[coach invite] new-user invite recorded for ${cleanEmail} from coach ${req.user.id}`);
@@ -5009,7 +5049,7 @@ app.get('/api/my-manual-reviews', requireAuth, async (req, res) => {
 app.get('/api/notifications/unread-counts', requireAuth, async (req, res) => {
   try {
     const uid = req.user.id;
-    const [profileRes, msgsRes, fbRes, revRes] = await Promise.all([
+    const [profileRes, msgsRes, fbRes, revRes, coachReqRes] = await Promise.all([
       supabase.from('profiles').select('account_type, coach_plan_status').eq('id', uid).maybeSingle(),
       supabase.from('coach_messages').select('id', { count: 'exact', head: true })
         .eq('client_id', uid).eq('sender_role', 'coach').is('read_at', null),
@@ -5017,12 +5057,15 @@ app.get('/api/notifications/unread-counts', requireAuth, async (req, res) => {
         .eq('client_id', uid).eq('visible_to_client', true).eq('seen_by_client', false),
       supabase.from('coach_manual_reviews').select('id', { count: 'exact', head: true })
         .eq('client_id', uid).eq('seen_by_client', false),
+      supabase.from('coach_clients').select('id', { count: 'exact', head: true })
+        .eq('client_id', uid).eq('status', 'pending'),
     ]);
 
     const out = {
       coach_messages_unread: msgsRes.count || 0,
       coach_feedback_unread: fbRes.count || 0,
       coach_review_unread: revRes.count || 0,
+      coach_requests_pending: coachReqRes.count || 0,
     };
 
     const profile = profileRes.data;
@@ -5317,6 +5360,34 @@ app.get('/api/my-coach', requireAuth, async (req, res) => {
       pendingCoach = { connection_id: pending.id, coach_id: pending.coach_id, requested_at: pending.created_at, ...coachProfile };
     }
     res.json({ coach, pending: pendingCoach });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Lightweight check used by the Account panel every time it opens — returns the most recent
+// pending coach connection request for this user (or { pending: false }).
+app.get('/api/my-pending-coach-request', requireAuth, async (req, res) => {
+  try {
+    const { data: row } = await supabase.from('coach_clients')
+      .select('id, coach_id, created_at')
+      .eq('client_id', req.user.id)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (!row) return res.json({ pending: false });
+    const { data: coachProfile } = await supabase.from('profiles')
+      .select('name, coach_title, coach_bio').eq('id', row.coach_id).maybeSingle();
+    res.json({
+      pending: true,
+      coach: {
+        id: row.coach_id,
+        name: coachProfile?.name || null,
+        title: coachProfile?.coach_title || null,
+        bio: coachProfile?.coach_bio || null,
+        connection_id: row.id,
+        requested_at: row.created_at,
+      }
+    });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
