@@ -2082,6 +2082,25 @@ app.get('/api/history', requireAuth, async (req, res) => {
   }
 });
 
+// ── GET SESSION LOGS ──────────────────────────────
+// Returns full session_logs rows (with day_label + exercises jsonb) so the progress
+// panel can render workouts grouped by session rather than flattened by exercise.
+app.get('/api/sessions', requireAuth, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const { data, error } = await supabase
+      .from('session_logs')
+      .select('id, logged_at, day_index, day_label, exercises, feeling, difficulty')
+      .eq('user_id', req.user.id)
+      .order('logged_at', { ascending: false })
+      .limit(limit);
+    if (error) throw error;
+    res.json({ sessions: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── GET PRs ────────────────────────────────────
 app.get('/api/prs', requireAuth, async (req, res) => {
   try {
