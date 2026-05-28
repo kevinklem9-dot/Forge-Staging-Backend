@@ -4524,10 +4524,29 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
       return res.status(403).json({ error: 'seat_limit', plan, limit, used });
     }
 
-    // Does the email match an existing profile?
+    // Does the email match an existing user? `profiles` has NO email column —
+    // it must come from auth.users via auth.admin.listUsers(). DO NOT change this to
+    // `profiles.ilike('email', …)` — that returns null for every real user and breaks
+    // every invite silently. See decisions.md: "PERMANENT: Coach invite existing-user lookup".
     const cleanEmail = email.trim().toLowerCase();
-    const { data: existingUser } = await supabase
-      .from('profiles').select('id, name').ilike('email', cleanEmail).maybeSingle();
+    let existingUser = null;
+    try {
+      const { data: authList } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+      const matchedAuthUser = (authList?.users || []).find(
+        u => u.email?.toLowerCase() === cleanEmail
+      );
+      if (matchedAuthUser) {
+        const { data: profileRow } = await supabase
+          .from('profiles')
+          .select('id, name')
+          .eq('id', matchedAuthUser.id)
+          .maybeSingle();
+        if (profileRow) existingUser = profileRow;
+      }
+    } catch(e) {
+      console.warn('[invite] auth.admin.listUsers failed:', e.message);
+    }
+    console.log('[invite] existingUser lookup result:', existingUser);
 
     let newLink = null;
 
