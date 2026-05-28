@@ -4551,6 +4551,20 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
     let newLink = null;
 
     if (existingUser) {
+      // Block coach-to-coach invites — a coach account cannot be a client of another coach.
+      const { data: inviteeProfile } = await supabase
+        .from('profiles')
+        .select('account_type')
+        .eq('id', existingUser.id)
+        .maybeSingle();
+
+      if (inviteeProfile?.account_type === 'coach') {
+        return res.status(409).json({
+          error: 'cannot_invite_coach',
+          message: 'Coach accounts cannot be invited as clients.'
+        });
+      }
+
       // Block if the client already has an active coach (any coach, not just this one)
       const { data: activeCoach } = await supabase.from('coach_clients')
         .select('id, coach_id').eq('client_id', existingUser.id).eq('status', 'active').maybeSingle();
