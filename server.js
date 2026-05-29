@@ -568,7 +568,15 @@ async function saveExerciseLookup(aiName, mwExercise) {
 }
 
 // ── CLIENTS ────────────────────────────────────
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// Module-level singletons — created ONCE, reused across all requests (correct for
+// Supabase/Anthropic which use stateless HTTP, not persistent connection pools).
+// Anthropic gets an explicit request timeout so a hung upstream call fails fast
+// instead of holding a worker until the 180s server socket timeout.
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+  timeout: 120 * 1000, // 120s ceiling per AI call (plan gen with haiku can run long)
+  maxRetries: 2,
+});
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -875,6 +883,25 @@ app.use('/api/chat', chatLimiter);
 app.use('/api/generate-plan', planLimiter);
 app.use('/api/checkin', checkinLimiter);
 
+// ── REQUEST TIMEOUT ────────────────────────────
+// Fail a stuck request at 30s instead of holding the socket open to the 180s
+// server timeout. The long-running AI endpoints (plan/chat/checkin/review/translate)
+// and the raw-socket video proxy are EXCLUDED — they legitimately run past 30s and
+// manage their own timeouts/heartbeats. A blanket 30s timeout here would kill them.
+const TIMEOUT_EXEMPT = [
+  '/api/generate-plan', '/api/chat', '/api/checkin', '/api/translate-plan',
+  '/api/review/generate', '/api/monthly-review/generate',
+  '/api/exercise/video', '/api/exercise/buftest',
+];
+app.use((req, res, next) => {
+  if (!TIMEOUT_EXEMPT.some(p => req.path.startsWith(p))) {
+    res.setTimeout(30000, () => {
+      if (!res.headersSent) res.status(408).json({ error: 'Request timeout' });
+    });
+  }
+  next();
+});
+
 // ── AUTH MIDDLEWARE ────────────────────────────
 async function requireAuth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
@@ -915,6 +942,20 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+
+// ── SELECT FIELD LISTS ─────────────────────────
+// Explicit column lists replace select('*') on wide/heavy tables. `profiles` has
+// 30+ columns; `plans` carries large workout/nutrition jsonb plus a `translations`
+// cache (up to 12 languages) that most reads do not need.
+// Standard minimal profile select for account/subscription checks:
+const PROFILE_FIELDS = 'id, name, subscription_tier, subscription_status, trial_ends_at, account_type, coach_plan, coach_plan_status';
+// Fields the AI prompt builders actually read off a profile:
+const COACH_PROFILE_FIELDS = 'name, age, sex, height_cm, weight_kg, goal, experience, days_per_week, equipment, diet_style, diet_restrictions, injuries';
+const PLAN_PROFILE_FIELDS = 'name, age, sex, height_cm, weight_kg, goal, experience, days_per_week, preferred_days, equipment, diet_style, diet_restrictions, injuries';
+// The live plan WITHOUT the heavy translations blob (chat/checkin only edit the plan):
+const PLAN_CORE_FIELDS = 'id, workout_plan, nutrition_plan';
+// Exercise-history columns the prompt builders read:
+const HISTORY_PROMPT_FIELDS = 'exercise_name, sets, reps, weight_kg, logged_at';
 
 // ── SUBSCRIPTION HELPERS ───────────────────────
 const TIER_RANK = { iron: 0, steel: 1, forge: 2 };
@@ -1190,7 +1231,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
   try {
     const { data: profile, error: profileErr } = await supabase
       .from('profiles')
-      .select('*')
+      .select(PLAN_PROFILE_FIELDS) // only the fields buildPlanPrompt reads — not all 30+ columns
       .eq('id', req.user.id)
       .maybeSingle();
 
@@ -1632,13 +1673,14 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
     const sanitised = messages.slice(-20).map(m => ({ ...m, content: String(m.content || '').slice(0, 2000) }));
 
     const [{ data: profile }, { data: planData }] = await Promise.all([
-      supabase.from('profiles').select('*').eq('id', req.user.id).maybeSingle(),
-      supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle()
+      supabase.from('profiles').select(COACH_PROFILE_FIELDS).eq('id', req.user.id).maybeSingle(),
+      // PLAN_CORE_FIELDS skips the heavy `translations` cache the coach prompt never reads
+      supabase.from('plans').select(PLAN_CORE_FIELDS).eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle()
     ]);
 
     const { data: recentHistory } = await supabase
       .from('exercise_history')
-      .select('*')
+      .select(HISTORY_PROMPT_FIELDS)
       .eq('user_id', req.user.id)
       .order('logged_at', { ascending: false })
       .limit(20);
@@ -1676,7 +1718,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
     if (planUpdateMatches.length > 0 && planData) {
       // Fetch the absolute latest plan from DB (not from earlier Promise.all)
       const { data: freshPlan } = await supabase
-        .from('plans').select('*').eq('user_id', req.user.id)
+        .from('plans').select(PLAN_CORE_FIELDS).eq('user_id', req.user.id)
         .order('generated_at', { ascending: false }).limit(1).maybeSingle();
 
       const currentPlan = {
@@ -1881,12 +1923,13 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
     const { session_summary, feeling, difficulty, messages, language } = req.body;
 
     const [{ data: profile }, { data: planData }] = await Promise.all([
-      supabase.from('profiles').select('*').eq('id', req.user.id).maybeSingle(),
-      supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle()
+      supabase.from('profiles').select(COACH_PROFILE_FIELDS).eq('id', req.user.id).maybeSingle(),
+      // PLAN_CORE_FIELDS skips the heavy `translations` cache the checkin prompt never reads
+      supabase.from('plans').select(PLAN_CORE_FIELDS).eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle()
     ]);
 
     const { data: recentHistory } = await supabase
-      .from('exercise_history').select('*').eq('user_id', req.user.id)
+      .from('exercise_history').select(HISTORY_PROMPT_FIELDS).eq('user_id', req.user.id)
       .order('logged_at', { ascending: false }).limit(10);
 
     const systemPrompt = buildCheckinPrompt(profile, planData, recentHistory, session_summary, feeling, difficulty, language);
@@ -1988,7 +2031,15 @@ app.post('/api/log', requireAuth, async (req, res) => {
       throw logError;
     }
 
-    const prUpdates = [];
+    // ── Batched history + PR writes ──────────────────────────────────────
+    // Was N+1: per exercise we ran delete + insert + PR-select + PR-upsert
+    // (≈4 sequential round-trips × N exercises). Now: 1 delete + 1 insert +
+    // 1 PR-select + 1 PR-upsert total, regardless of exercise count.
+    // Per-exercise stats are still computed in JS; only the DB calls are batched.
+    // Keyed by exercise_name (last entry wins) to preserve the original
+    // delete-then-insert "last write wins" semantics for any duplicate names.
+    const historyByName = new Map(); // name -> history row
+    const statByName = new Map();     // name -> { bestSet, est1rm, setsLen }
     for (const ex of exercises) {
       // exercises now have a sets_data array: [{weight, reps}, ...]
       // Use best set for PR calculation, total volume across all sets
@@ -2000,14 +2051,7 @@ app.post('/api/log', requireAuth, async (req, res) => {
       }, setsData[0]);
       const est1rm = Math.round(bestSet.weight * (1 + bestSet.reps / 30));
 
-      // Delete existing history entry for today then insert fresh
-      await supabase.from('exercise_history')
-        .delete()
-        .eq('user_id', req.user.id)
-        .eq('exercise_name', ex.name)
-        .eq('logged_at', today);
-
-      await supabase.from('exercise_history').insert({
+      historyByName.set(ex.name, {
         user_id: req.user.id,
         exercise_name: ex.name,
         logged_at: today,
@@ -2018,27 +2062,55 @@ app.post('/api/log', requireAuth, async (req, res) => {
         est_1rm: est1rm,
         sets_data: setsData // store full per-set breakdown
       });
+      statByName.set(ex.name, { bestSet, est1rm, setsLen: setsData.length });
+    }
 
-      // Check & update PR
-      const { data: existingPR } = await supabase
-        .from('personal_records')
-        .select('*')
-        .eq('user_id', req.user.id)
-        .eq('exercise_name', ex.name)
-        .maybeSingle();
+    const exerciseNames = [...historyByName.keys()];
 
-      if (!existingPR || est1rm > (existingPR.est_1rm || 0)) {
-        await supabase.from('personal_records').upsert({
+    // Replace today's history for these exercises in one delete + one insert
+    await supabase.from('exercise_history')
+      .delete()
+      .eq('user_id', req.user.id)
+      .eq('logged_at', today)
+      .in('exercise_name', exerciseNames);
+
+    const { error: histErr } = await supabase
+      .from('exercise_history')
+      .insert([...historyByName.values()]);
+    if (histErr) console.warn('exercise_history insert warning:', histErr.message);
+
+    // Fetch all existing PRs for these exercises in one query (was one per exercise)
+    const { data: existingPRs } = await supabase
+      .from('personal_records')
+      .select('exercise_name, est_1rm') // only field used for the PR comparison
+      .eq('user_id', req.user.id)
+      .in('exercise_name', exerciseNames);
+
+    const prByName = {};
+    for (const p of (existingPRs || [])) prByName[p.exercise_name] = p;
+
+    // Decide which exercises are new PRs, then upsert them all at once
+    const prUpdates = [];
+    const prRows = [];
+    for (const name of exerciseNames) {
+      const st = statByName.get(name);
+      const existing = prByName[name];
+      if (!existing || st.est1rm > (existing.est_1rm || 0)) {
+        prRows.push({
           user_id: req.user.id,
-          exercise_name: ex.name,
-          weight_kg: bestSet.weight,
-          reps: bestSet.reps,
-          sets: setsData.length,
-          est_1rm: est1rm,
+          exercise_name: name,
+          weight_kg: st.bestSet.weight,
+          reps: st.bestSet.reps,
+          sets: st.setsLen,
+          est_1rm: st.est1rm,
           achieved_at: today
-        }, { onConflict: 'user_id,exercise_name' });
-        prUpdates.push(ex.name);
+        });
+        prUpdates.push(name);
       }
+    }
+    if (prRows.length) {
+      await supabase.from('personal_records')
+        .upsert(prRows, { onConflict: 'user_id,exercise_name' });
     }
 
     res.json({ success: true, new_prs: prUpdates });
@@ -2069,14 +2141,18 @@ app.get('/api/history/:exerciseName', requireAuth, async (req, res) => {
 // ── GET ALL HISTORY ────────────────────────────
 app.get('/api/history', requireAuth, async (req, res) => {
   try {
+    // exercise_history grows several rows per session — cap to the most recent 750
+    // rows so a long-tenured user can't pull thousands. Fetch newest-first to apply
+    // the cap, then reverse to the ascending order the progress charts expect.
     const { data, error } = await supabase
       .from('exercise_history')
       .select('*')
       .eq('user_id', req.user.id)
-      .order('logged_at', { ascending: true });
+      .order('logged_at', { ascending: false })
+      .limit(750);
 
     if (error) throw error;
-    res.json({ history: data });
+    res.json({ history: (data || []).reverse() });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2106,9 +2182,10 @@ app.get('/api/prs', requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('personal_records')
-      .select('*')
+      .select('exercise_name, weight_kg, reps, sets, est_1rm, achieved_at')
       .eq('user_id', req.user.id)
-      .order('achieved_at', { ascending: false });
+      .order('achieved_at', { ascending: false })
+      .limit(100); // one PR per exercise — 100 is comfortably above any real catalogue
 
     if (error) throw error;
     res.json({ prs: data });
@@ -2127,7 +2204,8 @@ app.get('/api/prs/search', requireAuth, async (req, res) => {
       .select('exercise_name, weight_kg, reps, est_1rm, achieved_at')
       .eq('user_id', req.user.id)
       .ilike('exercise_name', `%${q}%`)
-      .order('achieved_at', { ascending: false });
+      .order('achieved_at', { ascending: false })
+      .limit(50);
 
     if (error) throw error;
     res.json({ prs: data || [] });
@@ -2184,7 +2262,9 @@ app.post('/api/bodyweight', requireAuth, async (req, res) => {
 // ── GET STREAK & BADGES ────────────────────────
 app.get('/api/stats', requireAuth, async (req, res) => {
   try {
-    // Get all session logs to compute streak and monthly counts
+    // Intentionally unlimited: lifetime monthly-badge counts and the longest-streak
+    // history need every logged day. Selecting only the `logged_at` date column (one
+    // small string per session) keeps the payload tiny even for multi-year users.
     const { data: sessions } = await supabase
       .from('session_logs')
       .select('logged_at')
@@ -2274,11 +2354,15 @@ app.get('/api/stats', requireAuth, async (req, res) => {
 // ── GET BODYWEIGHT HISTORY ─────────────────────
 app.get('/api/bodyweight', requireAuth, async (req, res) => {
   try {
+    // bodyweight_log is capped at one row per day, so it is naturally self-bounding.
+    // The ascending+limit(1825) (≈5 years) guard keeps the earliest entry — which the
+    // chart/summary use as the starting weight — while still capping any runaway read.
     const { data, error } = await supabase
       .from('bodyweight_log')
-      .select('*')
+      .select('weight_kg, logged_at')
       .eq('user_id', req.user.id)
-      .order('logged_at', { ascending: true });
+      .order('logged_at', { ascending: true })
+      .limit(1825);
 
     console.log('[bodyweight] fetch for user:', req.user.id, 'rows:', data?.length);
     if (error) throw error;
@@ -2295,11 +2379,14 @@ app.get('/api/bodyweight', requireAuth, async (req, res) => {
 // recorded_at so the frontend contract uses one field name.
 app.get('/api/bodyweight/history', requireAuth, async (req, res) => {
   try {
+    // Self-bounding (one row/day); ascending+limit(1825) keeps the earliest entry as
+    // the starting weight while capping reads at ≈5 years of daily logs.
     const { data, error } = await supabase
       .from('bodyweight_log')
       .select('weight_kg, logged_at')
       .eq('user_id', req.user.id)
-      .order('logged_at', { ascending: true });
+      .order('logged_at', { ascending: true })
+      .limit(1825);
 
     if (error) throw error;
 
@@ -3308,9 +3395,11 @@ app.get('/api/export/history', requireAuth, loadSubscription, async (req, res) =
       });
     }
 
+    // Full export — intentionally unlimited (the user is downloading their whole
+    // history). Selecting only the columns the CSV emits instead of every column.
     const { data: sessions, error } = await supabase
       .from('session_logs')
-      .select('*')
+      .select('logged_at, exercises, feeling, difficulty')
       .eq('user_id', req.user.id)
       .order('logged_at', { ascending: false });
 
@@ -3376,9 +3465,9 @@ app.post('/api/review/generate', requireAuth, loadSubscription, async (req, res)
     const weekStartStr = weekStart.toISOString().split('T')[0];
 
     const [profileRes, sessionsRes, prsRes] = await Promise.all([
-      supabase.from('profiles').select('*').eq('id', userId).maybeSingle(),
+      supabase.from('profiles').select('name, goal, days_per_week').eq('id', userId).maybeSingle(),
       supabase.from('workout_logs').select('*').eq('user_id', userId).gte('created_at', weekStart.toISOString()),
-      supabase.from('personal_records').select('*').eq('user_id', userId).gte('achieved_at', weekStartStr),
+      supabase.from('personal_records').select('exercise_name, weight_kg, reps').eq('user_id', userId).gte('achieved_at', weekStartStr),
     ]);
 
     const profile = profileRes.data;
@@ -3509,10 +3598,10 @@ app.post('/api/monthly-review/generate', requireAuth, loadSubscription, async (r
     const monthName = now.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
 
     const [profileRes, sessionsRes, prsRes, metricsRes] = await Promise.all([
-      supabase.from('profiles').select('*').eq('id', userId).maybeSingle(),
+      supabase.from('profiles').select('name, goal, experience, days_per_week').eq('id', userId).maybeSingle(),
       supabase.from('workout_logs').select('*').eq('user_id', userId).gte('created_at', monthStart).order('created_at', { ascending: false }),
-      supabase.from('personal_records').select('*').eq('user_id', userId).gte('achieved_at', monthStart),
-      supabase.from('body_metrics').select('*').eq('user_id', userId).gte('recorded_at', monthStart).order('recorded_at', { ascending: false }),
+      supabase.from('personal_records').select('exercise_name, weight_kg, reps').eq('user_id', userId).gte('achieved_at', monthStart),
+      supabase.from('body_metrics').select('weight_kg, recorded_at').eq('user_id', userId).gte('recorded_at', monthStart).order('recorded_at', { ascending: false }),
     ]);
 
     const profile = profileRes.data;
@@ -4664,12 +4753,18 @@ app.get('/api/coach/clients', requireAuth, requireCoach, async (req, res) => {
         .select('id, name, goal, experience, subscription_tier').in('id', clientIds);
       for (const p of (profiles || [])) profilesById[p.id] = p;
     }
-    // Last active per client — most recent session_log (logged_at is YYYY-MM-DD)
+    // Last active per client — most recent session_log (logged_at is YYYY-MM-DD).
+    // NOTE: bounded to the last 180 days of client logs. "first occurrence wins" below
+    // still yields each client's most-recent date; a client with zero logs in the
+    // window simply reports last_active=null (matches the no-logs display anyway).
+    // This prevents the query from scanning every client's entire history at scale.
     let lastActiveById = {};
     if (clientIds.length) {
+      const since180 = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
       const { data: logs } = await supabase.from('session_logs')
         .select('user_id, logged_at')
         .in('user_id', clientIds)
+        .gte('logged_at', since180)
         .order('logged_at', { ascending: false });
       for (const log of (logs || [])) {
         if (!lastActiveById[log.user_id]) lastActiveById[log.user_id] = log.logged_at;
@@ -5113,17 +5208,20 @@ app.get('/api/my-coach-messages', requireAuth, async (req, res) => {
     const { data: link } = await supabase.from('coach_clients')
       .select('coach_id').eq('client_id', req.user.id).eq('status', 'active').maybeSingle();
     if (!link) return res.json({ messages: [], coach_id: null });
+    // Cap to the most recent 300 messages (fetch newest-first, return oldest-first
+    // for display) so a long-running thread can't pull an unbounded row count.
     const { data, error } = await supabase.from('coach_messages')
       .select('id, sender_role, message_text, read_at, created_at')
       .eq('coach_id', link.coach_id).eq('client_id', req.user.id)
-      .order('created_at', { ascending: true });
+      .order('created_at', { ascending: false })
+      .limit(300);
     if (error) throw error;
     // Mark unread coach-sent messages as read
     await supabase.from('coach_messages')
       .update({ read_at: new Date().toISOString() })
       .eq('coach_id', link.coach_id).eq('client_id', req.user.id)
       .eq('sender_role', 'coach').is('read_at', null);
-    res.json({ messages: data || [], coach_id: link.coach_id });
+    res.json({ messages: (data || []).reverse(), coach_id: link.coach_id });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -5156,17 +5254,19 @@ app.get('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, asyn
     if (!await verifyClientConnection(req.user.id, clientId)) {
       return res.status(403).json({ error: 'no_connection' });
     }
+    // Cap to the most recent 300 messages (newest-first fetch, oldest-first display).
     const { data, error } = await supabase.from('coach_messages')
       .select('id, sender_role, message_text, read_at, created_at')
       .eq('coach_id', req.user.id).eq('client_id', clientId)
-      .order('created_at', { ascending: true });
+      .order('created_at', { ascending: false })
+      .limit(300);
     if (error) throw error;
     // Mark unread client-sent messages as read
     await supabase.from('coach_messages')
       .update({ read_at: new Date().toISOString() })
       .eq('coach_id', req.user.id).eq('client_id', clientId)
       .eq('sender_role', 'client').is('read_at', null);
-    res.json({ messages: data || [] });
+    res.json({ messages: (data || []).reverse() });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
