@@ -2140,16 +2140,43 @@ app.get('/api/prs/search', requireAuth, async (req, res) => {
 app.post('/api/bodyweight', requireAuth, async (req, res) => {
   try {
     const { weight_kg } = req.body;
+    const w = parseFloat(weight_kg);
+    console.log('[bodyweight] save attempt:', { user_id: req.user.id, weight_kg });
+    if (isNaN(w)) return res.status(400).json({ error: 'invalid_weight' });
     const today = new Date().toISOString().split('T')[0];
 
-    await supabase.from('bodyweight_log').upsert({
-      user_id: req.user.id,
-      weight_kg,
-      logged_at: today
-    }, { onConflict: 'user_id,logged_at' });
+    // Manual upsert instead of .upsert({ onConflict: 'user_id,logged_at' }) — the
+    // onConflict form silently failed (its result was never captured, so the route
+    // always returned success even when the write errored, e.g. if the matching
+    // unique constraint was missing). Check-then-update/insert needs no DB constraint.
+    const { data: existing } = await supabase
+      .from('bodyweight_log')
+      .select('id')
+      .eq('user_id', req.user.id)
+      .eq('logged_at', today)
+      .maybeSingle();
 
-    res.json({ success: true });
+    let data, error;
+    if (existing) {
+      ({ data, error } = await supabase
+        .from('bodyweight_log')
+        .update({ weight_kg: w })
+        .eq('id', existing.id)
+        .select()
+        .maybeSingle());
+    } else {
+      ({ data, error } = await supabase
+        .from('bodyweight_log')
+        .insert({ user_id: req.user.id, weight_kg: w, logged_at: today })
+        .select()
+        .maybeSingle());
+    }
+
+    console.log('[bodyweight] save result:', data, error);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true, entry: data });
   } catch (err) {
+    console.error('[bodyweight] save exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2253,6 +2280,7 @@ app.get('/api/bodyweight', requireAuth, async (req, res) => {
       .eq('user_id', req.user.id)
       .order('logged_at', { ascending: true });
 
+    console.log('[bodyweight] fetch for user:', req.user.id, 'rows:', data?.length);
     if (error) throw error;
     res.json({ history: data });
   } catch (err) {
@@ -3114,11 +3142,17 @@ app.get('/api/version', (req, res) => {
 
 
 // ── PROGRAMMES — Multiple saved plans ─────────
+// NOTE: table is `programmes` (pre-existing live feature + data), NOT
+// `saved_programmes` from the task spec. Extended in place with a `description`
+// column rather than forking a parallel table. Tier limits: Iron = 1 (upgrade
+// prompt), Steel = 3, Forge/exempt = unlimited. See decisions.md.
+const PROGRAMME_TIER_LIMIT = { iron: 1, steel: 3, forge: Infinity };
+
 app.get('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('programmes')
-      .select('id, name, created_at, is_active')
+      .select('id, name, description, created_at, is_active')
       .eq('user_id', req.user.id)
       .order('created_at', { ascending: false });
     if (error) throw error;
@@ -3130,28 +3164,42 @@ app.get('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
 
 app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
   try {
-    const { name, plan_data } = req.body;
+    const { name, description, plan_data } = req.body;
     if (!plan_data) return res.status(400).json({ error: 'No plan data provided' });
 
-    // Check programme limit for Iron users
     const { accessTier, isExempt } = req.subscription;
-    if (!hasAccess('multiple_programmes', accessTier, isExempt)) {
-      const { count } = await supabase
-        .from('programmes')
-        .select('id', { count: 'exact', head: true })
-        .eq('user_id', req.user.id);
-      if (count >= 1) {
-        return res.status(403).json({
-          error: 'programme_limit_reached',
-          message: 'Multiple programmes unlock on Steel. Upgrade to save more than one programme.'
+    const tier = isExempt ? 'forge' : (accessTier || 'iron');
+    const limit = PROGRAMME_TIER_LIMIT[tier] ?? 1;
+
+    const { count } = await supabase
+      .from('programmes')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', req.user.id);
+
+    if ((count || 0) >= limit) {
+      // Iron → upgrade prompt; Steel → at its 3-programme cap.
+      if (tier === 'iron') {
+        return res.status(409).json({
+          error: 'upgrade_required',
+          message: 'Save multiple programmes for different goals — available on Steel and Forge.'
         });
       }
+      return res.status(409).json({
+        error: 'programme_limit_reached',
+        message: `You've reached your ${limit} programme limit on ${tier[0].toUpperCase() + tier.slice(1)}. Upgrade to Forge for unlimited programmes.`
+      });
     }
 
     const { data, error } = await supabase
       .from('programmes')
-      .insert({ user_id: req.user.id, name: name || 'My Programme', plan_data, is_active: false })
-      .select()
+      .insert({
+        user_id: req.user.id,
+        name: (name || 'My Programme').toString().slice(0, 80),
+        description: description ? description.toString().slice(0, 300) : null,
+        plan_data,
+        is_active: false
+      })
+      .select('id, name, description, created_at, is_active')
       .maybeSingle();
     if (error) throw error;
     res.json({ programme: data });
@@ -3160,24 +3208,61 @@ app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
   }
 });
 
+// Activate a programme: flips this one active + all others inactive, AND writes
+// its stored plan_data into the live `plans` table so the rest of the app loads it.
+app.post('/api/programmes/:id/activate', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: prog, error: progErr } = await supabase
+      .from('programmes')
+      .select('id, name, plan_data')
+      .eq('id', id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (progErr) throw progErr;
+    if (!prog) return res.status(404).json({ error: 'programme_not_found' });
+
+    // Pull workout/nutrition out of plan_data (stored as {workout, nutrition},
+    // tolerate {workout_plan, nutrition_plan} too).
+    const pd = prog.plan_data || {};
+    const workout_plan = pd.workout ?? pd.workout_plan ?? null;
+    const nutrition_plan = pd.nutrition ?? pd.nutrition_plan ?? null;
+    if (!workout_plan) return res.status(400).json({ error: 'programme_has_no_plan' });
+
+    // Replace the live plan (same clean-slate pattern as plan generation).
+    await supabase.from('plans').delete().eq('user_id', req.user.id);
+    const { error: planErr } = await supabase
+      .from('plans')
+      .insert({ user_id: req.user.id, workout_plan, nutrition_plan, translations: {}, source_language: 'en' });
+    if (planErr) throw planErr;
+
+    // Flip active flags.
+    await supabase.from('programmes').update({ is_active: false }).eq('user_id', req.user.id);
+    await supabase.from('programmes').update({ is_active: true, updated_at: new Date().toISOString() })
+      .eq('id', id).eq('user_id', req.user.id);
+
+    res.json({ ok: true });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update name/description only (never plan_data).
 app.patch('/api/programmes/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, is_active } = req.body;
-
-    if (is_active) {
-      // Deactivate all other programmes first
-      await supabase.from('programmes')
-        .update({ is_active: false })
-        .eq('user_id', req.user.id);
-    }
+    const { name, description } = req.body;
+    const patch = { updated_at: new Date().toISOString() };
+    if (name !== undefined) patch.name = (name || '').toString().slice(0, 80);
+    if (description !== undefined) patch.description = description ? description.toString().slice(0, 300) : null;
 
     const { data, error } = await supabase
       .from('programmes')
-      .update({ ...(name && { name }), ...(is_active !== undefined && { is_active }) })
+      .update(patch)
       .eq('id', id)
       .eq('user_id', req.user.id)
-      .select()
+      .select('id, name, description, created_at, is_active')
       .maybeSingle();
     if (error) throw error;
     res.json({ programme: data });
@@ -3188,6 +3273,17 @@ app.patch('/api/programmes/:id', requireAuth, async (req, res) => {
 
 app.delete('/api/programmes/:id', requireAuth, async (req, res) => {
   try {
+    const { data: prog } = await supabase
+      .from('programmes')
+      .select('is_active')
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (!prog) return res.status(404).json({ error: 'programme_not_found' });
+    if (prog.is_active) {
+      return res.status(400).json({ error: 'cannot_delete_active', message: 'Switch to another programme before deleting this one.' });
+    }
+
     const { error } = await supabase
       .from('programmes')
       .delete()
