@@ -2117,6 +2117,25 @@ app.get('/api/prs', requireAuth, async (req, res) => {
   }
 });
 
+// ── SEARCH PRs BY EXERCISE NAME ────────────────
+app.get('/api/prs/search', requireAuth, async (req, res) => {
+  try {
+    const q = (req.query.q || '').toString().trim();
+    if (!q) return res.json({ prs: [] });
+    const { data, error } = await supabase
+      .from('personal_records')
+      .select('exercise_name, weight_kg, reps, est_1rm, achieved_at')
+      .eq('user_id', req.user.id)
+      .ilike('exercise_name', `%${q}%`)
+      .order('achieved_at', { ascending: false });
+
+    if (error) throw error;
+    res.json({ prs: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── LOG BODYWEIGHT ─────────────────────────────
 app.post('/api/bodyweight', requireAuth, async (req, res) => {
   try {
@@ -2236,6 +2255,50 @@ app.get('/api/bodyweight', requireAuth, async (req, res) => {
 
     if (error) throw error;
     res.json({ history: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── BODYWEIGHT HISTORY + SUMMARY ───────────────
+// Reads bodyweight_log (the same source as the progress bodyweight card and
+// POST /api/bodyweight), NOT body_metrics — body_metrics holds chest/waist/etc
+// measurements and would not match what the card shows. logged_at is mapped to
+// recorded_at so the frontend contract uses one field name.
+app.get('/api/bodyweight/history', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('bodyweight_log')
+      .select('weight_kg, logged_at')
+      .eq('user_id', req.user.id)
+      .order('logged_at', { ascending: true });
+
+    if (error) throw error;
+
+    const history = (data || []).map(r => ({ weight_kg: r.weight_kg, recorded_at: r.logged_at }));
+
+    if (!history.length) {
+      return res.json({
+        history: [],
+        starting_weight: null, current_weight: null,
+        total_change: null, lowest_weight: null, highest_weight: null
+      });
+    }
+
+    const weights = history.map(r => Number(r.weight_kg));
+    const starting_weight = history[0].weight_kg;
+    const current_weight = history[history.length - 1].weight_kg;
+    const change = Number(current_weight) - Number(starting_weight);
+    const total_change = (change >= 0 ? '+' : '−') + Math.abs(change).toFixed(1);
+
+    res.json({
+      history,
+      starting_weight,
+      current_weight,
+      total_change,
+      lowest_weight: Math.min(...weights),
+      highest_weight: Math.max(...weights)
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
