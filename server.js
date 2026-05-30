@@ -1685,7 +1685,12 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
       .order('logged_at', { ascending: false })
       .limit(20);
 
-    const systemPrompt = buildCoachPrompt(profile, planData, recentHistory, context, language);
+    let activeProgramme = null;
+    try {
+      const { data: _ap } = await supabase.from('programmes').select('name, plan_data').eq('user_id', req.user.id).eq('is_active', true).maybeSingle();
+      if (_ap && _ap.name) activeProgramme = { name: _ap.name, goal: (_ap.plan_data && (_ap.plan_data.goal || (_ap.plan_data.workout && _ap.plan_data.workout.goal))) || (profile && profile.goal) || null };
+    } catch(e) { /* programme context is best-effort */ }
+    const systemPrompt = buildCoachPrompt(profile, planData, recentHistory, context, language, activeProgramme);
 
     // Retry up to 3 times on 529 overloaded errors
     let response;
@@ -2528,7 +2533,7 @@ The "meals" array is just a fallback — the "weekly_meals" object is what gets 
 Keep total daily macros consistent across all 7 days but vary the actual foods.`;
 }
 
-function buildCoachPrompt(profile, planData, recentHistory, context, language) {
+function buildCoachPrompt(profile, planData, recentHistory, context, language, activeProgramme) {
   const plan = planData?.workout_plan;
   const nutrition = planData?.nutrition_plan;
 
@@ -2540,7 +2545,10 @@ function buildCoachPrompt(profile, planData, recentHistory, context, language) {
     ? plan.days.map(d => `[day_index:${d.day_index}] ${d.day_name} — ${d.label}: ${d.exercises?.map(e => `${e.name} ${e.sets}x${e.reps}`).join(', ') || 'Rest'}`).join('\n')
     : 'Not generated';
 
-  const contextStr = context ? `\nCURRENT CONTEXT: ${context}` : '';
+  const progCtx = (activeProgramme && activeProgramme.name)
+    ? `\nACTIVE PROGRAMME: The user is currently following their '${activeProgramme.name}' programme.` + (activeProgramme.goal ? ` Their goal for this programme is ${activeProgramme.goal}.` : '') + ` Coach them in the context of this specific programme and goal. If they ask about switching goals or programmes, acknowledge that they have multiple saved programmes available.`
+    : '';
+  const contextStr = (context ? `\nCURRENT CONTEXT: ${context}` : '') + progCtx;
 
   const langNames = { en:'English', es:'Spanish', fr:'French', de:'German', it:'Italian', pt:'Portuguese', nl:'Dutch', uk:'Ukrainian', fi:'Finnish', ar:'Arabic', zh:'Chinese', ja:'Japanese' };
   const langStr = language && language !== 'en'
@@ -3297,6 +3305,105 @@ app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
 
 // Activate a programme: flips this one active + all others inactive, AND writes
 // its stored plan_data into the live `plans` table so the rest of the app loads it.
+// Generate a brand-new programme from a full onboarding questionnaire (Feature 1).
+// Builds a synthetic profile from the supplied answers (physical stats fall back to
+// the user's saved profile), runs the same AI plan generation as onboarding, and
+// saves the result to `programmes` with is_active:false. Tier-gated: Iron locked,
+// Steel max 3, Forge unlimited.
+app.post('/api/programmes/generate', requireAuth, loadSubscription, async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('X-Accel-Buffering', 'no');
+  const heartbeat = setInterval(() => { try { res.write(''); } catch(e) { clearInterval(heartbeat); } }, 20000);
+  const sendResponse = (status, data) => { clearInterval(heartbeat); res.status(status).end(JSON.stringify(data)); };
+  try {
+    const { accessTier, isExempt } = req.subscription;
+    const tier = isExempt ? 'forge' : (accessTier || 'iron');
+    const limit = PROGRAMME_TIER_LIMIT[tier] != null ? PROGRAMME_TIER_LIMIT[tier] : 1;
+    if (tier === 'iron') {
+      return sendResponse(409, { error: 'upgrade_required', message: 'Save multiple programmes for different goals — available on Steel and Forge.' });
+    }
+    const { count } = await supabase.from('programmes')
+      .select('id', { count: 'exact', head: true }).eq('user_id', req.user.id);
+    if ((count || 0) >= limit) {
+      return sendResponse(409, { error: 'programme_limit_reached', message: `You've reached your ${limit} programme limit on ${tier[0].toUpperCase() + tier.slice(1)}. Upgrade to Forge for unlimited programmes.` });
+    }
+
+    const b = req.body || {};
+    const name = (b.name || 'My Programme').toString().slice(0, 80);
+    const language = b.language || 'en';
+
+    // Saved profile supplies the physical stats the questionnaire does not collect.
+    const { data: baseProfile } = await supabase.from('profiles')
+      .select(PLAN_PROFILE_FIELDS).eq('id', req.user.id).maybeSingle();
+
+    let injuries = (b.injuries || baseProfile?.injuries || 'none');
+    if (b.sport) {
+      const sp = typeof b.sport === 'string' ? b.sport : (b.sport.name || '');
+      if (sp) injuries = [(injuries && injuries !== 'none') ? injuries : '', 'Sport: ' + sp].filter(Boolean).join('. ') || 'none';
+    }
+
+    const profile = {
+      name: baseProfile?.name || 'User',
+      age: baseProfile?.age, sex: baseProfile?.sex,
+      height_cm: baseProfile?.height_cm, weight_kg: baseProfile?.weight_kg,
+      goal: b.goal || baseProfile?.goal || 'muscle',
+      experience: b.experience || baseProfile?.experience || 'intermediate',
+      days_per_week: b.days_per_week || baseProfile?.days_per_week || 4,
+      preferred_days: b.preferred_days || baseProfile?.preferred_days || 'flexible',
+      equipment: b.equipment || baseProfile?.equipment || 'full_gym',
+      diet_style: b.diet_style || baseProfile?.diet_style || 'anything',
+      diet_restrictions: b.diet_restrictions || baseProfile?.diet_restrictions || 'none',
+      injuries,
+    };
+
+    const mwExercises = await getMuscleWikiExercises();
+    const prompt = buildPlanPrompt(profile, language, mwExercises);
+
+    let plan = null, lastError = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const message = await anthropic.messages.create({
+          model: 'claude-haiku-4-5-20251001', max_tokens: 8000,
+          messages: [{ role: 'user', content: prompt }]
+        });
+        let clean = message.content[0].text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+        const start = clean.indexOf('{'), end = clean.lastIndexOf('}');
+        if (start === -1 || end === -1) throw new Error('No JSON object found');
+        plan = JSON.parse(clean.substring(start, end + 1));
+        if (!plan.workout?.days?.length) throw new Error('Plan missing workout days');
+        if (!plan.nutrition?.meals?.length) throw new Error('Plan missing nutrition meals');
+        if (mwExercises && plan.workout?.days) {
+          for (const day of plan.workout.days) {
+            for (const ex of (day.exercises || [])) {
+              const exact = mwExercises.find(e => e.name.toLowerCase() === ex.name.toLowerCase());
+              if (exact) { ex.name = exact.name; ex.mw_id = exact.id; continue; }
+              const mwName = await resolveExerciseName(ex.name, mwExercises);
+              if (mwName) { const mwEx = mwExercises.find(e => e.name === mwName); ex.name = mwName; if (mwEx) ex.mw_id = mwEx.id; }
+            }
+          }
+        }
+        break;
+      } catch (err) { lastError = err; if (attempt < 2) await new Promise(r => setTimeout(r, 1000)); }
+    }
+    if (!plan) return sendResponse(500, { error: 'generation_failed', detail: lastError?.message });
+
+    const goalLabel = Array.isArray(profile.goal) ? profile.goal.join(', ') : String(profile.goal || '');
+    const plan_data = { workout: plan.workout, nutrition: plan.nutrition, goal: goalLabel, experience: profile.experience, days_per_week: profile.days_per_week };
+    const description = b.description ? b.description.toString().slice(0, 300) : `${goalLabel} · ${profile.days_per_week} days/week`;
+
+    const { data: saved, error: saveErr } = await supabase.from('programmes').insert({
+      user_id: req.user.id, name, description, plan_data, is_active: false,
+    }).select('id, name, description, created_at, is_active').maybeSingle();
+    if (saveErr) throw saveErr;
+
+    sendResponse(200, { programme_id: saved.id, programme: saved, plan_data });
+  } catch (err) {
+    console.error('programmes/generate error:', err.message);
+    sendResponse(500, { error: err.message });
+  }
+});
+
 app.post('/api/programmes/:id/activate', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
