@@ -4608,6 +4608,97 @@ async function countActiveClients(coachId) {
   return count || 0;
 }
 
+// Generates a private, coach-facing overview of a client and stores it on the
+// coach_clients connection row. Declared as a function declaration so it is
+// hoisted and callable from the connection-accept handler defined earlier.
+async function generateClientSummary(coachId, clientId) {
+  // Full profile (only columns that exist on profiles — there is no `sport` column)
+  const { data: prof } = await supabase
+    .from('profiles')
+    .select('name, age, goal, experience, days_per_week, preferred_days, weight_kg, height_cm, injuries, equipment, diet_style, diet_restrictions, subscription_tier')
+    .eq('id', clientId)
+    .maybeSingle();
+  if (!prof) throw new Error('client_profile_not_found');
+
+  // Latest body metrics (weight, body fat if tracked)
+  const { data: metrics } = await supabase
+    .from('body_metrics')
+    .select('weight_kg, body_fat, recorded_at')
+    .eq('user_id', clientId)
+    .order('recorded_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  // Session count, last 30 days
+  const monthAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const { count: sessionCount } = await supabase
+    .from('session_logs')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', clientId)
+    .gte('logged_at', monthAgo);
+
+  // Current streak
+  const { data: streakRow } = await supabase
+    .from('streaks')
+    .select('current_streak')
+    .eq('user_id', clientId)
+    .maybeSingle();
+
+  const clientData = {
+    ...prof,
+    latest_weight_kg: metrics?.weight_kg ?? prof.weight_kg ?? null,
+    latest_body_fat: metrics?.body_fat ?? null,
+    sessions_last_30_days: sessionCount || 0,
+    current_streak: streakRow?.current_streak || 0,
+  };
+
+  const prompt = `You are writing a private client overview for a fitness coach.
+Based on the following client data, write a concise 3-4 paragraph
+professional summary that covers:
+1. Who they are and their primary goal (be specific — if goal is
+   'sport', name the sport and what they are training for)
+2. Their starting point — current stats, experience level,
+   any injuries or limitations to be aware of
+3. Their schedule and availability — which days they can train,
+   how many sessions per week, any equipment constraints
+4. Nutrition context — diet style, restrictions, calorie targets
+   if set
+Write in second person addressed to the coach, not the client.
+Be direct and factual. Use the client's actual name.
+Client data: ${JSON.stringify(clientData)}`;
+
+  const msg = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 1200,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  const summary = (msg.content?.[0]?.text || '').trim();
+  if (!summary) throw new Error('empty_summary');
+
+  await supabase
+    .from('coach_clients')
+    .update({ client_summary: summary, client_summary_generated_at: new Date().toISOString() })
+    .eq('coach_id', coachId)
+    .eq('client_id', clientId);
+
+  return summary;
+}
+
+// On-demand summary generation / regeneration for a coach viewing a client.
+app.post('/api/coach/clients/:clientId/generate-summary', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const summary = await generateClientSummary(req.user.id, clientId);
+    res.json({ summary, summary_generated_at: new Date().toISOString() });
+  } catch(err) {
+    console.error('[generate-summary]', err.message);
+    res.status(500).json({ error: 'summary_failed' });
+  }
+});
+
 // ── Coach setup — Stripe checkout for new coach plan ──
 // ── Coach setup — activates trial immediately, NO Stripe at this step.
 // Card is collected only after the 14-day trial expires (see /api/coach/create-checkout).
@@ -5005,6 +5096,11 @@ app.get('/api/coach/clients/:clientId/overview', requireAuth, requireCoach, asyn
       if (Array.isArray(days)) upcoming = days.slice(0, 3);
     } catch(e) { /* plan structure may vary */ }
 
+    // AI client summary (loaded with the overview so it renders in one call)
+    const { data: connRow } = await supabase.from('coach_clients')
+      .select('client_summary, client_summary_generated_at')
+      .eq('coach_id', req.user.id).eq('client_id', clientId).eq('status', 'active').maybeSingle();
+
     res.json({
       profile: profileRes.data,
       sessions_this_week: weekSessions.length,
@@ -5014,6 +5110,8 @@ app.get('/api/coach/clients/:clientId/overview', requireAuth, requireCoach, asyn
       prs_this_month: prsRes.count || 0,
       body_metrics: metricsRes.data || [],
       upcoming_sessions: upcoming,
+      summary: connRow?.client_summary || null,
+      summary_generated_at: connRow?.client_summary_generated_at || null,
     });
   } catch(err) {
     console.error('Coach overview error:', err.message);
@@ -5528,8 +5626,9 @@ app.get('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => 
 
 app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => {
   try {
-    const { client_id, name, programme_data, is_template } = req.body;
+    const { client_id, name, programme_data, nutrition_data, programme_type, is_template } = req.body;
     if (!name) return res.status(400).json({ error: 'Missing name' });
+    const ptype = programme_type || 'workout';
 
     if (client_id && !is_template) {
       if (!await verifyClientConnection(req.user.id, client_id)) {
@@ -5542,14 +5641,17 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
       client_id: client_id || null,
       name: name.slice(0, 200),
       is_template: !!is_template,
+      programme_type: ptype,
       programme_data: programme_data || {},
+      nutrition_data: nutrition_data || null,
       assigned_at: (client_id && !is_template) ? new Date().toISOString() : null,
       updated_at: new Date().toISOString(),
     };
     const { data, error } = await supabase.from('coach_programmes').insert(row).select().maybeSingle();
     if (error) throw error;
 
-    if (client_id && !is_template) {
+    // Workout assignment → write workout_plan into the client's live plan
+    if (client_id && !is_template && ptype !== 'nutrition') {
       await sendPushToUser(client_id, 'New programme assigned',
         `Your coach has assigned you a new programme: ${name}`,
         '/app.html?panel=workout').catch(() => {});
@@ -5593,6 +5695,41 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
         });
       }
     }
+
+    // Nutrition assignment → write nutrition_plan into the client's live plan
+    if (client_id && !is_template && nutrition_data && (ptype === 'nutrition' || ptype === 'both')) {
+      const coachName = req.coachProfile.coach_title || req.coachProfile.name || 'Your coach';
+      const { data: existingPlanN } = await supabase.from('plans')
+        .select('id, nutrition_plan').eq('user_id', client_id)
+        .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+      const prevN = existingPlanN?.nutrition_plan || null;
+      // Preserve the original AI nutrition so "Reset to AI plan" can restore it.
+      const aiBackup = prevN ? (prevN.coach_assigned ? (prevN._ai_backup || null) : prevN) : null;
+      const liveNutrition = {
+        ...nutrition_data,
+        coach_assigned: true,
+        coach_name: coachName,
+        assigned_at: new Date().toISOString(),
+        _ai_backup: aiBackup,
+      };
+      if (existingPlanN?.id) {
+        await supabase.from('plans').update({
+          nutrition_plan: liveNutrition,
+          translations: {},
+          generated_at: new Date().toISOString(),
+        }).eq('id', existingPlanN.id);
+      } else {
+        await supabase.from('plans').insert({
+          user_id: client_id,
+          nutrition_plan: liveNutrition,
+          generated_at: new Date().toISOString(),
+        });
+      }
+      await sendPushToUser(client_id, 'Nutrition plan updated',
+        'Your coach has updated your nutrition plan',
+        '/app.html?panel=nutrition').catch(() => {});
+    }
+
     res.json({ ok: true, programme: data });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
@@ -5650,6 +5787,53 @@ app.delete('/api/coach/programmes/:programmeId', requireAuth, requireCoach, asyn
       .delete().eq('id', programmeId).eq('coach_id', req.user.id);
     res.json({ ok: true });
   } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Returns the client's current live nutrition plan (coach-assigned or AI).
+app.get('/api/coach/clients/:clientId/nutrition-plan', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data: planRow } = await supabase.from('plans')
+      .select('nutrition_plan').eq('user_id', clientId)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    res.json({ nutrition_plan: planRow?.nutrition_plan || null });
+  } catch(err) {
+    console.error('[nutrition-plan GET]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Restores the client's AI nutrition plan and removes the coach's nutrition programme.
+app.post('/api/coach/clients/:clientId/reset-nutrition', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data: planRow } = await supabase.from('plans')
+      .select('id, nutrition_plan').eq('user_id', clientId)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    const restored = planRow?.nutrition_plan?._ai_backup || null;
+    if (planRow?.id) {
+      await supabase.from('plans').update({
+        nutrition_plan: restored,
+        translations: {},
+        generated_at: new Date().toISOString(),
+      }).eq('id', planRow.id);
+    }
+    await supabase.from('coach_programmes')
+      .delete().eq('coach_id', req.user.id).eq('client_id', clientId).eq('programme_type', 'nutrition');
+    await sendPushToUser(clientId, 'Nutrition plan reset',
+      'Your coach reset your nutrition plan to the AI plan.',
+      '/app.html?panel=nutrition').catch(() => {});
+    res.json({ ok: true, nutrition_plan: restored });
+  } catch(err) {
+    console.error('[reset-nutrition]', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Client-facing endpoints ───────────────────────────
@@ -5735,6 +5919,9 @@ app.post('/api/coach-connection/:connectionId/respond', requireAuth, async (req,
       await sendPushToUser(link.coach_id, 'Client connected',
         'A client has accepted your connection request.',
         '/app.html?panel=clients').catch(() => {});
+      // Auto-generate the coach's private client overview in the background (do not await)
+      generateClientSummary(link.coach_id, req.user.id).catch(e =>
+        console.warn('[summary] generation failed:', e.message));
     } else {
       await supabase.from('coach_clients').update({
         status: 'disconnected', disconnected_at: new Date().toISOString()
