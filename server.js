@@ -2204,11 +2204,18 @@ app.get('/api/prs/search', requireAuth, async (req, res) => {
   try {
     const q = (req.query.q || '').toString().trim();
     if (!q) return res.json({ prs: [] });
-    const { data, error } = await supabase
+    // FIX 5: tolerant multi-word matching. Normalise the query, split into words, and
+    // match ANY word via OR(ilike) so "benchpress" → bench OR press finds "Bench Press".
+    const normalised = q.toLowerCase().replace(/\s+/g, ' ').trim().replace(/[^a-z0-9 ]/g, '');
+    const words = normalised.split(' ').filter(w => w.length > 1);
+    let prQuery = supabase
       .from('personal_records')
       .select('exercise_name, weight_kg, reps, est_1rm, achieved_at')
-      .eq('user_id', req.user.id)
-      .ilike('exercise_name', `%${q}%`)
+      .eq('user_id', req.user.id);
+    prQuery = words.length
+      ? prQuery.or(words.map(w => `exercise_name.ilike.%${w}%`).join(','))
+      : prQuery.ilike('exercise_name', `%${q}%`);
+    const { data, error } = await prQuery
       .order('achieved_at', { ascending: false })
       .limit(50);
 
@@ -3245,11 +3252,15 @@ const PROGRAMME_TIER_LIMIT = { iron: 1, steel: 3, forge: Infinity };
 
 app.get('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
   try {
-    const { data, error } = await supabase
+    // FIX 8: exclude archived programmes by default. ?include_archived=true returns all
+    // (the frontend uses that to render the collapsed "Archived" section).
+    const includeArchived = req.query.include_archived === 'true';
+    let pq = supabase
       .from('programmes')
-      .select('id, name, description, created_at, is_active')
-      .eq('user_id', req.user.id)
-      .order('created_at', { ascending: false });
+      .select('id, name, description, created_at, is_active, is_archived')
+      .eq('user_id', req.user.id);
+    if (!includeArchived) pq = pq.or('is_archived.is.null,is_archived.eq.false');
+    const { data, error } = await pq.order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ programmes: data || [] });
   } catch(err) {
@@ -3269,7 +3280,8 @@ app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
     const { count } = await supabase
       .from('programmes')
       .select('id', { count: 'exact', head: true })
-      .eq('user_id', req.user.id);
+      .eq('user_id', req.user.id)
+      .or('is_archived.is.null,is_archived.eq.false'); // FIX 8: archived don't count toward the limit
 
     if ((count || 0) >= limit) {
       // Iron → upgrade prompt; Steel → at its 3-programme cap.
@@ -3324,7 +3336,8 @@ app.post('/api/programmes/generate', requireAuth, loadSubscription, async (req, 
       return sendResponse(409, { error: 'upgrade_required', message: 'Save multiple programmes for different goals — available on Steel and Forge.' });
     }
     const { count } = await supabase.from('programmes')
-      .select('id', { count: 'exact', head: true }).eq('user_id', req.user.id);
+      .select('id', { count: 'exact', head: true }).eq('user_id', req.user.id)
+      .or('is_archived.is.null,is_archived.eq.false'); // FIX 8: archived don't count toward the limit
     if ((count || 0) >= limit) {
       return sendResponse(409, { error: 'programme_limit_reached', message: `You've reached your ${limit} programme limit on ${tier[0].toUpperCase() + tier.slice(1)}. Upgrade to Forge for unlimited programmes.` });
     }
@@ -3460,6 +3473,37 @@ app.patch('/api/programmes/:id', requireAuth, async (req, res) => {
       .maybeSingle();
     if (error) throw error;
     res.json({ programme: data });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// FIX 8: archive a programme (over-limit resolution after a trial/tier downgrade).
+// Archived programmes are kept but excluded from the active list and the tier-limit count.
+app.patch('/api/programmes/:id/archive', requireAuth, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('programmes')
+      .update({ is_archived: true, is_active: false, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// FIX 8: restore an archived programme back to the active (inactive) list.
+app.patch('/api/programmes/:id/restore', requireAuth, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('programmes')
+      .update({ is_archived: false, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id);
+    if (error) throw error;
+    res.json({ ok: true });
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
@@ -5839,6 +5883,37 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
 
     res.json({ ok: true, programme: data });
   } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// FIX 7: generate a weekly shopping list from a coach-built nutrition plan's meals.
+// Called from the coach nutrition builder when the "Include shopping list" toggle is on.
+// Returns plain-text grouped list which is stored on nutrition_data.shopping_list and
+// surfaced in the client's Food panel.
+app.post('/api/coach/generate-shopping-list', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { meals, client_name } = req.body || {};
+    if (!Array.isArray(meals) || !meals.length) {
+      return res.status(400).json({ error: 'no_meals', message: 'No meals to build a shopping list from.' });
+    }
+    const mealsForPrompt = meals.map(m => ({
+      name: m.name || '',
+      foods: m.foods || m.note || m.notes || '',
+      kcal: m.kcal != null ? m.kcal : m.calories,
+      protein_g: m.protein_g, carbs_g: m.carbs_g, fat_g: m.fat_g,
+    }));
+    const prompt = `Based on these meals for a client's weekly nutrition plan, generate a practical weekly shopping list grouped by category (Proteins, Vegetables, Fruits, Grains/Carbs, Dairy, Fats/Oils, Other). Assume a full 7-day week and be specific with quantities where possible. Return ONLY the shopping list as plain text: each category as an UPPERCASE heading on its own line, followed by "- item (quantity)" bullet lines. No preamble, no closing remarks.\n\nMeals: ${JSON.stringify(mealsForPrompt)}`;
+    const message = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1500,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const shopping_list = (message.content?.[0]?.text || '').trim();
+    if (!shopping_list) return res.status(500).json({ error: 'generation_failed' });
+    res.json({ shopping_list });
+  } catch (err) {
+    console.error('generate-shopping-list error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async (req, res) => {
