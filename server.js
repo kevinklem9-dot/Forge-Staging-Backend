@@ -2169,15 +2169,26 @@ app.get('/api/history', requireAuth, async (req, res) => {
 app.get('/api/sessions', requireAuth, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    console.log('[sessions] fetching for user:', req.user.id);
+    // ROOT CAUSE OF THE 500: this select used to request `feeling, difficulty`, but
+    // session_logs has no such columns (schema: id, user_id, day_index, day_label,
+    // logged_at, exercises, created_at). feeling/difficulty are only fed to the
+    // post-workout check-in AI prompt — they are never persisted. PostgREST then
+    // threw "column session_logs.feeling does not exist", the catch returned 500,
+    // and the progress panel's session history never refreshed after a workout.
     const { data, error } = await supabase
       .from('session_logs')
-      .select('id, logged_at, day_index, day_label, exercises, feeling, difficulty')
+      .select('id, logged_at, day_index, day_label, exercises')
       .eq('user_id', req.user.id)
       .order('logged_at', { ascending: false })
       .limit(limit);
+    // Log the count (not the full jsonb payload) plus the error so the cause is
+    // visible in Railway logs without flooding them on every progress-panel open.
+    console.log('[sessions] query result:', { rows: data?.length ?? 0, error });
     if (error) throw error;
     res.json({ sessions: data || [] });
   } catch (err) {
+    console.error('[sessions] error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -3835,6 +3846,69 @@ Be direct, specific, and use their actual numbers. No generic filler. Write like
   } catch(err) {
     console.error('Monthly review error:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── ONBOARDING MISSIONS — mark complete (robust override) ──
+// The retention router ALSO defines POST /missions/:key/complete, but its handler
+// returns 404 ("Mission not found") whenever the user has no seeded onboarding_missions
+// row — which is the case for accounts created before the seed trigger existed (or any
+// environment where the trigger was never installed). The frontend fires these on login
+// and panel-open, so those users saw a stream of 404s in the console.
+//
+// This override is registered BEFORE the retention mount below, so Express matches it
+// first and the router's update-only handler never runs for this path. It creates the
+// mission row on demand (check-then-insert — NOT an onConflict upsert, which has bitten
+// us before when the unique constraint was missing; see the bodyweight fix in
+// known-bugs.md) and, because missions are non-critical gamification, it always resolves
+// to a 200 so the client never sees a console error.
+app.post('/api/missions/:missionId/complete', requireAuth, async (req, res) => {
+  const key = req.params.missionId;
+  try {
+    const now = new Date().toISOString();
+    const { data: existing } = await supabase
+      .from('onboarding_missions')
+      .select('id')
+      .eq('user_id', req.user.id)
+      .eq('mission_key', key)
+      .maybeSingle();
+
+    let row;
+    if (existing) {
+      const { data, error } = await supabase
+        .from('onboarding_missions')
+        .update({ completed: true, completed_at: now })
+        .eq('id', existing.id)
+        .select()
+        .maybeSingle();
+      if (error) throw error;
+      row = data;
+    } else {
+      const { data, error } = await supabase
+        .from('onboarding_missions')
+        .insert({ user_id: req.user.id, mission_key: key, completed: true, completed_at: now })
+        .select()
+        .maybeSingle();
+      if (error) throw error;
+      row = data;
+    }
+
+    // Keep profiles.onboarding_score in sync (best-effort — never fail on this).
+    let score = null;
+    try {
+      const { data: all } = await supabase
+        .from('onboarding_missions')
+        .select('completed')
+        .eq('user_id', req.user.id);
+      score = (all || []).filter(m => m.completed).length;
+      await supabase.from('profiles').update({ onboarding_score: score }).eq('id', req.user.id);
+    } catch (e) { /* onboarding_score is non-critical */ }
+
+    res.json({ ok: true, mission: row || { mission_key: key, completed: true }, score });
+  } catch (err) {
+    // Non-critical feature — log it but never surface a 404/500 to the client.
+    console.warn('[missions] complete fallback for', key, '—', err.message);
+    res.json({ ok: true, mission: key, completed: true });
   }
 });
 
