@@ -583,6 +583,26 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// ── BOOT MIGRATIONS (best-effort) ──────────────────────
+// Adds columns newer features need. The Supabase JS client can't run raw DDL, so
+// this calls an optional `run_sql` RPC if the project defines one; if it doesn't,
+// the .catch swallows it and the canonical migration is the SQL below — run once
+// in the Supabase SQL editor:
+//   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS units text DEFAULT 'kg';
+//   ALTER TABLE programmes ADD COLUMN IF NOT EXISTS description text;
+// PATCH /api/profile degrades gracefully if profiles.units is still absent, and the
+// frontend caches units in localStorage, so the app works either way.
+const BOOT_MIGRATIONS = [
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS units text DEFAULT 'kg'`,
+  `ALTER TABLE programmes ADD COLUMN IF NOT EXISTS description text`,
+];
+(async () => {
+  for (const sql of BOOT_MIGRATIONS) {
+    try { await supabase.rpc('run_sql', { sql }); }
+    catch (e) { /* no run_sql RPC — apply the SQL above in the Supabase SQL editor */ }
+  }
+})();
+
 // ── STRIPE ─────────────────────────────────────────────
 let stripe = null;
 try {
@@ -1338,12 +1358,21 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     // Also save to programmes table (deactivate existing, add new active one)
     const planName = `${profile?.goal || 'My'} Plan — ${new Date().toLocaleDateString('en-GB', { month: 'short', year: 'numeric' })}`;
     await supabase.from('programmes').update({ is_active: false }).eq('user_id', req.user.id);
-    await supabase.from('programmes').insert({
+    const { data: obProg } = await supabase.from('programmes').insert({
       user_id: req.user.id,
       name: planName,
       plan_data: { workout: plan.workout, nutrition: plan.nutrition },
       is_active: true
-    });
+    }).select('id').maybeSingle();
+    // One-line AI description for the My Programmes list — async, doesn't block onboarding.
+    if (obProg?.id) {
+      generateProgrammeDescription(obProg.id, {
+        goal: Array.isArray(profile?.goal) ? profile.goal.join(', ') : String(profile?.goal || ''),
+        days_per_week: profile?.days_per_week,
+        experience: profile?.experience,
+        day_labels: plan.workout?.days?.map(d => d.label),
+      });
+    }
 
     // Mark onboarding complete
     await supabase.from('profiles').update({ onboarding_complete: true }).eq('id', req.user.id);
@@ -1619,9 +1648,11 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
     // Only update columns that exist in the schema — ignore unknowns
     const allowed = ['name','age','sex','height_cm','weight_kg','goal','experience',
       'days_per_week','preferred_days','equipment','diet_style','diet_restrictions',
-      'injuries','target_weight_kg','onboarding_complete','preferred_language'];
+      'injuries','target_weight_kg','onboarding_complete','preferred_language','units'];
     const update = { updated_at: new Date().toISOString() };
     allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
+    // Units may only be 'kg' or 'lbs' — drop anything else so a bad value can't persist.
+    if (update.units !== undefined && update.units !== 'kg' && update.units !== 'lbs') delete update.units;
 
     const { data, error } = await supabase
       .from('profiles')
@@ -1631,9 +1662,11 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
       .maybeSingle();
 
     if (error) {
-      // If error is about missing column (preferred_days not migrated yet), retry without it
-      if (error.message?.includes('preferred_days')) {
+      // If error is about a column the DB doesn't have yet (preferred_days or units
+      // not migrated), retry without it so the rest of the update still lands.
+      if (error.message?.includes('preferred_days') || error.message?.includes('units')) {
         delete update.preferred_days;
+        delete update.units;
         const { data: data2, error: err2 } = await supabase
           .from('profiles').update(update).eq('id', req.user.id).select().maybeSingle();
         if (err2) throw err2;
@@ -3261,6 +3294,29 @@ app.get('/api/version', (req, res) => {
 // prompt), Steel = 3, Forge/exempt = unlimited. See decisions.md.
 const PROGRAMME_TIER_LIMIT = { iron: 1, steel: 3, forge: Infinity };
 
+// Generate a one-line AI description (Haiku, max ~12 words) for a programme and store
+// it on the row. Fire-and-forget: callers do NOT await this — it runs after the
+// response is sent and the frontend picks the description up on the next
+// /api/programmes load. Best-effort: any failure is logged and swallowed.
+async function generateProgrammeDescription(programmeId, data) {
+  try {
+    const descPrompt = `In one sentence of maximum 12 words, describe this fitness programme. Be specific about the goal, structure and focus. No fluff.\nProgramme data: ${JSON.stringify({
+      goal: data.goal,
+      days_per_week: data.days_per_week,
+      experience: data.experience,
+      sport: data.sport || null,
+      day_labels: data.day_labels || null
+    })}`;
+    const descMsg = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 60,
+      messages: [{ role: 'user', content: descPrompt }]
+    });
+    const aiDesc = descMsg.content?.[0]?.text?.trim();
+    if (aiDesc) await supabase.from('programmes').update({ description: aiDesc.slice(0, 300) }).eq('id', programmeId);
+  } catch (e) { console.warn('generateProgrammeDescription failed:', e.message); }
+}
+
 app.get('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
   try {
     // FIX 8: exclude archived programmes by default. ?include_archived=true returns all
@@ -3422,6 +3478,18 @@ app.post('/api/programmes/generate', requireAuth, loadSubscription, async (req, 
     if (saveErr) throw saveErr;
 
     sendResponse(200, { programme_id: saved.id, programme: saved, plan_data });
+
+    // Replace the template description with a one-line AI description, async (only
+    // when the caller didn't supply their own). Picked up on next /api/programmes load.
+    if (!b.description && saved?.id) {
+      generateProgrammeDescription(saved.id, {
+        goal: goalLabel,
+        days_per_week: profile.days_per_week,
+        experience: profile.experience,
+        sport: b.sport || null,
+        day_labels: plan.workout?.days?.map(d => d.label),
+      });
+    }
   } catch (err) {
     console.error('programmes/generate error:', err.message);
     sendResponse(500, { error: err.message });
