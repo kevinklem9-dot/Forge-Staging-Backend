@@ -590,11 +590,13 @@ const supabase = createClient(
 // in the Supabase SQL editor:
 //   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS units text DEFAULT 'kg';
 //   ALTER TABLE programmes ADD COLUMN IF NOT EXISTS description text;
-// PATCH /api/profile degrades gracefully if profiles.units is still absent, and the
-// frontend caches units in localStorage, so the app works either way.
+//   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS enabled_features jsonb DEFAULT '["plans","nutrition","progress","prs","coach","logging"]'::jsonb;
+// PATCH /api/profile degrades gracefully if profiles.units / enabled_features is still
+// absent, and the frontend caches both in localStorage, so the app works either way.
 const BOOT_MIGRATIONS = [
   `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS units text DEFAULT 'kg'`,
   `ALTER TABLE programmes ADD COLUMN IF NOT EXISTS description text`,
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS enabled_features jsonb DEFAULT '["plans","nutrition","progress","prs","coach","logging"]'::jsonb`,
 ];
 (async () => {
   for (const sql of BOOT_MIGRATIONS) {
@@ -1648,11 +1650,18 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
     // Only update columns that exist in the schema — ignore unknowns
     const allowed = ['name','age','sex','height_cm','weight_kg','goal','experience',
       'days_per_week','preferred_days','equipment','diet_style','diet_restrictions',
-      'injuries','target_weight_kg','onboarding_complete','preferred_language','units'];
+      'injuries','target_weight_kg','onboarding_complete','preferred_language','units',
+      'enabled_features'];
     const update = { updated_at: new Date().toISOString() };
     allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
     // Units may only be 'kg' or 'lbs' — drop anything else so a bad value can't persist.
     if (update.units !== undefined && update.units !== 'kg' && update.units !== 'lbs') delete update.units;
+    // enabled_features must be an array of strings — drop anything else so a bad value
+    // can't poison the jsonb column. (Validated here, not just trusted from the client.)
+    if (update.enabled_features !== undefined &&
+        !(Array.isArray(update.enabled_features) && update.enabled_features.every(f => typeof f === 'string'))) {
+      delete update.enabled_features;
+    }
 
     const { data, error } = await supabase
       .from('profiles')
@@ -1662,11 +1671,12 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
       .maybeSingle();
 
     if (error) {
-      // If error is about a column the DB doesn't have yet (preferred_days or units
-      // not migrated), retry without it so the rest of the update still lands.
-      if (error.message?.includes('preferred_days') || error.message?.includes('units')) {
+      // If error is about a column the DB doesn't have yet (preferred_days, units, or
+      // enabled_features not migrated), retry without it so the rest of the update still lands.
+      if (error.message?.includes('preferred_days') || error.message?.includes('units') || error.message?.includes('enabled_features')) {
         delete update.preferred_days;
         delete update.units;
+        delete update.enabled_features;
         const { data: data2, error: err2 } = await supabase
           .from('profiles').update(update).eq('id', req.user.id).select().maybeSingle();
         if (err2) throw err2;
