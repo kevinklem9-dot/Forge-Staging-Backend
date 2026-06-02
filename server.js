@@ -591,12 +591,15 @@ const supabase = createClient(
 //   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS units text DEFAULT 'kg';
 //   ALTER TABLE programmes ADD COLUMN IF NOT EXISTS description text;
 //   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS enabled_features jsonb DEFAULT '["plans","nutrition","progress","prs","coach","logging"]'::jsonb;
+//   ALTER TABLE programmes ADD COLUMN IF NOT EXISTS programme_type text DEFAULT 'workout';
 // PATCH /api/profile degrades gracefully if profiles.units / enabled_features is still
 // absent, and the frontend caches both in localStorage, so the app works either way.
 const BOOT_MIGRATIONS = [
   `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS units text DEFAULT 'kg'`,
   `ALTER TABLE programmes ADD COLUMN IF NOT EXISTS description text`,
   `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS enabled_features jsonb DEFAULT '["plans","nutrition","progress","prs","coach","logging"]'::jsonb`,
+  // Custom programme builder stores its origin here ('custom'); AI/onboarding plans default to 'workout'.
+  `ALTER TABLE programmes ADD COLUMN IF NOT EXISTS programme_type text DEFAULT 'workout'`,
 ];
 (async () => {
   for (const sql of BOOT_MIGRATIONS) {
@@ -3347,7 +3350,7 @@ app.get('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
 
 app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
   try {
-    const { name, description, plan_data } = req.body;
+    const { name, description, plan_data, programme_type } = req.body;
     if (!plan_data) return res.status(400).json({ error: 'No plan data provided' });
 
     const { accessTier, isExempt } = req.subscription;
@@ -3374,17 +3377,31 @@ app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
       });
     }
 
-    const { data, error } = await supabase
+    // programme_type: 'custom' for the manual builder, defaults to 'workout' for everything
+    // else. Stored so the My Programmes list / Log panel can distinguish custom builds.
+    const insertRow = {
+      user_id: req.user.id,
+      name: (name || 'My Programme').toString().slice(0, 80),
+      description: description ? description.toString().slice(0, 300) : null,
+      plan_data,
+      is_active: false,
+      programme_type: (programme_type || 'workout').toString().slice(0, 40)
+    };
+    let { data, error } = await supabase
       .from('programmes')
-      .insert({
-        user_id: req.user.id,
-        name: (name || 'My Programme').toString().slice(0, 80),
-        description: description ? description.toString().slice(0, 300) : null,
-        plan_data,
-        is_active: false
-      })
-      .select('id, name, description, created_at, is_active')
+      .insert(insertRow)
+      .select('id, name, description, created_at, is_active, programme_type')
       .maybeSingle();
+    // Graceful fallback if the programmes.programme_type column has not been migrated yet
+    // (mirrors the units/enabled_features degrade-without-column pattern).
+    if (error && /programme_type/.test(error.message || '')) {
+      delete insertRow.programme_type;
+      ({ data, error } = await supabase
+        .from('programmes')
+        .insert(insertRow)
+        .select('id, name, description, created_at, is_active')
+        .maybeSingle());
+    }
     if (error) throw error;
     res.json({ programme: data });
   } catch(err) {
@@ -3523,8 +3540,17 @@ app.post('/api/programmes/:id/activate', requireAuth, async (req, res) => {
     // tolerate {workout_plan, nutrition_plan} too).
     const pd = prog.plan_data || {};
     const workout_plan = pd.workout ?? pd.workout_plan ?? null;
-    const nutrition_plan = pd.nutrition ?? pd.nutrition_plan ?? null;
+    let nutrition_plan = pd.nutrition ?? pd.nutrition_plan ?? null;
     if (!workout_plan) return res.status(400).json({ error: 'programme_has_no_plan' });
+
+    // Workout-only programmes (e.g. the custom builder, programme_type 'custom') carry no
+    // nutrition. Preserve the user's existing nutrition_plan instead of wiping it to null
+    // when activating one. AI/onboarding programmes carry their own nutrition and override.
+    if (!nutrition_plan) {
+      const { data: existingPlan } = await supabase
+        .from('plans').select('nutrition_plan').eq('user_id', req.user.id).maybeSingle();
+      if (existingPlan && existingPlan.nutrition_plan) nutrition_plan = existingPlan.nutrition_plan;
+    }
 
     // Replace the live plan (same clean-slate pattern as plan generation).
     await supabase.from('plans').delete().eq('user_id', req.user.id);
