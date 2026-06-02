@@ -592,6 +592,9 @@ const supabase = createClient(
 //   ALTER TABLE programmes ADD COLUMN IF NOT EXISTS description text;
 //   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS enabled_features jsonb DEFAULT '["plans","nutrition","progress","prs","coach","logging"]'::jsonb;
 //   ALTER TABLE programmes ADD COLUMN IF NOT EXISTS programme_type text DEFAULT 'workout';
+//   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS session_duration_mins int DEFAULT 60;
+//   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS session_duration_varies boolean DEFAULT false;
+//   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS session_duration_by_day jsonb DEFAULT null;
 // PATCH /api/profile degrades gracefully if profiles.units / enabled_features is still
 // absent, and the frontend caches both in localStorage, so the app works either way.
 const BOOT_MIGRATIONS = [
@@ -600,6 +603,10 @@ const BOOT_MIGRATIONS = [
   `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS enabled_features jsonb DEFAULT '["plans","nutrition","progress","prs","coach","logging"]'::jsonb`,
   // Custom programme builder stores its origin here ('custom'); AI/onboarding plans default to 'workout'.
   `ALTER TABLE programmes ADD COLUMN IF NOT EXISTS programme_type text DEFAULT 'workout'`,
+  // Onboarding session-duration question. Single value in minutes, or per-day when it varies.
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS session_duration_mins int DEFAULT 60`,
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS session_duration_varies boolean DEFAULT false`,
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS session_duration_by_day jsonb DEFAULT null`,
 ];
 (async () => {
   for (const sql of BOOT_MIGRATIONS) {
@@ -976,7 +983,7 @@ function requireAdmin(req, res, next) {
 const PROFILE_FIELDS = 'id, name, subscription_tier, subscription_status, trial_ends_at, account_type, coach_plan, coach_plan_status';
 // Fields the AI prompt builders actually read off a profile:
 const COACH_PROFILE_FIELDS = 'name, age, sex, height_cm, weight_kg, goal, experience, days_per_week, equipment, diet_style, diet_restrictions, injuries';
-const PLAN_PROFILE_FIELDS = 'name, age, sex, height_cm, weight_kg, goal, experience, days_per_week, preferred_days, equipment, diet_style, diet_restrictions, injuries';
+const PLAN_PROFILE_FIELDS = 'name, age, sex, height_cm, weight_kg, goal, experience, days_per_week, preferred_days, equipment, diet_style, diet_restrictions, injuries, session_duration_mins, session_duration_varies, session_duration_by_day';
 // The live plan WITHOUT the heavy translations blob (chat/checkin only edit the plan):
 const PLAN_CORE_FIELDS = 'id, workout_plan, nutrition_plan';
 // Exercise-history columns the prompt builders read:
@@ -1654,11 +1661,25 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
     const allowed = ['name','age','sex','height_cm','weight_kg','goal','experience',
       'days_per_week','preferred_days','equipment','diet_style','diet_restrictions',
       'injuries','target_weight_kg','onboarding_complete','preferred_language','units',
-      'enabled_features'];
+      'enabled_features','session_duration_mins','session_duration_varies','session_duration_by_day'];
     const update = { updated_at: new Date().toISOString() };
     allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
     // Units may only be 'kg' or 'lbs' — drop anything else so a bad value can't persist.
     if (update.units !== undefined && update.units !== 'kg' && update.units !== 'lbs') delete update.units;
+    // session_duration_by_day must be a plain object (e.g. { monday: 60 }) or null — drop
+    // anything else so a bad value can't poison the jsonb column.
+    if (update.session_duration_by_day !== undefined &&
+        update.session_duration_by_day !== null &&
+        (typeof update.session_duration_by_day !== 'object' || Array.isArray(update.session_duration_by_day))) {
+      delete update.session_duration_by_day;
+    }
+    // session_duration_varies is a boolean.
+    if (update.session_duration_varies !== undefined) update.session_duration_varies = !!update.session_duration_varies;
+    // session_duration_mins is an int — drop a non-numeric value rather than persist NaN.
+    if (update.session_duration_mins !== undefined) {
+      const n = parseInt(update.session_duration_mins, 10);
+      if (isNaN(n)) delete update.session_duration_mins; else update.session_duration_mins = n;
+    }
     // enabled_features must be an array of strings — drop anything else so a bad value
     // can't poison the jsonb column. (Validated here, not just trusted from the client.)
     if (update.enabled_features !== undefined &&
@@ -1676,10 +1697,13 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
     if (error) {
       // If error is about a column the DB doesn't have yet (preferred_days, units, or
       // enabled_features not migrated), retry without it so the rest of the update still lands.
-      if (error.message?.includes('preferred_days') || error.message?.includes('units') || error.message?.includes('enabled_features')) {
+      if (error.message?.includes('preferred_days') || error.message?.includes('units') || error.message?.includes('enabled_features') || error.message?.includes('session_duration')) {
         delete update.preferred_days;
         delete update.units;
         delete update.enabled_features;
+        delete update.session_duration_mins;
+        delete update.session_duration_varies;
+        delete update.session_duration_by_day;
         const { data: data2, error: err2 } = await supabase
           .from('profiles').update(update).eq('id', req.user.id).select().maybeSingle();
         if (err2) throw err2;
@@ -2495,6 +2519,12 @@ function buildPlanPrompt(profile, language, mwExercises) {
   // Sanitise all string fields to prevent JSON issues
   const safe = (v, fallback = 'not specified') => String(v || fallback).replace(/["""'']/g, '').substring(0, 200).trim();
 
+  // Session-duration context: tell the AI how long each session should run so it sizes
+  // the per-day exercise count and total volume to fit (warm-up + working sets + rest).
+  const durationContext = profile.session_duration_varies
+    ? `Session durations vary by day (minutes): ${JSON.stringify(profile.session_duration_by_day || {})}`
+    : `Each session is approximately ${profile.session_duration_mins || 60} minutes.`;
+
   return `You are an expert strength and conditioning coach. Generate a completely personalised workout and nutrition plan.
 
 PROFILE:
@@ -2505,6 +2535,7 @@ PROFILE:
 - Experience: ${safe(profile.experience, 'intermediate')}
 - Training days per week: ${profile.days_per_week || 4}
 - Preferred training days: ${safe(profile.preferred_days, 'flexible')}
+- Session length: ${durationContext} Size each day's exercise count and total volume to fit the available time (account for warm-up and rest between sets).
 - Equipment: ${safe(profile.equipment, 'full_gym')}
 - Diet style: ${safe(profile.diet_style, 'anything')}
 - Diet restrictions: ${safe(profile.diet_restrictions, 'none')}
@@ -3348,6 +3379,24 @@ app.get('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
   }
 });
 
+// Full single programme including plan_data — used by the editor to pre-populate the
+// custom builder, and by the read-only "View" for AI programmes. User-scoped.
+app.get('/api/programmes/:id/full', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('programmes')
+      .select('id, name, description, created_at, is_active, is_archived, plan_data, programme_type')
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'programme_not_found' });
+    res.json({ programme: data });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
   try {
     const { name, description, plan_data, programme_type } = req.body;
@@ -3462,6 +3511,11 @@ app.post('/api/programmes/generate', requireAuth, loadSubscription, async (req, 
       diet_style: b.diet_style || baseProfile?.diet_style || 'anything',
       diet_restrictions: b.diet_restrictions || baseProfile?.diet_restrictions || 'none',
       injuries,
+      // Inherit the user's saved session-duration preference so generated programmes
+      // are sized to the same schedule as their onboarding plan.
+      session_duration_varies: baseProfile?.session_duration_varies,
+      session_duration_mins: baseProfile?.session_duration_mins,
+      session_duration_by_day: baseProfile?.session_duration_by_day,
     };
 
     const mwExercises = await getMuscleWikiExercises();
@@ -3570,23 +3624,46 @@ app.post('/api/programmes/:id/activate', requireAuth, async (req, res) => {
   }
 });
 
-// Update name/description only (never plan_data).
+// Update name/description, and (for the workout editor) full plan_data. When the
+// edited programme is the active one, its new workout/nutrition is also written
+// through to the live `plans` table so the Plan/Log panels reflect the edit at once.
 app.patch('/api/programmes/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, description } = req.body;
+    const { name, description, plan_data } = req.body;
     const patch = { updated_at: new Date().toISOString() };
     if (name !== undefined) patch.name = (name || '').toString().slice(0, 80);
     if (description !== undefined) patch.description = description ? description.toString().slice(0, 300) : null;
+    if (plan_data !== undefined && plan_data && typeof plan_data === 'object') patch.plan_data = plan_data;
 
     const { data, error } = await supabase
       .from('programmes')
       .update(patch)
       .eq('id', id)
       .eq('user_id', req.user.id)
-      .select('id, name, description, created_at, is_active')
+      .select('id, name, description, created_at, is_active, plan_data, programme_type')
       .maybeSingle();
     if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'programme_not_found' });
+
+    // If plan_data changed AND this programme is the active one, push it into the live
+    // plans table (same shape/clean-slate as the activate endpoint). Nutrition is
+    // preserved when the (custom) programme carries none.
+    if (patch.plan_data && data.is_active) {
+      const pd = data.plan_data || {};
+      const workout_plan = pd.workout ?? pd.workout_plan ?? null;
+      let nutrition_plan = pd.nutrition ?? pd.nutrition_plan ?? null;
+      if (workout_plan) {
+        if (!nutrition_plan) {
+          const { data: existingPlan } = await supabase
+            .from('plans').select('nutrition_plan').eq('user_id', req.user.id).maybeSingle();
+          if (existingPlan && existingPlan.nutrition_plan) nutrition_plan = existingPlan.nutrition_plan;
+        }
+        await supabase.from('plans').delete().eq('user_id', req.user.id);
+        await supabase.from('plans').insert({ user_id: req.user.id, workout_plan, nutrition_plan, translations: {}, source_language: 'en' });
+      }
+    }
+
     res.json({ programme: data });
   } catch(err) {
     res.status(500).json({ error: err.message });
