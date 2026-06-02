@@ -3334,7 +3334,7 @@ app.get('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
     const includeArchived = req.query.include_archived === 'true';
     let pq = supabase
       .from('programmes')
-      .select('id, name, description, created_at, is_active, is_archived')
+      .select('id, name, description, created_at, is_active, is_archived, plan_data, programme_type')
       .eq('user_id', req.user.id);
     if (!includeArchived) pq = pq.or('is_archived.is.null,is_archived.eq.false');
     const { data, error } = await pq.order('created_at', { ascending: false });
