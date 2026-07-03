@@ -19,6 +19,12 @@ let mwExerciseCache = null;
 let mwExerciseCacheTime = 0;
 const MW_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
+// ── STRIPE WEBHOOK IDEMPOTENCY ────────────────────────
+// Stripe retries webhook deliveries (network blips, slow 2xx). Track processed event
+// IDs in-memory so a retry can't double-apply a handler (e.g. double credits). Covers
+// the common retry case within one server instance; pruned below to stay bounded.
+const processedWebhookEvents = new Set();
+
 // ── YOUTUBE VIDEO LOOKUP ─────────────────────────────────
 // Replaces MuscleWiki — YouTube Data API v3, 10k free calls/day
 // Each exercise cached in Supabase permanently after first lookup
@@ -583,6 +589,30 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// ── EMAIL (Resend) ─────────────────────────────────────
+// Transactional email (welcome, referral, etc.) via Resend. Supabase Auth still sends
+// the password-reset + signup-confirmation emails. Defensive require: a missing module
+// or unset RESEND_API_KEY degrades to a logged no-op instead of crashing the server.
+// DEPLOY STEPS: add "resend" to package.json + `npm install`, then set RESEND_API_KEY
+// (and optionally FROM_EMAIL) in the Railway env. Until then, sendEmail() is a no-op.
+let _Resend = null;
+try { _Resend = require('resend').Resend; } catch (e) { console.warn('[email] resend module not installed — transactional emails disabled'); }
+const resend = (_Resend && process.env.RESEND_API_KEY) ? new _Resend(process.env.RESEND_API_KEY) : null;
+const FROM_EMAIL = process.env.FROM_EMAIL || 'noreply@klemforge.com';
+const FROM_NAME = 'FORGE';
+
+async function sendEmail(to, subject, html) {
+  if (!resend) { console.warn('[email] RESEND_API_KEY not set — skipping email:', subject); return false; }
+  try {
+    const { error } = await resend.emails.send({ from: `${FROM_NAME} <${FROM_EMAIL}>`, to, subject, html });
+    if (error) { console.error('[email] Send error:', error); return false; }
+    return true;
+  } catch (err) {
+    console.error('[email] Exception:', err.message);
+    return false;
+  }
+}
+
 // ── BOOT MIGRATIONS (best-effort) ──────────────────────
 // Adds columns newer features need. The Supabase JS client can't run raw DDL, so
 // this calls an optional `run_sql` RPC if the project defines one; if it doesn't,
@@ -607,6 +637,9 @@ const BOOT_MIGRATIONS = [
   `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS session_duration_mins int DEFAULT 60`,
   `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS session_duration_varies boolean DEFAULT false`,
   `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS session_duration_by_day jsonb DEFAULT null`,
+  // Daily workout reminder: preferred LOCAL time ('HH:MM') + IANA timezone. NULL = no reminder.
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS reminder_time text DEFAULT NULL`,
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS reminder_timezone text DEFAULT 'UTC'`,
 ];
 (async () => {
   for (const sql of BOOT_MIGRATIONS) {
@@ -694,13 +727,15 @@ const corsOptions = {
       // Dev origins only outside production — never trust localhost in prod.
       ...(process.env.NODE_ENV !== 'production' ? ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:8080'] : []),
     ].filter(Boolean);
-    if (allowed.some(o => origin.startsWith(o))) return callback(null, true);
+    if (allowed.includes(origin)) return callback(null, true);
     callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization']
 };
+const compression = require('compression');
+app.use(compression()); // gzip all responses — first so every downstream response is compressed
 app.use(helmet({ contentSecurityPolicy: false })); // Security headers
 // Explicit hardening on top of helmet — DENY framing outright (helmet defaults to
 // SAMEORIGIN) and lock down powerful browser features the app never uses.
@@ -724,6 +759,20 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
   } catch (err) {
     console.error('Webhook signature error:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // ── IDEMPOTENCY ───────────────────────────────────────
+  // Ignore an event already processed by this instance so a Stripe retry can't
+  // double-apply (e.g. double credits). Keyed on the verified event.id.
+  if (processedWebhookEvents.has(event.id)) {
+    console.log('[webhook] duplicate event ignored:', event.id);
+    return res.json({ received: true });
+  }
+  processedWebhookEvents.add(event.id);
+  // Prune oldest entries to prevent unbounded growth (add first, then prune).
+  if (processedWebhookEvents.size > 10000) {
+    const first = processedWebhookEvents.values().next().value;
+    processedWebhookEvents.delete(first);
   }
 
   try {
@@ -774,6 +823,42 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             lifetime_tier: tier,
             stripe_customer_id: session.customer,
           }).eq('id', userId);
+
+          // Update Mailchimp — tag as upgraded (fire-and-forget)
+          const userEmailLT = session.customer_details?.email
+            || session.customer_email || null;
+          if (process.env.MAILCHIMP_API_KEY &&
+              process.env.MAILCHIMP_AUDIENCE_ID &&
+              userEmailLT) {
+            const mcServerLT = process.env.MAILCHIMP_SERVER
+              || 'us1';
+            const cryptoLT = require('crypto');
+            const subHashLT = cryptoLT
+              .createHash('md5')
+              .update(userEmailLT.toLowerCase())
+              .digest('hex');
+            fetch('https://' + mcServerLT +
+              '.api.mailchimp.com/3.0/lists/' +
+              process.env.MAILCHIMP_AUDIENCE_ID +
+              '/members/' + subHashLT + '/tags', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Basic ' +
+                  Buffer.from('anystring:' +
+                    process.env.MAILCHIMP_API_KEY)
+                    .toString('base64')
+              },
+              body: JSON.stringify({
+                tags: [
+                  { name: 'trial', status: 'inactive' },
+                  { name: 'upgraded', status: 'active' }
+                ]
+              })
+            }).catch(err => console.error(
+              '[mailchimp] lifetime tag error:',
+              err.message));
+          }
           // Increment founding member counter
           const { data: fmConfig } = await supabase.from('founding_member_config').select('*').maybeSingle();
           await supabase.from('founding_member_config').upsert({
@@ -790,6 +875,44 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             stripe_customer_id: session.customer,
             stripe_subscription_id: session.subscription,
           }).eq('id', userId);
+
+          // Update Mailchimp — tag as upgraded, remove trial tag (fire-and-forget)
+          const userEmail = session.customer_details?.email || session.customer_email || null;
+          if (process.env.MAILCHIMP_API_KEY &&
+              process.env.MAILCHIMP_AUDIENCE_ID &&
+              userEmail) {
+            const mcServer = process.env.MAILCHIMP_SERVER
+              || 'us1';
+
+            // Get subscriber hash (MD5 of lowercase email)
+            const crypto = require('crypto');
+            const subscriberHash = crypto
+              .createHash('md5')
+              .update(userEmail.toLowerCase())
+              .digest('hex');
+
+            const mcUrl = `https://${mcServer}.api.mailchimp.com/3.0/lists/${process.env.MAILCHIMP_AUDIENCE_ID}/members/${subscriberHash}/tags`;
+
+            fetch(mcUrl, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Basic ' +
+                  Buffer.from('anystring:' +
+                    process.env.MAILCHIMP_API_KEY)
+                    .toString('base64')
+              },
+              body: JSON.stringify({
+                tags: [
+                  { name: 'trial', status: 'inactive' },
+                  { name: 'upgraded', status: 'active' }
+                ]
+              })
+            }).catch(err =>
+              console.error('[mailchimp] Tag error:',
+                err.message)
+            );
+          }
           // Increment launch promo counter if applicable
           if (isPromo && ['steel','forge'].includes(tier)) {
             await stripe_recordLaunchSub(tier);
@@ -868,11 +991,77 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         }
         break;
       }
+
+      case 'charge.refunded': {
+        try {
+          const charge = event.data.object;
+          const customerId = charge.customer;
+          if (!customerId) break;
+          // Partial-refund guard: act only on FULL refunds. Stripe sets charge.refunded=true
+          // only when the entire amount is refunded; partial refunds leave it false and take
+          // no automated action (support handles those manually).
+          if (!charge.refunded) {
+            console.log('[webhook] partial refund — no access revocation');
+            break;
+          }
+          // 30-day money-back window: only auto-revoke within the guarantee period (matches
+          // terms.html). A full refund after 30 days is logged but handled manually by support.
+          const chargeDate = new Date(charge.created * 1000);
+          const daysSinceCharge = (Date.now() - chargeDate) / (1000 * 60 * 60 * 24);
+          if (daysSinceCharge > 30) {
+            console.log('[webhook] refund outside 30-day window — no access revocation, user should contact support');
+            break;
+          }
+          const { data: profile } = await supabase
+            .from('profiles')
+            .select('id, subscription_status')
+            .eq('stripe_customer_id', customerId)
+            .maybeSingle();
+          if (!profile) break;
+          await supabase.from('profiles')
+            .update({
+              subscription_status: 'expired',
+              subscription_tier: 'iron',
+              lifetime_tier: null
+            })
+            .eq('id', profile.id);
+          console.log('[webhook] charge.refunded → access revoked for', profile.id);
+        } catch(e) {
+          console.error('[webhook] charge.refunded error:', e.message);
+        }
+        break;
+      }
+
+      case 'charge.dispute.created': {
+        try {
+          const dispute = event.data.object;
+          const customerId = dispute.customer;
+          if (!customerId) break;
+          const { data: profile } = await supabase
+            .from('profiles')
+            .select('id')
+            .eq('stripe_customer_id', customerId)
+            .maybeSingle();
+          if (!profile) break;
+          await supabase.from('profiles')
+            .update({
+              subscription_status: 'expired',
+              subscription_tier: 'iron',
+              lifetime_tier: null,
+              is_frozen: true
+            })
+            .eq('id', profile.id);
+          console.log('[webhook] charge.dispute.created → account frozen for', profile.id);
+        } catch(e) {
+          console.error('[webhook] charge.dispute.created error:', e.message);
+        }
+        break;
+      }
     }
     res.json({ received: true });
   } catch(err) {
     console.error('Webhook handler error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -922,10 +1111,39 @@ const planLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 20, skip: skipNon
 const checkinLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, skip: skipNonProd, message: { error: 'Too many check-ins — slow down.' } });
 const signupLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 50, skip: skipNonProd, message: { error: 'Too many signups — try again later.' } });
 const resetLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, skip: skipNonProd, message: { error: 'Too many reset attempts — try again later.' } });
+
+// Dedicated AI-endpoint limiters (per-IP, hourly) — same pattern as the limiters above and
+// skipped outside production via skipNonProd. These routes previously had only the global
+// 500/15min limiter, which is weak protection against token-cost abuse.
+const aiLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  skip: skipNonProd,
+  message: { error: 'Too many AI requests. Please wait before trying again.' }
+});
+
+const summaryLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  skip: skipNonProd,
+  message: { error: 'Too many summary generations. Please wait.' }
+});
+
+const programmesGenLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  skip: skipNonProd,
+  message: { error: 'Too many programme generations. Please wait before trying again.' }
+});
 app.use('/api/', limiter);
 app.use('/api/chat', chatLimiter);
 app.use('/api/generate-plan', planLimiter);
 app.use('/api/checkin', checkinLimiter);
+app.use('/api/programmes/generate', programmesGenLimiter);
+app.use('/api/translate-plan', aiLimiter);
+app.use('/api/review/generate', aiLimiter);
+app.use('/api/monthly-review/generate', aiLimiter);
+app.use('/api/coach/generate-shopping-list', aiLimiter);
 
 // ── REQUEST TIMEOUT ────────────────────────────
 // Fail a stuck request at 30s instead of holding the socket open to the 180s
@@ -936,6 +1154,7 @@ const TIMEOUT_EXEMPT = [
   '/api/generate-plan', '/api/chat', '/api/checkin', '/api/translate-plan',
   '/api/review/generate', '/api/monthly-review/generate',
   '/api/exercise/video', '/api/exercise/buftest',
+  '/api/notifications/unread-counts',
 ];
 app.use((req, res, next) => {
   if (!TIMEOUT_EXEMPT.some(p => req.path.startsWith(p))) {
@@ -962,41 +1181,49 @@ app.use((req, res, next) => {
 
 // ── AUTH MIDDLEWARE ────────────────────────────
 async function requireAuth(req, res, next) {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: 'Unauthorised' });
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Unauthorised' });
 
-  const { data: { user }, error } = await supabase.auth.getUser(token);
-  if (error || !user) {
-    console.warn(`Auth failed: ${req.ip} — ${error?.message || 'invalid token'}`);
-    return res.status(401).json({ error: 'Invalid token' });
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) {
+      console.warn(`Auth failed: ${req.ip} — ${error?.message || 'invalid token'}`);
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    req.user = user;
+
+    // Check frozen status on every authenticated request
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('is_frozen, subscription_tier, subscription_status, trial_ends_at, is_exempt')
+      .eq('id', user.id)
+      .maybeSingle();
+
+    if (profile?.is_frozen) {
+      return res.status(403).json({
+        error: 'account_frozen',
+        message: 'Your account has been suspended. Contact support to resolve this.'
+      });
+    }
+
+    // Cache profile data on request so loadSubscription doesn't need to re-fetch
+    req.profileCache = profile || null;
+    next();
+  } catch(err) {
+    console.error('[requireAuth] unexpected error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Authentication error' });
   }
-
-  req.user = user;
-
-  // Check frozen status on every authenticated request
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('is_frozen, subscription_tier, subscription_status, trial_ends_at, is_exempt')
-    .eq('id', user.id)
-    .maybeSingle();
-
-  if (profile?.is_frozen) {
-    return res.status(403).json({
-      error: 'account_frozen',
-      message: 'Your account has been suspended. Contact support to resolve this.'
-    });
-  }
-
-  // Cache profile data on request so loadSubscription doesn't need to re-fetch
-  req.profileCache = profile || null;
-  next();
 }
 
 
 function requireAdmin(req, res, next) {
   const adminEmail = process.env.ADMIN_EMAIL;
-  if (!adminEmail) return res.status(500).json({ error: 'ADMIN_EMAIL not configured' });
-  if (req.user?.email !== adminEmail) return res.status(403).json({ error: 'Forbidden' });
+  if (!adminEmail) return res.status(500).json({ error: 'Unauthorized' });
+  if (req.user?.email !== adminEmail) {
+    console.error('[admin] Unauthorised access attempt');
+    return res.status(403).json({ error: 'Forbidden' });
+  }
   next();
 }
 
@@ -1164,7 +1391,7 @@ app.get('/api/vapid-public-key', (req, res) => {
 
 // ── SIGNUP — Check email + create account ──────
 app.post('/api/signup', signupLimiter, async (req, res) => {
-  const { email, password, name } = req.body;
+  const { email, password, name, language } = req.body;
   if (!email || !password || !name) return res.status(400).json({ error: 'All fields required.' });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Invalid email address.' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
@@ -1211,7 +1438,8 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
             name,
             subscription_tier: 'iron',
             subscription_status: 'trial',
-            trial_ends_at: trialEndsAt
+            trial_ends_at: trialEndsAt,
+            preferred_language: language || 'en'
           })
           .eq('id', data.user.id)
           .select('id')
@@ -1226,8 +1454,58 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
           name,
           subscription_tier: 'iron',
           subscription_status: 'trial',
-          trial_ends_at: trialEndsAt
+          trial_ends_at: trialEndsAt,
+          preferred_language: language || 'en'
         });
+      }
+
+      // Add to Mailchimp audience (fire-and-forget)
+      if (process.env.MAILCHIMP_API_KEY &&
+          process.env.MAILCHIMP_AUDIENCE_ID) {
+        const mcServer = process.env.MAILCHIMP_SERVER
+          || 'us1';
+        const mcUrl = `https://${mcServer}.api.mailchimp.com/3.0/lists/${process.env.MAILCHIMP_AUDIENCE_ID}/members`;
+
+        // Split name into first/last for merge fields
+        const nameParts = (name || '').trim()
+          .split(' ');
+        const firstName = nameParts[0] || name || '';
+        const lastName = nameParts.slice(1).join(' ')
+          || '';
+
+        fetch(mcUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Basic ' +
+              Buffer.from('anystring:' +
+                process.env.MAILCHIMP_API_KEY)
+                .toString('base64')
+          },
+          body: JSON.stringify({
+            email_address: email,
+            status: 'subscribed',
+            merge_fields: {
+              FNAME: firstName,
+              LNAME: lastName
+            },
+            tags: ['trial']
+          })
+        })
+        .then(async res => {
+          const body = await res.json();
+          if (!res.ok) {
+            console.error('[mailchimp] Add failed:',
+              res.status, JSON.stringify(body));
+          } else {
+            console.log('[mailchimp] Contact added:',
+              email, 'status:', body.status);
+          }
+        })
+        .catch(err =>
+          console.error('[mailchimp] Network error:',
+            err.message)
+        );
       }
     }
 
@@ -1260,7 +1538,7 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
     res.json({ requires_confirmation: true, email });
   } catch (err) {
     console.error('Signup error:', err);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1277,7 +1555,7 @@ app.post('/api/reset-password', resetLimiter, async (req, res) => {
     if (error) console.error('Reset password error:', error.message);
     res.json({ success: true });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1287,31 +1565,95 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Transfer-Encoding', 'chunked');
   res.setHeader('X-Accel-Buffering', 'no');
+  res.writeHead(200); // commit headers as 200 up front (before the heartbeat flushes them)
 
-  // Send a heartbeat comment every 20 seconds to prevent proxy timeout
+  // Send a heartbeat every 20 seconds to prevent proxy timeout (real byte, not '' —
+  // an empty string sends zero bytes in chunked encoding and never keeps the socket alive)
   const heartbeat = setInterval(() => {
-    try { res.write(''); } catch(e) { clearInterval(heartbeat); }
+    try { res.write('\n'); } catch(e) { clearInterval(heartbeat); }
   }, 20000);
 
   const sendResponse = (status, data) => {
     clearInterval(heartbeat);
-    res.status(status).end(JSON.stringify(data));
+    res.end(JSON.stringify(data));
   };
 
   try {
-    const { data: profile, error: profileErr } = await supabase
+    // `let` so we can reassign `profile` after a self-heal upsert below — the rest of the
+    // function reads `profile` whether it already existed or was just created.
+    let { data: profile, error: profileErr } = await supabase
       .from('profiles')
       .select(PLAN_PROFILE_FIELDS) // only the fields buildPlanPrompt reads — not all 30+ columns
       .eq('id', req.user.id)
       .maybeSingle();
 
-    if (profileErr || !profile) {
-      console.error('Profile fetch error:', profileErr?.message);
-      return sendResponse(404, { error: 'Profile not found. Please try again.' });
+    if (profileErr) {
+      console.error('Profile fetch error:', profileErr.message);
+      return sendResponse(500, { error: 'Internal server error' });
     }
 
+    if (!profile) {
+      // Profile row missing — create it now as a fallback (self-heal) instead of 404ing.
+      const { error: upsertErr } = await supabase
+        .from('profiles')
+        .upsert({
+          id: req.user.id,
+          name: req.user.email?.split('@')[0] || '',
+          subscription_tier: 'iron',
+          subscription_status: 'trial',
+          trial_ends_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+          created_at: new Date().toISOString()
+        // FIX 2: ignoreDuplicates so a transient read-miss on an EXISTING profile can't
+        // overwrite a real trial_ends_at / paid status with a fresh 7-day trial. On conflict
+        // this becomes a no-op and the re-fetch below picks up the true row.
+        }, { onConflict: 'id', ignoreDuplicates: true });
+
+      if (upsertErr) {
+        console.error('Profile create error:', upsertErr.message);
+        return sendResponse(500, { error: 'Internal server error' });
+      }
+
+      // Re-fetch after creating, then continue with the same `profile` variable below.
+      const { data: newProfile, error: refetchErr } = await supabase
+        .from('profiles')
+        .select(PLAN_PROFILE_FIELDS)
+        .eq('id', req.user.id)
+        .maybeSingle();
+
+      if (refetchErr || !newProfile) {
+        return sendResponse(500, { error: 'Internal server error' });
+      }
+      profile = newProfile;
+    }
+
+    // ── TRIAL BACKSTOP (FIX 2) ────────────────────────────────────────────────
+    // New-user race: the profile row can be created by the DB trigger before the signup
+    // handler's trial_ends_at write lands (or if that write failed), leaving trial_ends_at
+    // NULL — which made some brand-new users see "trial ended" on first load. Set a fresh
+    // 7-day trial ONLY when trial_ends_at is NULL and the account is still a trial (or has no
+    // status yet). We deliberately do NOT touch a trial_ends_at that is merely in the past —
+    // that is a legitimately ENDED trial, and re-granting it would bypass the paywall (see the
+    // loadSubscription entitlement guard).
+    try {
+      const { data: trialCheck } = await supabase
+        .from('profiles')
+        .select('trial_ends_at, subscription_status')
+        .eq('id', req.user.id)
+        .maybeSingle();
+      if (trialCheck && !trialCheck.trial_ends_at &&
+          (!trialCheck.subscription_status || trialCheck.subscription_status === 'trial')) {
+        await supabase.from('profiles')
+          .update({
+            trial_ends_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+            subscription_status: 'trial',
+            subscription_tier: 'iron'
+          })
+          .eq('id', req.user.id);
+      }
+    } catch (e) { console.error('Trial backstop check failed:', e.message); }
+
     console.log('=== GENERATE PLAN START ===');
-    console.log('User:', profile.name, '| goal:', profile.goal, '| language:', req.body?.language);
+    console.log('[plan] generating for user:', req.user.id);
     console.log('ANTHROPIC_API_KEY set:', !!process.env.ANTHROPIC_API_KEY);
     console.log('SUPABASE_URL set:', !!process.env.SUPABASE_URL);
 
@@ -1330,14 +1672,24 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
         console.log(`Attempt ${attempt}: calling Anthropic...`);
         const message = await anthropic.messages.create({
           model: 'claude-haiku-4-5-20251001',
-          max_tokens: 8000,
+          max_tokens: 16000,
           messages: [{ role: 'user', content: prompt }]
         });
         const raw = message.content[0].text;
+        console.log(`[generate-plan] attempt ${attempt} response length: ${raw.length} chars`);
         console.log(`Attempt ${attempt}: Anthropic responded, length:`, raw.length);
 
         // Strip markdown fences
         let clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+
+        // Truncation guard: a complete plan object ends with '}'. If the stripped response
+        // does not, the model hit the max_tokens ceiling mid-JSON — throw a clear error so
+        // Railway logs show the real cause (and the retry loop tries again) instead of a
+        // cryptic JSON.parse failure. Must run BEFORE the substring() extraction below, which
+        // would otherwise always force a trailing '}'.
+        if (clean.length > 100 && !clean.trimEnd().endsWith('}')) {
+          throw new Error('Response truncated — JSON incomplete');
+        }
 
         // Find outermost { }
         const start = clean.indexOf('{');
@@ -1389,7 +1741,8 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
 
     // Delete any existing plan for this user first (clean slate)
     console.log('Deleting existing plan...');
-    await supabase.from('plans').delete().eq('user_id', req.user.id);
+    const { error: deleteError } = await supabase.from('plans').delete().eq('user_id', req.user.id);
+    if (deleteError) console.error('[generate-plan] delete error:', deleteError);
 
     // Save to DB — reset translations cache, store source language
     console.log('Inserting new plan...');
@@ -1408,12 +1761,37 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     // Also save to programmes table (deactivate existing, add new active one)
     const planName = `${profile?.goal || 'My'} Plan — ${new Date().toLocaleDateString('en-GB', { month: 'short', year: 'numeric' })}`;
     await supabase.from('programmes').update({ is_active: false }).eq('user_id', req.user.id);
-    const { data: obProg } = await supabase.from('programmes').insert({
+    const { data: obProg, error: progInsertError } = await supabase.from('programmes').insert({
       user_id: req.user.id,
       name: planName,
       plan_data: { workout: plan.workout, nutrition: plan.nutrition },
       is_active: true
     }).select('id').maybeSingle();
+    if (progInsertError) console.error('[generate-plan] programmes insert error:', progInsertError);
+
+    // Also save the AI nutrition plan as its own active 'nutrition' programme row so it shows
+    // in My Programmes (and stays available to switch back to if a coach later assigns a custom
+    // nutrition plan). Deactivate any existing nutrition programmes first so only one is active.
+    // Best-effort — must never block onboarding.
+    try {
+      await supabase.from('programmes')
+        .update({ is_active: false })
+        .eq('user_id', req.user.id)
+        .eq('programme_type', 'nutrition');
+    } catch(_) {}
+    try {
+      await supabase.from('programmes').insert({
+        user_id: req.user.id,
+        name: (profile?.goal || 'My') + ' Nutrition Plan — ' +
+          new Date().toLocaleDateString('en-GB', { month: 'short', year: 'numeric' }),
+        plan_data: { nutrition: plan.nutrition },
+        programme_type: 'nutrition',
+        is_active: true
+      });
+    } catch(nutritionProgErr) {
+      console.error('[generate-plan] nutrition programme insert error:', nutritionProgErr);
+    }
+
     // One-line AI description for the My Programmes list — async, doesn't block onboarding.
     if (obProg?.id) {
       generateProgrammeDescription(obProg.id, {
@@ -1425,7 +1803,11 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     }
 
     // Mark onboarding complete
-    await supabase.from('profiles').update({ onboarding_complete: true }).eq('id', req.user.id);
+    const { error: onboardingError } = await supabase.from('profiles').update({ onboarding_complete: true }).eq('id', req.user.id);
+    if (onboardingError) {
+      console.error('[generate-plan] onboarding_complete update failed:', onboardingError);
+      return sendResponse(500, { error: 'Plan generated but failed to complete setup. Please try again.' });
+    }
 
     console.log('Plan generated successfully for:', profile.name);
     sendResponse(200, { plan: data });
@@ -1634,7 +2016,7 @@ app.post('/api/translate-plan', requireAuth, async (req, res) => {
     res.json({ ok: true, ...result });
   } catch (err) {
     console.error('translate-plan error:', err);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1643,7 +2025,7 @@ app.get('/api/plan', requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('plans')
-      .select('*')
+      .select('id, workout_plan, nutrition_plan, source_language, translations')
       .eq('user_id', req.user.id)
       .order('generated_at', { ascending: false })
       .limit(1)
@@ -1672,7 +2054,7 @@ app.get('/api/plan', requireAuth, async (req, res) => {
     res.json({ plan: { ...planWithoutCache, workout_plan, nutrition_plan } });
   } catch (err) {
     console.error('Get plan error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1688,18 +2070,79 @@ app.get('/api/profile', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ profile: data });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ── UPDATE PROFILE ─────────────────────────────
 app.patch('/api/profile', requireAuth, async (req, res) => {
   try {
+    // ── INPUT VALIDATION (Audit 4, 2a) ── bound/whitelist profile fields before they
+    // reach the DB or flow into AI prompts (prompt-injection surface). `body` aliases
+    // req.body so the string caps below mutate the SAME object the allowed-list copy reads.
+    const body = req.body;
+
+    // A) Numeric range validation
+    if (body.age !== undefined) {
+      const age = Number(body.age);
+      if (!Number.isInteger(age) || age < 13 || age > 100)
+        return res.status(400).json({ error: 'Invalid age' });
+    }
+    if (body.height_cm !== undefined) {
+      const h = Number(body.height_cm);
+      if (isNaN(h) || h < 100 || h > 250)
+        return res.status(400).json({ error: 'Invalid height' });
+    }
+    if (body.weight_kg !== undefined) {
+      const w = Number(body.weight_kg);
+      if (isNaN(w) || w < 25 || w > 400)
+        return res.status(400).json({ error: 'Invalid weight' });
+    }
+    if (body.target_weight_kg !== undefined && body.target_weight_kg !== null) {
+      const tw = Number(body.target_weight_kg);
+      if (isNaN(tw) || tw < 25 || tw > 400)
+        return res.status(400).json({ error: 'Invalid target weight' });
+    }
+    if (body.days_per_week !== undefined) {
+      const d = Number(body.days_per_week);
+      if (!Number.isInteger(d) || d < 1 || d > 7)
+        return res.status(400).json({ error: 'Invalid days per week' });
+    }
+
+    // B) String length caps (mutate req.body before the allowed-list copy below)
+    if (body.name !== undefined)
+      body.name = String(body.name).slice(0, 100);
+    if (body.diet_restrictions !== undefined)
+      body.diet_restrictions = String(body.diet_restrictions).slice(0, 500);
+    if (body.injuries !== undefined)
+      body.injuries = String(body.injuries).slice(0, 500);
+    if (body.bio !== undefined)
+      body.bio = String(body.bio).slice(0, 500);
+
+    // C) Enum validation. goal uses the app's REAL vocabulary and may arrive as an array
+    // or a comma-joined multi-select (e.g. "muscle, strength") or 'custom' — validate every
+    // token, allow empty (no goal chosen yet). experience/sex are single values.
+    const VALID_GOALS = ['muscle', 'fat_loss', 'endurance', 'sport', 'strength', 'custom'];
+    const VALID_EXPERIENCE = ['beginner', 'intermediate', 'advanced'];
+    const VALID_SEX = ['male', 'female', 'other'];
+    if (body.goal !== undefined && body.goal !== null) {
+      const goalTokens = Array.isArray(body.goal)
+        ? body.goal
+        : String(body.goal).split(',').map(g => g.trim()).filter(Boolean);
+      if (!goalTokens.every(g => VALID_GOALS.includes(g)))
+        return res.status(400).json({ error: 'Invalid goal' });
+    }
+    if (body.experience !== undefined && !VALID_EXPERIENCE.includes(body.experience))
+      return res.status(400).json({ error: 'Invalid experience' });
+    if (body.sex !== undefined && !VALID_SEX.includes(body.sex))
+      return res.status(400).json({ error: 'Invalid sex' });
+
     // Only update columns that exist in the schema — ignore unknowns
     const allowed = ['name','age','sex','height_cm','weight_kg','goal','experience',
       'days_per_week','preferred_days','equipment','diet_style','diet_restrictions',
       'injuries','target_weight_kg','onboarding_complete','preferred_language','units',
-      'enabled_features','session_duration_mins','session_duration_varies','session_duration_by_day'];
+      'enabled_features','session_duration_mins','session_duration_varies','session_duration_by_day',
+      'reminder_time','reminder_timezone'];
     const update = { updated_at: new Date().toISOString() };
     allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
     // Units may only be 'kg' or 'lbs' — drop anything else so a bad value can't persist.
@@ -1727,21 +2170,22 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
 
     const { data, error } = await supabase
       .from('profiles')
-      .update(update)
-      .eq('id', req.user.id)
+      .upsert({ id: req.user.id, ...update }, { onConflict: 'id' })
       .select()
       .maybeSingle();
 
     if (error) {
       // If error is about a column the DB doesn't have yet (preferred_days, units, or
       // enabled_features not migrated), retry without it so the rest of the update still lands.
-      if (error.message?.includes('preferred_days') || error.message?.includes('units') || error.message?.includes('enabled_features') || error.message?.includes('session_duration')) {
+      if (error.message?.includes('preferred_days') || error.message?.includes('units') || error.message?.includes('enabled_features') || error.message?.includes('session_duration') || error.message?.includes('reminder_')) {
         delete update.preferred_days;
         delete update.units;
         delete update.enabled_features;
         delete update.session_duration_mins;
         delete update.session_duration_varies;
         delete update.session_duration_by_day;
+        delete update.reminder_time;
+        delete update.reminder_timezone;
         const { data: data2, error: err2 } = await supabase
           .from('profiles').update(update).eq('id', req.user.id).select().maybeSingle();
         if (err2) throw err2;
@@ -1752,7 +2196,7 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
     res.json({ profile: data });
   } catch (err) {
     console.error('Profile update error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1795,7 +2239,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
 
     let activeProgramme = null;
     try {
-      const { data: _ap } = await supabase.from('programmes').select('name, plan_data').eq('user_id', req.user.id).eq('is_active', true).maybeSingle();
+      const { data: _ap } = await supabase.from('programmes').select('name, plan_data').eq('user_id', req.user.id).eq('programme_type', 'workout').eq('is_active', true).order('updated_at', { ascending: false }).limit(1).maybeSingle();
       if (_ap && _ap.name) activeProgramme = { name: _ap.name, goal: (_ap.plan_data && (_ap.plan_data.goal || (_ap.plan_data.workout && _ap.plan_data.workout.goal))) || (profile && profile.goal) || null };
     } catch(e) { /* programme context is best-effort */ }
     const systemPrompt = buildCoachPrompt(profile, planData, recentHistory, context, language, activeProgramme);
@@ -1806,7 +2250,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
       try {
         response = await anthropic.messages.create({
           model: 'claude-sonnet-4-6',
-          max_tokens: 6000,
+          max_tokens: 12000,
           system: systemPrompt,
           messages: sanitised
         });
@@ -1822,13 +2266,29 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
     }
 
     const rawReply = response.content[0].text;
+    const cleanedRaw = rawReply.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '').trim();
 
     // Extract ALL plan update tags (there could be multiple)
-    const planUpdateMatches = [...rawReply.matchAll(/<PLAN_UPDATE>([\s\S]*?)<\/PLAN_UPDATE>/g)];
+    const planUpdateMatches = [...cleanedRaw.matchAll(/<PLAN_UPDATE>([\s\S]*?)<\/PLAN_UPDATE>/g)];
     let planUpdate = null;
-    let cleanReply = rawReply.replace(/<PLAN_UPDATE>[\s\S]*?<\/PLAN_UPDATE>/g, '').trim();
+    let cleanReply = cleanedRaw.replace(/<PLAN_UPDATE>[\s\S]*?<\/PLAN_UPDATE>/g, '').trim();
+    // Belt-and-braces: strip any leaked day_index references from the visible reply
+    // (PLAN_UPDATE tags are already removed above, so this only touches prose).
+    cleanReply = cleanReply
+      .replace(/\bday_index\s*:?\s*\d+/gi, '')
+      .replace(/\bday_index\b/gi, '')
+      .trim();
 
-    if (planUpdateMatches.length > 0 && planData) {
+    // ── PLAN-EDITING TIER GATE (Audit 5, F4) ──
+    // plan_editing is a Steel+ feature (trial/exempt resolve to accessTier 'forge', so they
+    // keep it). Iron users still get the chat reply — the PLAN_UPDATE tags are already
+    // stripped from cleanReply above; we append an upgrade note and skip applying any edit.
+    const canEditPlan = hasAccess('plan_editing', req.subscription?.accessTier, req.subscription?.isExempt);
+    if (planUpdateMatches.length > 0 && !canEditPlan) {
+      cleanReply = cleanReply + '\n\n' + 'Plan editing is available on Steel and above. Upgrade to let your AI coach update your programme.';
+    }
+
+    if (planUpdateMatches.length > 0 && planData && canEditPlan) {
       // Fetch the absolute latest plan from DB (not from earlier Promise.all)
       const { data: freshPlan } = await supabase
         .from('plans').select(PLAN_CORE_FIELDS).eq('user_id', req.user.id)
@@ -1839,12 +2299,14 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
         nutrition: freshPlan?.nutrition_plan || planData.nutrition_plan
       };
 
+      const appliedInstructions = [];
       for (const match of planUpdateMatches) {
         try {
           const updateInstruction = JSON.parse(match[1].trim());
           const updatedPlan = applyPlanUpdate(currentPlan, updateInstruction);
           currentPlan.workout = updatedPlan.workout;
           currentPlan.nutrition = updatedPlan.nutrition;
+          appliedInstructions.push(updateInstruction);
           planUpdate = { type: updateInstruction.type, summary: updateInstruction.summary };
         } catch(e) {
           console.error('Plan update parse error:', e.message);
@@ -1861,6 +2323,35 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
             translations: {} // reset cache — next fetch re-translates
           })
           .eq('id', (freshPlan || planData).id);
+
+        // Keep an active custom programme in sync: re-apply the SAME instruction(s) to the
+        // programme's own workout days. Plan/Log panels render against the active custom
+        // programme when one exists, so without this the coach's edit never shows there.
+        // Surgical — the user-built programme is preserved, only the edited exercises change.
+        // nutrition: {} keeps nutrition-type instructions as harmless no-ops; only .workout
+        // is persisted. Own try/catch so a programme failure can't undo the plan save above.
+        try {
+          const { data: activeProgs } = await supabase
+            .from('programmes')
+            .select('id, plan_data')
+            .eq('user_id', req.user.id)
+            .eq('is_active', true)
+            .eq('is_archived', false)
+            .limit(1);
+          if (activeProgs?.length && activeProgs[0].plan_data?.workout) {
+            const prog = activeProgs[0];
+            let progWorkout = prog.plan_data.workout;
+            for (const instr of appliedInstructions) {
+              progWorkout = applyPlanUpdate({ workout: progWorkout, nutrition: {} }, instr).workout;
+            }
+            await supabase
+              .from('programmes')
+              .update({ plan_data: { ...prog.plan_data, workout: progWorkout } })
+              .eq('id', prog.id);
+          }
+        } catch (e) {
+          console.error('Programme sync error:', e.message);
+        }
       }
     }
 
@@ -1876,7 +2367,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
   } catch (err) {
     console.error('Chat error:', err.message);
     console.error('Chat stack:', err.stack);
-    res.status(500).json({ error: 'Internal server error' });
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1936,6 +2427,13 @@ function applyPlanUpdate(plan, instruction) {
     // Full day replacement
     const day = updated.workout?.days?.find(d => d.day_index === instruction.day_index);
     if (day) day.exercises = instruction.exercises;
+  }
+
+  if (instruction.type === 'rename_day') {
+    const day = updated.workout?.days?.find(d => d.day_index === instruction.day_index);
+    if (day && instruction.label) {
+      day.label = String(instruction.label).slice(0, 100);
+    }
   }
 
   if (instruction.type === 'reschedule_days') {
@@ -2025,12 +2523,24 @@ function applyPlanUpdate(plan, instruction) {
 }
 
 // ── POST-WORKOUT CHECK-IN ──────────────────────
-app.post('/api/checkin', requireAuth, async (req, res) => {
+app.post('/api/checkin', requireAuth, loadSubscription, async (req, res) => {
   try {
     // If this user's coach has disabled post-workout check-ins, skip silently
     // and tell the client there's nothing to show.
     if (await isReviewDisabledByCoach(req.user.id, 'post_workout_checkin_enabled')) {
       return res.json({ disabled: true });
+    }
+
+    // Enforce the monthly AI cap for Iron tier (mirrors /api/chat). loadSubscription
+    // resolves exempt/trial accounts to a non-iron tier, so they bypass this automatically.
+    if (req.subscription?.tier === 'iron') {
+      const usage = await getCoachUsage(req.user.id);
+      if (usage >= 20) {
+        return res.status(429).json({
+          error: 'monthly_limit_reached',
+          message: 'Monthly AI limit reached. Upgrade to continue.'
+        });
+      }
     }
 
     const { session_summary, feeling, difficulty, messages, language } = req.body;
@@ -2068,6 +2578,11 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
     const planUpdateMatch = rawReply.match(/<PLAN_UPDATE>([\s\S]*?)<\/PLAN_UPDATE>/);
     let planUpdate = null;
     let cleanReply = rawReply.replace(/<PLAN_UPDATE>[\s\S]*?<\/PLAN_UPDATE>/g, '').trim();
+    // Belt-and-braces: strip any leaked day_index references from the visible reply
+    cleanReply = cleanReply
+      .replace(/\bday_index\s*:?\s*\d+/gi, '')
+      .replace(/\bday_index\b/gi, '')
+      .trim();
 
     if (planUpdateMatch && planData) {
       try {
@@ -2081,6 +2596,27 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
           translations: {} // reset cache — next fetch re-translates
         }).eq('id', planData.id);
         planUpdate = { type: updateInstruction.type, summary: updateInstruction.summary };
+
+        // Keep an active custom programme in sync with the same change (see chat handler).
+        try {
+          const { data: activeProgs } = await supabase
+            .from('programmes')
+            .select('id, plan_data')
+            .eq('user_id', req.user.id)
+            .eq('is_active', true)
+            .eq('is_archived', false)
+            .limit(1);
+          if (activeProgs?.length && activeProgs[0].plan_data?.workout) {
+            const prog = activeProgs[0];
+            const progWorkout = applyPlanUpdate({ workout: prog.plan_data.workout, nutrition: {} }, updateInstruction).workout;
+            await supabase
+              .from('programmes')
+              .update({ plan_data: { ...prog.plan_data, workout: progWorkout } })
+              .eq('id', prog.id);
+          }
+        } catch (e) {
+          console.error('Programme sync error (checkin):', e.message);
+        }
       } catch(e) {
         console.error('Checkin plan update error:', e.message);
       }
@@ -2100,7 +2636,7 @@ app.post('/api/checkin', requireAuth, async (req, res) => {
     if (err.message?.includes('overloaded') || err.status === 529) {
       return res.status(503).json({ error: 'AI is busy — please try again in a moment.' });
     }
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2154,6 +2690,7 @@ app.post('/api/log', requireAuth, async (req, res) => {
     const historyByName = new Map(); // name -> history row
     const statByName = new Map();     // name -> { bestSet, est1rm, setsLen }
     for (const ex of exercises) {
+      if (ex.cardio) continue; // cardio logs carry no weight/reps — skip PR + history processing
       // exercises now have a sets_data array: [{weight, reps}, ...]
       // Use best set for PR calculation, total volume across all sets
       const setsData = ex.sets_data || [{ weight: ex.weight, reps: ex.reps }];
@@ -2229,7 +2766,7 @@ app.post('/api/log', requireAuth, async (req, res) => {
     res.json({ success: true, new_prs: prUpdates });
   } catch (err) {
     console.error('Log error:', err);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2247,7 +2784,7 @@ app.get('/api/history/:exerciseName', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ history: data });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2267,7 +2804,7 @@ app.get('/api/history', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ history: (data || []).reverse() });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2276,7 +2813,7 @@ app.get('/api/history', requireAuth, async (req, res) => {
 // panel can render workouts grouped by session rather than flattened by exercise.
 app.get('/api/sessions', requireAuth, async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
     console.log('[sessions] fetching for user:', req.user.id);
     // ROOT CAUSE OF THE 500: this select used to request `feeling, difficulty`, but
     // session_logs has no such columns (schema: id, user_id, day_index, day_label,
@@ -2297,7 +2834,7 @@ app.get('/api/sessions', requireAuth, async (req, res) => {
     res.json({ sessions: data || [] });
   } catch (err) {
     console.error('[sessions] error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2314,7 +2851,7 @@ app.get('/api/prs', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ prs: data });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2323,16 +2860,25 @@ app.get('/api/prs/search', requireAuth, async (req, res) => {
   try {
     const q = (req.query.q || '').toString().trim();
     if (!q) return res.json({ prs: [] });
-    // FIX 5: tolerant multi-word matching. Normalise the query, split into words, and
-    // match ANY word via OR(ilike) so "benchpress" → bench OR press finds "Bench Press".
+    // FIX 5: tolerant matching. Normalise the query, split into words, and match ANY word
+    // (and its singular/stem) via OR(ilike) so "benchpress" → bench OR press finds "Bench
+    // Press", and a plural like "curls" → "curl" finds "Barbell Curl". The frontend has a
+    // Levenshtein fallback for typos when this returns nothing.
     const normalised = q.toLowerCase().replace(/\s+/g, ' ').trim().replace(/[^a-z0-9 ]/g, '');
     const words = normalised.split(' ').filter(w => w.length > 1);
+    const stemWord = (w) => w.replace(/ies$/, 'y').replace(/ing$/, '').replace(/ed$/, '').replace(/es$/, '').replace(/s$/, '');
+    const terms = new Set();
+    words.forEach(w => {
+      terms.add(w);
+      const s = stemWord(w);
+      if (s.length >= 3 && s !== w) terms.add(s);
+    });
     let prQuery = supabase
       .from('personal_records')
       .select('exercise_name, weight_kg, reps, est_1rm, achieved_at')
       .eq('user_id', req.user.id);
-    prQuery = words.length
-      ? prQuery.or(words.map(w => `exercise_name.ilike.%${w}%`).join(','))
+    prQuery = terms.size
+      ? prQuery.or([...terms].map(w => `exercise_name.ilike.%${w}%`).join(','))
       : prQuery.ilike('exercise_name', `%${q}%`);
     const { data, error } = await prQuery
       .order('achieved_at', { ascending: false })
@@ -2341,7 +2887,7 @@ app.get('/api/prs/search', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ prs: data || [] });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2350,8 +2896,11 @@ app.post('/api/bodyweight', requireAuth, async (req, res) => {
   try {
     const { weight_kg } = req.body;
     const w = parseFloat(weight_kg);
-    console.log('[bodyweight] save attempt:', { user_id: req.user.id, weight_kg });
+    console.log('[bodyweight] saving');
     if (isNaN(w)) return res.status(400).json({ error: 'invalid_weight' });
+    if (w < 20 || w > 500) {
+      return res.status(400).json({ error: 'Weight must be between 20 and 500 kg' });
+    }
     const today = new Date().toISOString().split('T')[0];
 
     // Manual upsert instead of .upsert({ onConflict: 'user_id,logged_at' }) — the
@@ -2386,7 +2935,7 @@ app.post('/api/bodyweight', requireAuth, async (req, res) => {
     res.json({ success: true, entry: data });
   } catch (err) {
     console.error('[bodyweight] save exception:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2478,7 +3027,7 @@ app.get('/api/stats', requireAuth, async (req, res) => {
     res.json({ streak, longest_streak, badges, monthly_counts });
   } catch (err) {
     console.error('Stats error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2495,11 +3044,11 @@ app.get('/api/bodyweight', requireAuth, async (req, res) => {
       .order('logged_at', { ascending: true })
       .limit(1825);
 
-    console.log('[bodyweight] fetch for user:', req.user.id, 'rows:', data?.length);
+    console.log('[bodyweight] fetched');
     if (error) throw error;
     res.json({ history: data });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2535,7 +3084,7 @@ app.get('/api/bodyweight/history', requireAuth, async (req, res) => {
     const starting_weight = history[0].weight_kg;
     const current_weight = history[history.length - 1].weight_kg;
     const change = Number(current_weight) - Number(starting_weight);
-    const total_change = (change >= 0 ? '+' : '−') + Math.abs(change).toFixed(1);
+    const total_change = (change >= 0 ? '+' : '-') + Math.abs(change).toFixed(1);
 
     res.json({
       history,
@@ -2546,7 +3095,161 @@ app.get('/api/bodyweight/history', requireAuth, async (req, res) => {
       highest_weight: Math.max(...weights)
     });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── BODY METRICS ──────────────────────────────
+// Registered here (before the retention mount further down) so these own /api/metrics and
+// take precedence over any /metrics defined in routes/retention.js. POST upserts one row per
+// user per day keyed on (user_id, logged_at) — REQUIRES a UNIQUE (user_id, logged_at)
+// constraint on body_metrics (see deployment note); without it the upsert errors.
+app.post('/api/metrics', requireAuth, async (req, res) => {
+  if (res.headersSent) return;
+  try {
+    const userId = req.user.id;
+    const {
+      weight_kg, body_fat_pct, muscle_mass_kg,
+      visceral_fat_rating, bone_mass_kg,
+      body_water_pct, metabolic_age, bmr, tdee,
+      activity_level, chest_cm, waist_cm, hips_cm,
+      arm_cm, thigh_cm, left_arm_cm, right_arm_cm,
+      left_thigh_cm, right_thigh_cm,
+      left_calf_cm, right_calf_cm, notes
+    } = req.body;
+
+    // Validate at least one metric provided
+    const fields = [
+      weight_kg, body_fat_pct, muscle_mass_kg,
+      visceral_fat_rating, bone_mass_kg,
+      body_water_pct, metabolic_age, chest_cm,
+      waist_cm, hips_cm, left_arm_cm, right_arm_cm,
+      left_thigh_cm, right_thigh_cm,
+      left_calf_cm, right_calf_cm
+    ];
+    if (fields.every(f => f === undefined || f === null || f === '')) {
+      return res.status(400).json({ error: 'Enter at least one measurement' });
+    }
+
+    // Numeric range validation — coerce to a number first so string inputs (e.g. "18.5")
+    // range-check correctly. toNum maps blank/missing to null, which the loop skips.
+    const toNum = v => (v === undefined || v === null || v === '') ? null : parseFloat(v);
+    const numChecks = [
+      [toNum(weight_kg), 20, 500, 'weight'],
+      [toNum(body_fat_pct), 1, 70, 'body fat'],
+      [toNum(muscle_mass_kg), 5, 200, 'muscle mass'],
+      [toNum(visceral_fat_rating), 1, 59, 'visceral fat'],
+      [toNum(bone_mass_kg), 0.5, 10, 'bone mass'],
+      [toNum(body_water_pct), 20, 80, 'body water'],
+      [toNum(metabolic_age), 10, 120, 'metabolic age'],
+    ];
+    for (const [val, min, max, name] of numChecks) {
+      if (val !== null && (isNaN(val) || val < min || val > max)) {
+        return res.status(400).json({ error: `Invalid ${name} value` });
+      }
+    }
+
+    // Validate activity_level if provided
+    const VALID_ACTIVITY = [
+      'sedentary', 'lightly_active',
+      'moderately_active', 'very_active',
+      'extremely_active'
+    ];
+    if (activity_level && activity_level !== '' && !VALID_ACTIVITY.includes(activity_level)) {
+      return res.status(400).json({ error: 'Invalid activity level' });
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+
+    // Upsert — one entry per user per day
+    const { data, error } = await supabase
+      .from('body_metrics')
+      .upsert({
+        user_id: userId,
+        logged_at: today,
+        weight_kg: weight_kg || null,
+        body_fat_pct: body_fat_pct || null,
+        muscle_mass_kg: muscle_mass_kg || null,
+        visceral_fat_rating: visceral_fat_rating || null,
+        bone_mass_kg: bone_mass_kg || null,
+        body_water_pct: body_water_pct || null,
+        metabolic_age: (metabolic_age === undefined || metabolic_age === null || metabolic_age === '')
+          ? null : Math.round(Number(metabolic_age)),
+        bmr: bmr || null,
+        tdee: tdee || null,
+        activity_level: activity_level || null,
+        chest_cm: chest_cm || null,
+        waist_cm: waist_cm || null,
+        hips_cm: hips_cm || null,
+        arm_cm: arm_cm || null,
+        thigh_cm: thigh_cm || null,
+        left_arm_cm: left_arm_cm || null,
+        right_arm_cm: right_arm_cm || null,
+        left_thigh_cm: left_thigh_cm || null,
+        right_thigh_cm: right_thigh_cm || null,
+        left_calf_cm: left_calf_cm || null,
+        right_calf_cm: right_calf_cm || null,
+        notes: notes?.slice(0, 500) || null
+      }, { onConflict: 'user_id,logged_at' })
+      .select()
+      .single();
+
+    if (error) throw error;
+    return res.json({ success: true, metric: data });
+  } catch (e) {
+    if (!res.headersSent) {
+      console.error('[metrics] POST error:', e.message);
+      return res.status(500).json({ error: 'Failed to save metrics' });
+    }
+  }
+});
+
+app.get('/api/metrics', requireAuth, async (req, res) => {
+  if (res.headersSent) return;
+  try {
+    const userId = req.user.id;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 90, 1), 365);
+
+    const { data, error } = await supabase
+      .from('body_metrics')
+      .select('*')
+      .eq('user_id', userId)
+      .order('logged_at', { ascending: false })
+      .limit(limit);
+
+    if (error) throw error;
+    return res.json({ metrics: data || [] });
+  } catch (e) {
+    if (!res.headersSent) {
+      console.error('[metrics] GET error:', e.message);
+      return res.status(500).json({ error: 'Failed to fetch metrics' });
+    }
+  }
+});
+
+app.get('/api/metrics/latest', requireAuth, async (req, res) => {
+  if (res.headersSent) return;
+  try {
+    const userId = req.user.id;
+
+    // Get last two entries for trend calculation
+    const { data, error } = await supabase
+      .from('body_metrics')
+      .select('*')
+      .eq('user_id', userId)
+      .order('logged_at', { ascending: false })
+      .limit(2);
+
+    if (error) throw error;
+    return res.json({
+      latest: data?.[0] || null,
+      previous: data?.[1] || null
+    });
+  } catch (e) {
+    if (!res.headersSent) {
+      console.error('[metrics] latest error:', e.message);
+      return res.status(500).json({ error: 'Failed to fetch latest metrics' });
+    }
   }
 });
 
@@ -2688,7 +3391,9 @@ function buildCoachPrompt(profile, planData, recentHistory, context, language, a
     ? `\nLANGUAGE: You MUST respond entirely in ${langNames[language] || language}. Every word of your response must be in ${langNames[language] || language}. Do not switch to English under any circumstances.`
     : '';
 
-  return `You are a world-class personal trainer and nutrition coach embedded in the FORGE fitness app. You are coaching a specific client. Be direct, specific, and actionable. No fluff. Use their exact numbers when relevant.${contextStr}${langStr}
+  return `IMPORTANT: Never output your internal reasoning, thinking process, JSON structures, or technical plan instructions in plain text. Your visible response must only contain natural coaching language. PLAN_UPDATE tags are processed automatically and never shown to users.
+
+You are a world-class personal trainer and nutrition coach embedded in the FORGE fitness app. You are coaching a specific client. Be direct, specific, and actionable. No fluff. Use their exact numbers when relevant.${contextStr}${langStr}
 
 CLIENT PROFILE:
 - Name: ${profile?.name || 'User'}
@@ -2757,6 +3462,9 @@ PLAN UPDATE TYPES — use exactly as shown:
 8. REPLACE ALL EXERCISES ON A DAY:
 <PLAN_UPDATE>{"type":"update_day","day_index":0,"exercises":[{"name":"Exercise","note":"cue","sets":"4","reps":"8-10","rest":"2 min","rpe":8}],"summary":"Replaced Monday workout"}</PLAN_UPDATE>
 
+9. RENAME A DAY'S LABEL (e.g. "Push A" → "Chest & Triceps"):
+<PLAN_UPDATE>{"type":"rename_day","day_index":0,"label":"Chest & Triceps","summary":"Renamed Monday to Chest and Triceps"}</PLAN_UPDATE>
+
 - Add a training day: <PLAN_UPDATE>{"type":"add_day","day":{"day_index":4,"day_name":"Friday","label":"Lower Body B","exercises":[{"name":"Squat","note":"Full depth","sets":"4","reps":"6-8","rest":"3 min","rpe":8}]},"summary":"Added Friday lower body session"}</PLAN_UPDATE>
 
 - Remove a training day: <PLAN_UPDATE>{"type":"remove_day","day_index":4,"summary":"Removed Friday session"}</PLAN_UPDATE>
@@ -2780,6 +3488,8 @@ CRITICAL RULES FOR PLAN EDITING:
 - The plan shown in your context is the current live plan — treat it as ground truth
 
 RULES:
+- NEVER mention day_index, field names, JSON structure, or any technical implementation detail in your conversational response. These are for tags only — the user never sees them.
+- ALWAYS refer to days by their name (Monday, Tuesday etc) or their label (Push A, Leg Day etc) in conversation. Never say 'day_index 0' or 'day_index 1' to the user.
 - ALWAYS use the OCCUPIED and FREE day_index lists above — never guess
 - NEVER move a workout to an OCCUPIED day_index unless the user specifically asks to swap two days
 - If the user asks to move to an occupied day, tell them what's already there and ask if they want to swap
@@ -2835,7 +3545,10 @@ YOUR TASK:
 PLAN EDITING: If you decide to adapt the plan based on their feedback, include a <PLAN_UPDATE> tag:
 <PLAN_UPDATE>{"type":"update_exercise","day_index":0,"exercise_name":"Exercise Name","changes":{"sets":"4","reps":"8-10"},"summary":"Brief description of change"}</PLAN_UPDATE>
 
-The tag will be hidden from the user — only your text is shown. Always explain any changes you make in your text response.`;
+The tag will be hidden from the user — only your text is shown. Always explain any changes you make in your text response.
+
+- NEVER mention day_index, field names, JSON structure, or any technical implementation detail in your response. These are for tags only.
+- ALWAYS refer to days by their name (Monday, Tuesday etc) or their label in conversation. Never say 'day_index 0' or similar to the user.`;
 }
 
 
@@ -2852,7 +3565,7 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ conversations: data });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2869,7 +3582,7 @@ app.get('/api/conversations/:id', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ conversation: data });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2885,14 +3598,14 @@ app.get('/api/plan/days', requireAuth, async (req, res) => {
     })) || [];
     res.json({ days });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ── REPAIR PLAN DAYS (fix corrupted day_index values) ──
 app.post('/api/plan/repair-days', requireAuth, async (req, res) => {
   try {
-    const { data: planData } = await supabase.from('plans').select('*').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    const { data: planData } = await supabase.from('plans').select('id, user_id, workout_plan, nutrition_plan, generated_at, source_language').eq('user_id', req.user.id).order('generated_at', { ascending: false }).limit(1).maybeSingle();
     if (!planData) return res.status(404).json({ error: 'No plan found' });
 
     const dayNames = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
@@ -2918,7 +3631,7 @@ app.post('/api/plan/repair-days', requireAuth, async (req, res) => {
     await supabase.from('plans').update({ workout_plan: plan, translations: {} }).eq('id', planData.id);
     res.json({ success: true, days: plan.days.map(d => ({ day_index: d.day_index, day_name: d.day_name, label: d.label })) });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2951,7 +3664,7 @@ app.post('/api/conversations', requireAuth, async (req, res) => {
       res.json({ conversation: data });
     }
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2967,7 +3680,7 @@ app.delete('/api/conversations/:id', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3014,7 +3727,7 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
       renewalDate,
     });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3024,8 +3737,23 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
 
 app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
   try {
-    if (!stripe) return res.status(503).json({ error: 'Stripe not configured — check STRIPE_SECRET_KEY env var' });    const { tier, billing, is_promo } = req.body;
+    if (!stripe) return res.status(503).json({ error: 'Payment service unavailable' });
+    const { tier, billing } = req.body;
     if (!tier || !billing) return res.status(400).json({ error: 'Missing tier or billing' });
+
+    // Validate tier + billing against an allow-list — never trust raw client values.
+    if (!['iron','steel','forge','coach_starter','coach_pro','coach_elite'].includes(tier)) {
+      return res.status(400).json({ error: 'Invalid tier' });
+    }
+    if (!['monthly','annual','lifetime'].includes(billing)) {
+      return res.status(400).json({ error: 'Invalid billing' });
+    }
+
+    // Derive promo eligibility server-side instead of trusting a client-supplied is_promo.
+    // A tier only qualifies for promo pricing while ITS launch promo is still active.
+    const pricingStatus = await getLaunchPricingStatus();
+    const is_promo = (tier === 'steel' && !!pricingStatus?.steel_active) ||
+                     (tier === 'forge' && !!pricingStatus?.forge_active) || false;
 
     const userId = req.user.id;
     const userEmail = req.user.email;
@@ -3041,7 +3769,7 @@ app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
     }
 
     const priceId = STRIPE_PRICES[priceKey];
-    if (!priceId) return res.status(400).json({ error: `No price found for ${priceKey}` });
+    if (!priceId) return res.status(400).json({ error: 'Invalid plan selection' });
 
     // Get or create Stripe customer
     const { data: profile } = await supabase.from('profiles')
@@ -3083,14 +3811,14 @@ app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
     res.json({ url: session.url, session_id: session.id });
   } catch (err) {
     console.error('Stripe checkout error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Stripe billing portal — manage/cancel subscription
 app.post('/api/stripe/portal', requireAuth, async (req, res) => {
   try {
-    if (!stripe) return res.status(503).json({ error: 'Stripe not configured — check STRIPE_SECRET_KEY env var' });    const { data: profile } = await supabase.from('profiles')
+    if (!stripe) return res.status(503).json({ error: 'Payment service unavailable' });    const { data: profile } = await supabase.from('profiles')
       .select('stripe_customer_id').eq('id', req.user.id).maybeSingle();
     if (!profile?.stripe_customer_id) return res.status(400).json({ error: 'No Stripe customer found. Please make a purchase first.' });
     const frontendUrl = process.env.FRONTEND_URL || 'https://klemforge.com';
@@ -3104,16 +3832,16 @@ app.post('/api/stripe/portal', requireAuth, async (req, res) => {
     console.error('Billing portal error:', err.message);
     // Common cause: portal not configured in Stripe dashboard
     if (err.message?.includes('configuration')) {
-      return res.status(500).json({ error: 'Billing portal not configured. Go to Stripe Dashboard → Settings → Billing → Customer portal and save the settings.' });
+      return res.status(500).json({ error: 'Billing portal unavailable. Please contact support.' });
     }
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Sync subscription tier from Stripe — called after billing portal return
 app.post('/api/stripe/sync-subscription', requireAuth, async (req, res) => {
   try {
-    if (!stripe) return res.status(503).json({ error: 'Stripe not configured — check STRIPE_SECRET_KEY env var' });    const { data: profile } = await supabase.from('profiles')
+    if (!stripe) return res.status(503).json({ error: 'Payment service unavailable' });    const { data: profile } = await supabase.from('profiles')
       .select('stripe_subscription_id, stripe_customer_id').eq('id', req.user.id).maybeSingle();
     if (!profile?.stripe_subscription_id) return res.json({ ok: true, synced: false });
     const sub = await stripe.subscriptions.retrieve(profile.stripe_subscription_id);
@@ -3126,7 +3854,7 @@ app.post('/api/stripe/sync-subscription', requireAuth, async (req, res) => {
     res.json({ ok: true, synced: true, tier, status });
   } catch(err) {
     console.error('Sync subscription error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3141,7 +3869,7 @@ app.post('/api/admin/clear-translation-cache', requireAuth, requireAdmin, async 
     if (error) throw error;
     res.json({ success: true, message: 'All translation caches cleared' });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3176,10 +3904,28 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
     allAuthUsers.forEach(u => emailMap[u.id] = u.email);
 
     const users = (profiles || []).map(p => ({ ...p, email: emailMap[p.id] || '—' }));
-    res.json({ users });
+
+    // FIX 2: count active-paid vs active-exempt vs trial separately so comped (exempt)
+    // accounts are no longer reported as paying. Derived from the profiles already fetched
+    // above — no extra query. (is_exempt IS NOT TRUE → counts false/null/undefined as paid.)
+    const stats = { active_paid: 0, active_exempt: 0, trial: 0 };
+    (profiles || []).forEach(p => {
+      if (p.subscription_status === 'active') {
+        if (p.is_exempt === true) stats.active_exempt++;
+        else stats.active_paid++;
+      } else if (p.subscription_status === 'trial') {
+        stats.trial++;
+      }
+    });
+
+    // FIX 3: the admin signup graph + headline stats are derived from this response. The
+    // profiles query above has NO date filter, so today's signups are already included.
+    // Disable caching so the dashboard always reflects the latest data.
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.json({ users, stats });
   } catch (err) {
     console.error('Admin users error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3203,7 +3949,7 @@ app.patch('/api/admin/users/:userId/freeze', requireAuth, requireAdmin, async (r
 
     res.json({ success: true, profile: data });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3249,23 +3995,38 @@ app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, re
     res.json({ success: true });
   } catch (err) {
     console.error('Delete user error:', err);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 
 // ── ADMIN — Set user tier ──────────────────────
-// ── USER TIER SELECTION (preview — Stripe not yet live) ──
-// NOTE: This sets a COSMETIC tier preference only (used during the free trial so the
-// UI can show "you're on Steel"). It does NOT grant paid entitlement: loadSubscription's
-// ENTITLEMENT GUARD ignores subscription_tier unless the status is actually paid/active,
-// so a user cannot escalate to Steel/Forge for free by calling this. Real upgrades go
-// through Stripe (/api/stripe/create-checkout → webhook).
+// ── USER TIER SELECTION (trial-only cosmetic preview) ──
+// SECURITY (F3 — Claude 5 audit, HIGH): tier self-selection is a TRIAL-ONLY preview so the
+// UI can show "you're on Steel" during the free trial. It grants no paid entitlement and is
+// gated to subscription_status === 'trial' below. A paid (active/past_due/lifetime) or expired
+// account is rejected with 403: loadSubscription's ENTITLEMENT GUARD honours a stored
+// subscription_tier whenever the status is paid, so WITHOUT this gate an active lower-tier
+// subscriber could PATCH themselves to Forge and keep every Forge feature for free. Real tier
+// changes for paid accounts come ONLY from Stripe webhooks (checkout.session.completed /
+// customer.subscription.updated → getTierFromPriceId).
 app.patch('/api/subscription/tier', requireAuth, async (req, res) => {
   const { tier } = req.body;
   const validTiers = ['iron', 'steel', 'forge'];
   if (!validTiers.includes(tier)) return res.status(400).json({ error: 'Invalid tier' });
   try {
+    // Trial-only gate (F3): load the caller's current status and refuse the change for any
+    // non-trial account. Trial users may still preview tiers; paid users cannot self-upgrade.
+    const { data: current, error: statusErr } = await supabase
+      .from('profiles')
+      .select('subscription_status')
+      .eq('id', req.user.id)
+      .maybeSingle();
+    if (statusErr) throw statusErr;
+    if (current?.subscription_status !== 'trial') {
+      return res.status(403).json({ error: 'Tier can only be changed during trial period' });
+    }
+
     const { data, error } = await supabase
       .from('profiles')
       .update({ subscription_tier: tier })
@@ -3275,7 +4036,7 @@ app.patch('/api/subscription/tier', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, tier: data.subscription_tier, trialEndsAt: data.trial_ends_at });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3291,7 +4052,50 @@ app.patch('/api/admin/users/:userId/expire-trial', requireAuth, requireAdmin, as
     if (error) throw error;
     res.json({ success: true });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.patch('/api/admin/users/:userId/extend-trial', requireAuth, requireAdmin, async (req, res) => {
+  if (res.headersSent) return;
+  try {
+    const { userId } = req.params;
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    // Extend the trial by 7 days from now, or from the current trial_ends_at if it is
+    // still in the future (whichever is later) — so an admin top-up never shortens a trial.
+    // maybeSingle() (not single()) per the project rule: 0 rows is possible for a
+    // valid-format-but-nonexistent id and must not throw.
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('trial_ends_at')
+      .eq('id', userId)
+      .maybeSingle();
+
+    const base = profile?.trial_ends_at && new Date(profile.trial_ends_at) > new Date()
+      ? new Date(profile.trial_ends_at)
+      : new Date();
+    base.setDate(base.getDate() + 7);
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({
+        trial_ends_at: base.toISOString(),
+        subscription_status: 'trial'
+      })
+      .eq('id', userId)
+      .select()
+      .maybeSingle();
+
+    if (error) throw error;
+    return res.json({ success: true, profile: data });
+  } catch(err) {
+    if (!res.headersSent) {
+      console.error('[admin extend-trial]', err);
+      return res.status(500).json({ error: 'Internal server error' });
+    }
   }
 });
 
@@ -3322,7 +4126,7 @@ app.patch('/api/admin/users/:userId/tier', requireAuth, requireAdmin, async (req
     if (error) throw error;
     res.json({ success: true, profile: data });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3335,10 +4139,10 @@ app.patch('/api/admin/users/:userId/coach-plan', requireAuth, requireAdmin, asyn
     if (action === 'expire_trial') {
       updates.coach_plan_status = 'cancelled';
     } else if (action === 'extend_trial') {
-      // Trial is a fixed 14-day window from coach_trial_start; setting start to 7 days ago
-      // leaves 7 days remaining.
-      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-      updates.coach_trial_start = sevenDaysAgo;
+      // Give a fresh 7-day window from today: requireCoach grants 7 days from
+      // coach_trial_start, so setting the start to now leaves a full 7 days.
+      const newTrialStart = new Date().toISOString();
+      updates.coach_trial_start = newTrialStart;
       updates.coach_plan_status = 'trial';
     } else if (action === 'set_active') {
       updates.coach_plan_status = 'active';
@@ -3349,7 +4153,7 @@ app.patch('/api/admin/users/:userId/coach-plan', requireAuth, requireAdmin, asyn
       .update(updates).eq('id', userId).select().maybeSingle();
     if (error) throw error;
     res.json({ success: true, profile: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── ADMIN — Coach exempt toggle (bypasses requireCoach plan-status check) ──
@@ -3362,7 +4166,7 @@ app.patch('/api/admin/users/:userId/coach-exempt', requireAuth, requireAdmin, as
       .update({ is_coach_exempt: exempt }).eq('id', userId).select().maybeSingle();
     if (error) throw error;
     res.json({ success: true, profile: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── App version (used by frontend auto-update banner) ──
@@ -3409,16 +4213,40 @@ app.get('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
     // FIX 8: exclude archived programmes by default. ?include_archived=true returns all
     // (the frontend uses that to render the collapsed "Archived" section).
     const includeArchived = req.query.include_archived === 'true';
+    const typeFilter = req.query.type;
     let pq = supabase
       .from('programmes')
       .select('id, name, description, created_at, is_active, is_archived, plan_data, programme_type')
       .eq('user_id', req.user.id);
     if (!includeArchived) pq = pq.or('is_archived.is.null,is_archived.eq.false');
+    if (typeFilter === 'nutrition') pq = pq.eq('programme_type', 'nutrition');
+    else if (typeFilter === 'workout') pq = pq.in('programme_type', ['workout', 'custom']);
+    // no typeFilter or typeFilter === 'all' → no additional filter (existing behaviour)
     const { data, error } = await pq.order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ programmes: data || [] });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Returns the user's active nutrition-type programme (or null). Registered BEFORE the
+// /:id/full route so 'active-nutrition' is never captured as an :id param.
+app.get('/api/programmes/active-nutrition', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('programmes')
+      .select('id, name, description, created_at, is_active, plan_data, programme_type')
+      .eq('user_id', req.user.id)
+      .eq('programme_type', 'nutrition')
+      .eq('is_active', true)
+      .or('is_archived.is.null,is_archived.eq.false')
+      .maybeSingle();
+    if (error) throw error;
+    res.json({ programme: data || null });
+  } catch(err) {
+    console.error('Server error:', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3436,7 +4264,7 @@ app.get('/api/programmes/:id/full', requireAuth, async (req, res) => {
     if (!data) return res.status(404).json({ error: 'programme_not_found' });
     res.json({ programme: data });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3453,6 +4281,7 @@ app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
       .from('programmes')
       .select('id', { count: 'exact', head: true })
       .eq('user_id', req.user.id)
+      .eq('programme_type', programme_type || 'workout') // scope the limit per programme type
       .or('is_archived.is.null,is_archived.eq.false'); // FIX 8: archived don't count toward the limit
 
     if ((count || 0) >= limit) {
@@ -3497,7 +4326,7 @@ app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
     if (error) throw error;
     res.json({ programme: data });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3626,7 +4455,7 @@ app.post('/api/programmes/:id/activate', requireAuth, async (req, res) => {
 
     const { data: prog, error: progErr } = await supabase
       .from('programmes')
-      .select('id, name, plan_data')
+      .select('id, name, plan_data, programme_type')
       .eq('id', id)
       .eq('user_id', req.user.id)
       .maybeSingle();
@@ -3638,6 +4467,34 @@ app.post('/api/programmes/:id/activate', requireAuth, async (req, res) => {
     const pd = prog.plan_data || {};
     const workout_plan = pd.workout ?? pd.workout_plan ?? null;
     let nutrition_plan = pd.nutrition ?? pd.nutrition_plan ?? null;
+
+    const progType = prog.programme_type || 'workout';
+
+    if (progType === 'nutrition') {
+      const nutrition_plan = pd.nutrition ?? pd.nutrition_plan ?? null;
+      if (!nutrition_plan) return res.status(400).json({ error: 'programme_has_no_plan' });
+      // For nutrition-only programmes: only update nutrition_plan, never touch workout_plan
+      const { data: existingPlan } = await supabase
+        .from('plans').select('workout_plan, translations, source_language')
+        .eq('user_id', req.user.id).maybeSingle();
+      await supabase.from('plans').delete().eq('user_id', req.user.id);
+      const { error: planErr } = await supabase.from('plans').insert({
+        user_id: req.user.id,
+        workout_plan: existingPlan?.workout_plan ?? null,
+        nutrition_plan,
+        translations: existingPlan?.translations ?? {},
+        source_language: existingPlan?.source_language ?? 'en'
+      });
+      if (planErr) throw planErr;
+      // Deactivate other nutrition programmes only, then activate this one
+      await supabase.from('programmes').update({ is_active: false })
+        .eq('user_id', req.user.id).eq('programme_type', 'nutrition');
+      await supabase.from('programmes').update({
+        is_active: true, updated_at: new Date().toISOString()
+      }).eq('id', id).eq('user_id', req.user.id);
+      return res.json({ ok: true });
+    }
+
     if (!workout_plan) return res.status(400).json({ error: 'programme_has_no_plan' });
 
     // Workout-only programmes (e.g. the custom builder, programme_type 'custom') carry no
@@ -3663,7 +4520,7 @@ app.post('/api/programmes/:id/activate', requireAuth, async (req, res) => {
 
     res.json({ ok: true });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3709,7 +4566,7 @@ app.patch('/api/programmes/:id', requireAuth, async (req, res) => {
 
     res.json({ programme: data });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3725,7 +4582,7 @@ app.patch('/api/programmes/:id/archive', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ ok: true });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3740,7 +4597,7 @@ app.patch('/api/programmes/:id/restore', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ ok: true });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3765,7 +4622,7 @@ app.delete('/api/programmes/:id', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3785,7 +4642,7 @@ app.get('/api/export/history', requireAuth, loadSubscription, async (req, res) =
     // history). Selecting only the columns the CSV emits instead of every column.
     const { data: sessions, error } = await supabase
       .from('session_logs')
-      .select('logged_at, exercises, feeling, difficulty')
+      .select('logged_at, exercises')
       .eq('user_id', req.user.id)
       .order('logged_at', { ascending: false });
 
@@ -3798,19 +4655,17 @@ app.get('/api/export/history', requireAuth, loadSubscription, async (req, res) =
       .maybeSingle();
 
     // Build CSV
-    const rows = ['Date,Exercise,Set,Weight (kg),Reps,Session Rating,Session Difficulty'];
+    const rows = ['Date,Exercise,Set,Weight (kg),Reps'];
     for (const session of sessions || []) {
       const date = session.logged_at?.split('T')[0] || '';
-      const rating = session.feeling || '';
-      const difficulty = session.difficulty || '';
       const exercises = session.exercises || [];
       for (const ex of exercises) {
         const sets = ex.sets_data || [];
         if (sets.length === 0) {
-          rows.push(`${date},"${ex.name}",—,—,—,${rating},${difficulty}`);
+          rows.push(`${date},"${ex.name}",—,—,—`);
         } else {
           sets.forEach((s, i) => {
-            rows.push(`${date},"${ex.name}",${i + 1},${s.weight || 0},${s.reps || 0},${rating},${difficulty}`);
+            rows.push(`${date},"${ex.name}",${i + 1},${s.weight || 0},${s.reps || 0}`);
           });
         }
       }
@@ -3823,7 +4678,7 @@ app.get('/api/export/history', requireAuth, loadSubscription, async (req, res) =
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(csv);
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3852,7 +4707,7 @@ app.post('/api/review/generate', requireAuth, loadSubscription, async (req, res)
 
     const [profileRes, sessionsRes, prsRes] = await Promise.all([
       supabase.from('profiles').select('name, goal, days_per_week').eq('id', userId).maybeSingle(),
-      supabase.from('workout_logs').select('*').eq('user_id', userId).gte('created_at', weekStart.toISOString()),
+      supabase.from('session_logs').select('*').eq('user_id', userId).gte('created_at', weekStart.toISOString()),
       supabase.from('personal_records').select('exercise_name, weight_kg, reps').eq('user_id', userId).gte('achieved_at', weekStartStr),
     ]);
 
@@ -3907,7 +4762,7 @@ Write a concise weekly review (100-150 words) covering: how the week went, any h
     res.json({ review: { summary, workouts_completed: sessions.length, prs_hit: prs.length, week_start: weekStartStr } });
   } catch (err) {
     console.error('Weekly review generate error:', err);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3930,7 +4785,7 @@ app.get('/api/review/latest', requireAuth, loadSubscription, async (req, res) =>
     if (data && !data.summary && data.ai_insights) data.summary = data.ai_insights;
     res.json({ review: data || null });
   } catch (err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3959,7 +4814,7 @@ app.get('/api/monthly-review/latest', requireAuth, loadSubscription, async (req,
 
     res.json({ review: data || null });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -3985,7 +4840,7 @@ app.post('/api/monthly-review/generate', requireAuth, loadSubscription, async (r
 
     const [profileRes, sessionsRes, prsRes, metricsRes] = await Promise.all([
       supabase.from('profiles').select('name, goal, experience, days_per_week').eq('id', userId).maybeSingle(),
-      supabase.from('workout_logs').select('*').eq('user_id', userId).gte('created_at', monthStart).order('created_at', { ascending: false }),
+      supabase.from('session_logs').select('*').eq('user_id', userId).gte('created_at', monthStart).order('created_at', { ascending: false }),
       supabase.from('personal_records').select('exercise_name, weight_kg, reps').eq('user_id', userId).gte('achieved_at', monthStart),
       supabase.from('body_metrics').select('weight_kg, logged_at').eq('user_id', userId).gte('logged_at', monthStart).order('logged_at', { ascending: false }),
     ]);
@@ -4069,7 +4924,7 @@ Be direct, specific, and use their actual numbers. No generic filler. Write like
     res.json({ review: { summary, workouts_completed: sessions.length, prs_hit: prs.length, month_start: monthStart } });
   } catch(err) {
     console.error('Monthly review error:', err);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -4181,7 +5036,11 @@ app.get('/api/exercise/search', requireAuth, async (req, res) => {
 
 
 // ── EXERCISE VIDEO PROXY ────────────────────────────────
-app.get('/api/exercise/video/*', requireAuth, (req, res) => {
+app.get('/api/exercise/video/*', requireAuth, loadSubscription, (req, res) => {
+  // Forge-tier feature — gate server-side so lower tiers can't stream exercise videos.
+  if (!hasAccess('video_demos', req.subscription?.accessTier, req.subscription?.isExempt)) {
+    return res.status(403).json({ error: 'upgrade_required', feature: 'video_demos' });
+  }
   const apiKey = process.env.MUSCLEWIKI_API_KEY;
   if (!apiKey) return res.status(404).json({ error: 'No API key configured' });
 
@@ -4586,7 +5445,7 @@ app.post('/api/exercise/remap-plan', requireAuth, async (req, res) => {
 
     res.json({ success: true, remapped: changed });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -4632,25 +5491,10 @@ app.get('/api/launch-pricing', async (req, res) => {
 
 // Increment counter when a paid subscription completes
 app.post('/api/launch-pricing/record-subscription', requireAuth, async (req, res) => {
-  try {
-    const { tier } = req.body; // 'steel' or 'forge'
-    if (!['steel','forge'].includes(tier)) return res.status(400).json({ error: 'Invalid tier' });
-    const status = await getLaunchPricingStatus();
-    if (!status[`${tier}_active`]) return res.json({ ok: true, promo_active: false });
-    const { data: config } = await supabase.from('launch_pricing_config').select('*').maybeSingle();
-    const newSold = (config?.[`${tier}_sold`] || 0) + 1;
-    const nowEnded = newSold >= LAUNCH_PROMO_THRESHOLD;
-    await supabase.from('launch_pricing_config').upsert({
-      id: 1,
-      steel_active: config?.steel_active ?? true,
-      steel_sold: tier === 'steel' ? newSold : (config?.steel_sold || 0),
-      forge_active: config?.forge_active ?? true,
-      forge_sold: tier === 'forge' ? newSold : (config?.forge_sold || 0),
-      ...(tier === 'steel' && nowEnded ? { steel_active: false } : {}),
-      ...(tier === 'forge' && nowEnded ? { forge_active: false } : {}),
-    });
-    res.json({ ok: true, promo_active: !nowEnded, remaining: LAUNCH_PROMO_THRESHOLD - newSold });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  // DISABLED: this endpoint let any authenticated user increment the global launch-promo
+  // counter with NO payment verification. Real increments are driven by the Stripe webhook
+  // (checkout.session.completed -> stripe_recordLaunchSub). Route kept; body always 403s.
+  return res.status(403).json({ error: 'Forbidden' });
 });
 
 // Admin: view and control launch pricing
@@ -4671,14 +5515,33 @@ app.patch('/api/admin/launch-pricing', requireAuth, requireAdmin, async (req, re
       forge_sold: config?.forge_sold || 0,
     });
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
+if (process.env.NODE_ENV !== 'production') {
+  console.warn(
+    '⚠️  WARNING: NODE_ENV is not "production" ' +
+    '(current: ' + (process.env.NODE_ENV || 'unset') + '). ' +
+    'ALL RATE LIMITING IS DISABLED. ' +
+    'Set NODE_ENV=production in Railway environment variables.'
+  );
+}
 const server = app.listen(PORT, () => console.log(`FORGE backend running on port ${PORT}`));
 // Increase timeout to 3 minutes — plan generation with Sonnet can take up to 90 seconds
 server.timeout = 180000;
 server.keepAliveTimeout = 180000;
 server.headersTimeout = 185000;
+
+// Keep Railway dyno warm — ping every 10 minutes
+const BACKEND_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+  ? 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN
+  : 'https://forge-production-db97.up.railway.app';
+
+setInterval(() => {
+  fetch(BACKEND_URL + '/health')
+    .then(() => console.log('[keep-alive] ping ok'))
+    .catch(e => console.log('[keep-alive] ping failed:', e.message));
+}, 10 * 60 * 1000);
 
 // ── DEBUG — View raw plan (admin only) ────────
 app.get('/api/debug/plan', requireAuth, requireAdmin, async (req, res) => {
@@ -4702,26 +5565,66 @@ app.get('/api/exercise/find-ids', requireAuth, requireAdmin, async (req, res) =>
 // PUSH NOTIFICATIONS
 // ═══════════════════════════════════════════════════════
 
+// Web Push (VAPID) — server-side push for sendPushToUser. A raw fetch to the push
+// endpoint is unsigned + unencrypted and rejected by every push service, so we sign +
+// encrypt via the web-push library, exactly like workout-reminder.js. Wrapped in
+// try/catch so a missing/invalid VAPID key degrades to a logged no-op instead of
+// crashing the server at boot (mirrors the Stripe/Resend init pattern above).
+const webpush = require('web-push');
+try {
+  webpush.setVapidDetails(
+    'mailto:' + (process.env.VAPID_EMAIL || 'hello@forge.app'),
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
+  console.log('Web Push (VAPID) initialised ✓');
+} catch (e) {
+  console.error('Web Push init failed — sendPushToUser disabled:', e.message);
+}
+
 // Send push notification to a user
 async function sendPushToUser(userId, title, body, url = '/') {
   try {
     const { data: subs } = await supabase
       .from('push_subscriptions')
-      .select('subscription')
+      .select('id, subscription')
       .eq('user_id', userId);
     if (!subs?.length) return;
-    const payload = JSON.stringify({ title, body, url });
+    const payload = { title, body, url };
     for (const row of subs) {
+      // Send-time SSRF guard (defence-in-depth): even if a stale/invalid endpoint slipped
+      // into the DB before subscribe-time validation existed, never POST to a host outside
+      // the known push services. Uses `continue` (not `return`) so the user's OTHER valid
+      // devices still receive the push — matches this loop's existing per-row "ignore
+      // individual failures" design. (No caller reads sendPushToUser's return value.)
+      const ALLOWED_PUSH_HOSTS = [
+        'https://fcm.googleapis.com',
+        'https://updates.push.services.mozilla.com',
+        'https://push.services.mozilla.com',
+        'https://web.push.apple.com',
+        'https://api.push.apple.com',
+        'https://androidpush.googleapis.com',
+        'https://fcm-push-gateway.googleapis.com',
+      ];
+      const sendEndpoint = row?.subscription?.endpoint || '';
+      if (!sendEndpoint || !ALLOWED_PUSH_HOSTS.some(h => sendEndpoint.startsWith(h))) {
+        console.warn('[sendPushToUser] blocked invalid endpoint:',
+          sendEndpoint.substring(0, 80));
+        continue;
+      }
       try {
-        await fetch(row.subscription.endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'TTL': '86400',
-          },
-          body: payload,
-        }).catch(() => {});
-      } catch(e) { /* ignore individual failures */ }
+        // VAPID-signed + encrypted via web-push (mirrors workout-reminder.js). On a
+        // 404/410 the subscription is gone — delete it so we stop trying. Other devices
+        // still get the push (loop continues on individual failures).
+        await webpush.sendNotification(row.subscription, JSON.stringify(payload));
+      } catch (err) {
+        if (err.statusCode === 410 || err.statusCode === 404) {
+          await supabase.from('push_subscriptions').delete().eq('id', row.id);
+          console.log(`[sendPushToUser] removed expired subscription ${row.id} (user ${userId})`);
+        } else {
+          console.error(`[sendPushToUser] push failed for ${userId}:`, err.statusCode || err.message);
+        }
+      }
     }
   } catch(e) { console.error('sendPushToUser error:', e.message); }
 }
@@ -4729,16 +5632,64 @@ async function sendPushToUser(userId, title, body, url = '/') {
 // Subscribe to push
 app.post('/api/push/subscribe', requireAuth, async (req, res) => {
   try {
-    const { subscription } = req.body;
-    if (!subscription?.endpoint) return res.status(400).json({ error: 'Invalid subscription' });
+    const { subscription } = req.body || {};
+    if (!subscription || typeof subscription !== 'object') {
+      return res.status(400).json({ error: 'Invalid subscription' });
+    }
+
+    const endpoint = subscription?.endpoint;
+    if (!endpoint || typeof endpoint !== 'string') {
+      return res.status(400).json({ error: 'Invalid subscription endpoint' });
+    }
+
+    // SSRF guard: only store push subscriptions whose endpoint points at a known push
+    // service. sendPushToUser() later POSTs server-side to this stored endpoint, so an
+    // unvalidated client-supplied URL could target internal infrastructure. startsWith
+    // (not includes) — the host is a prefix; real endpoints have a path after it.
+    const ALLOWED_PUSH_HOSTS = [
+      'https://fcm.googleapis.com',
+      'https://updates.push.services.mozilla.com',
+      'https://push.services.mozilla.com',
+      'https://web.push.apple.com',
+      'https://api.push.apple.com',
+      'https://androidpush.googleapis.com',
+      'https://fcm-push-gateway.googleapis.com',
+    ];
+
+    const endpointAllowed = ALLOWED_PUSH_HOSTS.some(host =>
+      endpoint.startsWith(host)
+    );
+
+    if (!endpointAllowed) {
+      console.warn('[push/subscribe] rejected endpoint:',
+        endpoint.substring(0, 80));
+      return res.status(400).json({
+        error: 'Invalid push endpoint'
+      });
+    }
+
     await supabase.from('push_subscriptions').upsert({
       user_id: req.user.id,
       subscription,
     }, { onConflict: 'user_id' });
     res.json({ ok: true });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// Unsubscribe from push (remove this device's subscription)
+app.delete('/api/push/subscribe', requireAuth, async (req, res) => {
+  const { endpoint } = req.body;
+  if (!endpoint) return res.status(400).json({ error: 'endpoint required' });
+
+  await supabase
+    .from('push_subscriptions')
+    .delete()
+    .eq('user_id', req.user.id)
+    .eq('subscription->>endpoint', endpoint);
+
+  res.json({ success: true });
 });
 
 // Trigger grace period notification sequence
@@ -4804,7 +5755,7 @@ app.post('/api/push/founding-member-notify', requireAuth, async (req, res) => {
     await sendPushToUser(userId, 'Founding Member access — limited slots', 'Pay once, train forever. First 500 members only. You\'re eligible now.');
     await supabase.from('profiles').update({ founding_notified_at: new Date().toISOString() }).eq('id', userId);
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -4817,7 +5768,7 @@ app.get('/api/testimonial', async (req, res) => {
       quote: "Built me a full programme in under 2 minutes. I've tried four other apps. This is the first one that felt like it actually knew what I needed.",
       attribution: "— James, training for football season"
     });
-  } catch(e) { console.error('Server error:', e); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(e) { console.error('Server error:', e); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/admin/testimonial', requireAuth, requireAdmin, async (req, res) => {
@@ -4825,7 +5776,7 @@ app.patch('/api/admin/testimonial', requireAuth, requireAdmin, async (req, res) 
     const { quote, attribution } = req.body;
     await supabase.from('app_config').upsert({ key: 'paywall_testimonial', value: { quote, attribution } }, { onConflict: 'key' });
     res.json({ ok: true });
-  } catch(e) { console.error('Server error:', e); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(e) { console.error('Server error:', e); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -4836,7 +5787,7 @@ app.post('/api/trial-feedback', requireAuth, async (req, res) => {
     const { feedback } = req.body;
     await supabase.from('trial_feedback').insert({ user_id: req.user.id, feedback, created_at: new Date().toISOString() });
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -4851,11 +5802,20 @@ app.get('/api/founding-member/slots', async (req, res) => {
       steel_total: data?.steel_total || 250,
       steel_sold: data?.steel_sold || 0,
     });
-  } catch(e) { console.error('Server error:', e); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(e) { console.error('Server error:', e); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/founding-member/claim', requireAuth, async (req, res) => {
   try {
+    // SECURITY: self-service founding-member claims are disabled. This endpoint granted a
+    // free lifetime subscription (subscription_status='lifetime') with NO payment check.
+    // The only legitimate lifetime-grant path is the Stripe webhook
+    // (checkout.session.completed, billing==='lifetime'). Handler preserved below for
+    // reference; this guard returns 403 for every request and MUST stay first in the try
+    // block so it fires before any DB read.
+    return res.status(403).json({
+      error: 'Founding member claims are closed.'
+    });
     const { tier } = req.body; // 'iron' or 'steel'
     if (!['iron','steel'].includes(tier)) return res.status(400).json({ error: 'Invalid tier' });
     const { data: config } = await supabase.from('founding_member_config').select('*').maybeSingle();
@@ -4876,7 +5836,7 @@ app.post('/api/founding-member/claim', requireAuth, async (req, res) => {
       lifetime_tier: tier,
     }).eq('id', req.user.id);
     res.json({ ok: true, tier });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -4893,7 +5853,7 @@ app.get('/api/referral', requireAuth, async (req, res) => {
     }
     const stats = profile.referral_stats || { clicks: 0, signups: 0, conversions: 0, credits: 0 };
     res.json({ code: profile.referral_code, stats });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Apply referral code on signup — called after account creation
@@ -4901,6 +5861,27 @@ app.post('/api/referral/apply', requireAuth, async (req, res) => {
   try {
     const { code } = req.body;
     if (!code) return res.status(400).json({ error: 'No code' });
+
+    // SECURITY (guard): block repeat trial-extension. Without this, any user could re-apply a
+    // referral code on every call and keep pushing trial_ends_at out (= permanent free access).
+    // 1) refuse if already on a paid/lifetime plan; 2) dedup on referred_by, which this
+    // endpoint already sets on a successful apply, so a referral can be applied only once.
+    // (referred_by is the existing column that records a referral was applied — used instead
+    // of a new referral_applied_at column to avoid a schema migration / deploy window.)
+    const { data: prof } = await supabase
+      .from('profiles')
+      .select('subscription_status, trial_ends_at, referred_by')
+      .eq('id', req.user.id)
+      .maybeSingle();
+    if (prof && ['active', 'lifetime'].includes(prof.subscription_status)) {
+      return res.status(400).json({
+        error: 'Cannot apply code to an active subscription.'
+      });
+    }
+    if (prof && prof.referred_by) {
+      return res.status(400).json({ error: 'Referral code already applied.' });
+    }
+
     const { data: referrer } = await supabase.from('profiles').select('id, referral_stats').eq('referral_code', code.toUpperCase()).maybeSingle();
     if (!referrer) return res.status(404).json({ error: 'Invalid code' });
     if (referrer.id === req.user.id) return res.status(400).json({ error: 'Cannot refer yourself' });
@@ -4912,7 +5893,7 @@ app.post('/api/referral/apply', requireAuth, async (req, res) => {
     stats.signups = (stats.signups || 0) + 1;
     await supabase.from('profiles').update({ referral_stats: stats }).eq('id', referrer.id);
     res.json({ ok: true, trialDays: 14 });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -4928,11 +5909,34 @@ app.post('/api/creator-code/validate', async (req, res) => {
     if (data.expires_at && new Date(data.expires_at) < new Date()) return res.status(400).json({ error: 'Code expired' });
     if (data.max_uses && data.uses_count >= data.max_uses) return res.status(400).json({ error: 'Code fully redeemed' });
     res.json({ ok: true, trial_days: data.trial_days || 14, name: data.name });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/creator-code/redeem', requireAuth, async (req, res) => {
   try {
+    // SECURITY (guard): block repeat trial-extension. Without this, any user could redeem a
+    // creator code on every call and keep extending trial_ends_at (= permanent free Forge
+    // access, since trial grants full access). 1) refuse if already on a paid/lifetime plan;
+    // 2) dedup via the existing creator_code_uses table — one creator-code redemption per user.
+    const { data: prof } = await supabase
+      .from('profiles')
+      .select('subscription_status, trial_ends_at')
+      .eq('id', req.user.id)
+      .maybeSingle();
+    if (prof && ['active', 'lifetime'].includes(prof.subscription_status)) {
+      return res.status(400).json({
+        error: 'Cannot apply code to an active subscription.'
+      });
+    }
+    const { data: priorUses } = await supabase
+      .from('creator_code_uses')
+      .select('id')
+      .eq('user_id', req.user.id)
+      .limit(1);
+    if (priorUses && priorUses.length) {
+      return res.status(400).json({ error: 'Creator code already applied.' });
+    }
+
     const { code } = req.body;
     const { data } = await supabase.from('creator_codes')
       .select('*').eq('code', code.toUpperCase().trim()).maybeSingle();
@@ -4948,7 +5952,7 @@ app.post('/api/creator-code/redeem', requireAuth, async (req, res) => {
       code_id: data.id, user_id: req.user.id, used_at: new Date().toISOString()
     });
     res.json({ ok: true, trial_days: data.trial_days || 14 });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Admin: create creator code
@@ -4961,14 +5965,14 @@ app.post('/api/admin/creator-codes', requireAuth, requireAdmin, async (req, res)
     }).select().maybeSingle();
     if (error) throw error;
     res.json({ ok: true, code: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/admin/creator-codes', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { data } = await supabase.from('creator_codes').select('*').order('created_at', { ascending: false });
     res.json({ codes: data || [] });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -5023,10 +6027,10 @@ async function requireCoach(req, res, next) {
       }
       return res.status(403).json({ error: 'not_coach', message: 'Coach account required.' });
     }
-    // Active trial — check the 14-day window
+    // Active trial — check the 7-day window
     if (profile.coach_plan_status === 'trial' && profile.coach_trial_start) {
       const trialEnd = new Date(profile.coach_trial_start);
-      trialEnd.setDate(trialEnd.getDate() + 14);
+      trialEnd.setDate(trialEnd.getDate() + 7);
       if (new Date() > trialEnd) {
         await supabase.from('profiles')
           .update({ coach_plan_status: 'expired' })
@@ -5037,7 +6041,7 @@ async function requireCoach(req, res, next) {
     req.coachProfile = profile;
     next();
   } catch(e) {
-    console.error('Server error:', e); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', e); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 }
 
@@ -5061,7 +6065,7 @@ async function countActiveClients(coachId) {
 // Generates a private, coach-facing overview of a client and stores it on the
 // coach_clients connection row. Declared as a function declaration so it is
 // hoisted and callable from the connection-accept handler defined earlier.
-async function generateClientSummary(coachId, clientId) {
+async function generateClientSummary(coachId, clientId, lang) {
   // Full profile (only columns that exist on profiles — there is no `sport` column)
   const { data: prof } = await supabase
     .from('profiles')
@@ -5073,7 +6077,7 @@ async function generateClientSummary(coachId, clientId) {
   // Latest body metrics (weight, body fat if tracked)
   const { data: metrics } = await supabase
     .from('body_metrics')
-    .select('weight_kg, body_fat, logged_at')
+    .select('weight_kg, body_fat_pct, logged_at')
     .eq('user_id', clientId)
     .order('logged_at', { ascending: false })
     .limit(1)
@@ -5097,12 +6101,17 @@ async function generateClientSummary(coachId, clientId) {
   const clientData = {
     ...prof,
     latest_weight_kg: metrics?.weight_kg ?? prof.weight_kg ?? null,
-    latest_body_fat: metrics?.body_fat ?? null,
+    latest_body_fat: metrics?.body_fat_pct ?? null,
     sessions_last_30_days: sessionCount || 0,
     current_streak: streakRow?.current_streak || 0,
   };
 
-  const prompt = `You are writing a private client overview for a fitness coach.
+  // Optional language: defaults to English (LANG_NAMES omits 'en'), so a missing/'en'/unknown
+  // code yields no instruction and the prompt stays byte-identical to the original English behaviour.
+  const langName = LANG_NAMES[lang] || 'English';
+  const langInstruction = (langName === 'English') ? '' : `Write this summary in ${langName}. `;
+
+  const prompt = `${langInstruction}You are writing a private client overview for a fitness coach.
 Based on the following client data, write a concise 3-4 paragraph
 professional summary that covers:
 1. Who they are and their primary goal (be specific — if goal is
@@ -5135,17 +6144,18 @@ Client data: ${JSON.stringify(clientData)}`;
 }
 
 // On-demand summary generation / regeneration for a coach viewing a client.
-app.post('/api/coach/clients/:clientId/generate-summary', requireAuth, requireCoach, async (req, res) => {
+app.post('/api/coach/clients/:clientId/generate-summary', requireAuth, requireCoach, summaryLimiter, async (req, res) => {
   try {
     const { clientId } = req.params;
+    const { lang } = req.body || {};
     if (!await verifyClientConnection(req.user.id, clientId)) {
       return res.status(403).json({ error: 'no_connection' });
     }
-    const summary = await generateClientSummary(req.user.id, clientId);
+    const summary = await generateClientSummary(req.user.id, clientId, lang);
     res.json({ summary, summary_generated_at: new Date().toISOString() });
   } catch(err) {
     console.error('[generate-summary]', err.message);
-    res.status(500).json({ error: 'summary_failed' });
+    if (!res.headersSent) res.status(500).json({ error: 'summary_failed' });
   }
 });
 
@@ -5161,11 +6171,49 @@ app.post('/api/coach/setup', requireAuth, async (req, res) => {
     const planConfig = COACH_PLAN_CONFIG[plan];
     const userId = req.user.id;
 
+    // SECURITY: block infinite free-trial resets. Read the existing profile first — if a
+    // coach trial was already started, preserve the ORIGINAL coach_trial_start and mark the
+    // status 'expired' so requireCoach enforces payment immediately (mirrors the isPostTrial
+    // guard in the Stripe webhook). maybeSingle() → null on a missing row (never throws).
+    const { data: existingProfile } = await supabase
+      .from('profiles')
+      .select('coach_trial_start, coach_plan_status')
+      .eq('id', req.user.id)
+      .maybeSingle();
+    const hadPriorTrial = !!(existingProfile?.coach_trial_start);
+    const trialStart = hadPriorTrial
+      ? existingProfile.coach_trial_start
+      : new Date().toISOString();
+    const currentStatus = existingProfile?.coach_plan_status;
+    // Check if trial days remain in the 7-day window (matches requireCoach,
+    // which also uses 7 days). A coach who cancelled mid-trial keeps their
+    // remaining days on the new tier; a genuinely expired trial (0 days left)
+    // still requires payment, so this never grants an infinite trial.
+    let trialStatus;
+    if (!hadPriorTrial) {
+      trialStatus = 'trial';
+    } else if (currentStatus === 'active') {
+      trialStatus = 'active';
+    } else {
+      const trialEnd = new Date(trialStart);
+      trialEnd.setDate(trialEnd.getDate() + 7);
+      const daysRemaining = Math.floor(
+        (trialEnd - new Date()) / (1000 * 60 * 60 * 24));
+      if (daysRemaining > 0) {
+        // Trial days remain — restore trial status so they can use the
+        // remaining days on the new tier.
+        trialStatus = 'trial';
+      } else {
+        // Trial genuinely expired — must pay.
+        trialStatus = 'expired';
+      }
+    }
+
     const updates = {
       account_type: 'coach',
       coach_plan: plan,
-      coach_plan_status: 'trial',
-      coach_trial_start: new Date().toISOString(),
+      coach_plan_status: trialStatus,
+      coach_trial_start: trialStart,
       coach_commission_rate: planConfig.commissionRate,
       coach_bio: (bio || '').toString().slice(0, 200) || null,
       coach_title: (title || '').toString().slice(0, 100),
@@ -5176,10 +6224,10 @@ app.post('/api/coach/setup', requireAuth, async (req, res) => {
     const { error } = await supabase.from('profiles').update(updates).eq('id', userId);
     if (error) throw error;
 
-    res.json({ ok: true, plan, status: 'trial' });
+    res.json({ ok: true, plan, status: trialStatus });
   } catch(err) {
     console.error('Coach setup error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -5239,7 +6287,7 @@ app.post('/api/coach/create-checkout', requireAuth, async (req, res) => {
     res.json({ url: session.url, session_id: session.id });
   } catch(err) {
     console.error('Coach create-checkout error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -5252,7 +6300,7 @@ app.post('/api/coach/downgrade', requireAuth, async (req, res) => {
     }).eq('id', req.user.id);
     if (error) throw error;
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Coach profile ──────────────────────────────────────
@@ -5262,7 +6310,7 @@ app.get('/api/coach/profile', requireAuth, requireCoach, async (req, res) => {
       .select('account_type, coach_plan, coach_plan_status, coach_trial_start, coach_commission_rate, coach_bio, coach_title, coach_stripe_subscription_id, name')
       .eq('id', req.user.id).maybeSingle();
     res.json({ profile: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/coach/profile', requireAuth, requireCoach, async (req, res) => {
@@ -5274,7 +6322,7 @@ app.patch('/api/coach/profile', requireAuth, requireCoach, async (req, res) => {
     if (Object.keys(update).length === 0) return res.status(400).json({ error: 'Nothing to update' });
     await supabase.from('profiles').update(update).eq('id', req.user.id);
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Client management ──────────────────────────────────
@@ -5322,7 +6370,7 @@ app.get('/api/coach/clients', requireAuth, requireCoach, async (req, res) => {
       last_active: r.client_id ? (lastActiveById[r.client_id] || null) : null,
     }));
     res.json({ clients });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res) => {
@@ -5427,8 +6475,8 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
         newLink = inserted;
         console.log('[invite] coach_clients insert result:', JSON.stringify(inserted));
         console.log('[invite] client_id stored:', insertRow.client_id);
-        console.log('[invite] invited_email stored:', insertRow.invited_email);
-        console.log('[invite] created coach_clients row:', newLink?.id, 'for client', existingUser.id);
+        console.log('[invite] invite recorded');
+        console.log('[invite] invite recorded');
       }
 
       await sendPushToUser(
@@ -5457,22 +6505,28 @@ app.post('/api/coach/clients/invite', requireAuth, requireCoach, async (req, res
       newLink = inserted;
       console.log('[invite] coach_clients insert result:', JSON.stringify(inserted));
       console.log('[invite] client_id stored:', insertRow.client_id);
-      console.log('[invite] invited_email stored:', insertRow.invited_email);
-      console.log('[invite] created coach_clients row:', newLink?.id, 'for email', cleanEmail);
+      console.log('[invite] invite recorded');
+      console.log('[invite] invite recorded');
       // Email send is wired up to existing email system when available.
       // For now we log and rely on the recipient signing up — they'll see the invite on first login.
-      console.log(`[coach invite] new-user invite recorded for ${cleanEmail} from coach ${req.user.id}`);
+      console.log('[coach invite] invite recorded');
       return res.json({ type: 'new', message: 'Invitation recorded. They\'ll see it when they join FORGE.', connection_id: newLink.id });
     }
   } catch(err) {
     console.error('Coach invite error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.delete('/api/coach/clients/:clientId', requireAuth, requireCoach, async (req, res) => {
   try {
     const { clientId } = req.params;
+    // Reject a non-UUID clientId before it reaches the .or() filter below — an unvalidated
+    // value is interpolated raw into a PostgREST filter string (filter-injection risk).
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(clientId)) {
+      return res.status(400).json({ error: 'Invalid client ID' });
+    }
     // Find the link — clientId param may be a profile id OR a connection id
     const { data: link } = await supabase.from('coach_clients')
       .select('id, client_id').eq('coach_id', req.user.id)
@@ -5487,7 +6541,7 @@ app.delete('/api/coach/clients/:clientId', requireAuth, requireCoach, async (req
         '/app.html?panel=account').catch(() => {});
     }
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Client data — coach reads client data ─────────────
@@ -5565,7 +6619,7 @@ app.get('/api/coach/clients/:clientId/overview', requireAuth, requireCoach, asyn
     });
   } catch(err) {
     console.error('Coach overview error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -5583,7 +6637,7 @@ app.get('/api/coach/clients/:clientId/plan', requireAuth, requireCoach, async (r
       .limit(1).maybeSingle();
     res.json({ plan: plan?.workout_plan || null });
   } catch(err) {
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -5609,7 +6663,7 @@ app.get('/api/coach/clients/:clientId/ai-activity', requireAuth, requireCoach, a
         monthly_review_enabled: true,
       },
     });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/coach/clients/:clientId/notes', requireAuth, requireCoach, async (req, res) => {
@@ -5621,7 +6675,7 @@ app.get('/api/coach/clients/:clientId/notes', requireAuth, requireCoach, async (
     const { data } = await supabase.from('coach_notes')
       .select('*').eq('coach_id', req.user.id).eq('client_id', clientId).maybeSingle();
     res.json({ notes: data || null });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/coach/clients/:clientId/notes', requireAuth, requireCoach, async (req, res) => {
@@ -5637,7 +6691,7 @@ app.post('/api/coach/clients/:clientId/notes', requireAuth, requireCoach, async 
     }, { onConflict: 'coach_id,client_id' }).select().maybeSingle();
     if (error) throw error;
     res.json({ ok: true, notes: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Coach session feedback ────────────────────────────
@@ -5653,7 +6707,7 @@ app.get('/api/coach/clients/:clientId/feedback', requireAuth, requireCoach, asyn
       .order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ feedback: data || [] });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/coach/clients/:clientId/feedback', requireAuth, requireCoach, async (req, res) => {
@@ -5677,7 +6731,7 @@ app.post('/api/coach/clients/:clientId/feedback', requireAuth, requireCoach, asy
     const { data, error } = await supabase.from('coach_session_feedback').insert(row).select().maybeSingle();
     if (error) throw error;
     res.json({ ok: true, feedback: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/coach/feedback/:feedbackId', requireAuth, requireCoach, async (req, res) => {
@@ -5704,7 +6758,7 @@ app.patch('/api/coach/feedback/:feedbackId', requireAuth, requireCoach, async (r
       .update(patch).eq('id', feedbackId).select().maybeSingle();
     if (error) throw error;
     res.json({ ok: true, feedback: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/coach/feedback/:feedbackId', requireAuth, requireCoach, async (req, res) => {
@@ -5718,7 +6772,7 @@ app.delete('/api/coach/feedback/:feedbackId', requireAuth, requireCoach, async (
     const { error } = await supabase.from('coach_session_feedback').delete().eq('id', feedbackId);
     if (error) throw error;
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Client-facing: feedback shared by my coach ────────
@@ -5747,7 +6801,7 @@ app.get('/api/my-coach-feedback', requireAuth, async (req, res) => {
         session_logged_at: f.session_log_id ? (sessionLabelById[f.session_log_id]?.logged_at || null) : null,
       })),
     });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Coach ↔ Client messaging ──────────────────────────
@@ -5770,7 +6824,24 @@ app.get('/api/my-coach-messages', requireAuth, async (req, res) => {
       .eq('coach_id', link.coach_id).eq('client_id', req.user.id)
       .eq('sender_role', 'coach').is('read_at', null);
     res.json({ messages: (data || []).reverse(), coach_id: link.coach_id });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.get('/api/my-coach/feedback', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('coach_session_feedback')
+      .select('id, feedback_text, created_at, session_log_id, is_general, seen_by_client')
+      .eq('client_id', req.user.id)
+      .eq('visible_to_client', true)
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (error) throw error;
+    res.json({ feedback: data || [] });
+  } catch(err) {
+    console.error('Server error:', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 app.post('/api/my-coach-messages', requireAuth, async (req, res) => {
@@ -5790,10 +6861,10 @@ app.post('/api/my-coach-messages', requireAuth, async (req, res) => {
     const { data: clientProfile } = await supabase.from('profiles').select('name').eq('id', req.user.id).maybeSingle();
     const clientName = clientProfile?.name || 'Your client';
     await sendPushToUser(link.coach_id, 'New client message',
-      `${clientName} sent you a message`,
+      `${clientName}: ${text.slice(0, 100)}`,
       '/app.html?panel=clients').catch(() => {});
     res.json({ ok: true, message: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, async (req, res) => {
@@ -5809,13 +6880,8 @@ app.get('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, asyn
       .order('created_at', { ascending: false })
       .limit(300);
     if (error) throw error;
-    // Mark unread client-sent messages as read
-    await supabase.from('coach_messages')
-      .update({ read_at: new Date().toISOString() })
-      .eq('coach_id', req.user.id).eq('client_id', clientId)
-      .eq('sender_role', 'client').is('read_at', null);
     res.json({ messages: (data || []).reverse() });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, async (req, res) => {
@@ -5833,11 +6899,11 @@ app.post('/api/coach/clients/:clientId/messages', requireAuth, requireCoach, asy
     }).select().maybeSingle();
     if (error) throw error;
     const coachName = req.coachProfile?.name || 'Your coach';
-    await sendPushToUser(clientId, 'Coach replied',
-      `${coachName} replied to your message`,
+    await sendPushToUser(clientId, 'Message from your coach',
+      `${coachName}: ${text.slice(0, 100)}`,
       '/app.html?panel=my-coach').catch(() => {});
     res.json({ ok: true, message: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Manual coach reviews (when AI review disabled) ────
@@ -5876,9 +6942,9 @@ app.post('/api/coach/clients/:clientId/manual-review', requireAuth, requireCoach
     // Push the client so they see it
     await sendPushToUser(clientId, 'Coach review',
       `Your coach posted a ${review_type} review`,
-      '/app.html?panel=coach').catch(() => {});
+      '/app.html?panel=progress').catch(() => {});
     res.json({ ok: true, review: row });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/coach/clients/:clientId/manual-reviews', requireAuth, requireCoach, async (req, res) => {
@@ -5893,7 +6959,7 @@ app.get('/api/coach/clients/:clientId/manual-reviews', requireAuth, requireCoach
       .order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ reviews: data || [] });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.get('/api/my-manual-reviews', requireAuth, async (req, res) => {
@@ -5907,7 +6973,7 @@ app.get('/api/my-manual-reviews', requireAuth, async (req, res) => {
       .order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ reviews: data || [] });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Notifications: unread counts ──────────────────────
@@ -5999,7 +7065,7 @@ app.get('/api/notifications/unread-counts', requireAuth, async (req, res) => {
     }
 
     res.json(out);
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/notifications/mark-seen', requireAuth, async (req, res) => {
@@ -6026,7 +7092,7 @@ app.post('/api/notifications/mark-seen', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'bad_type' });
     }
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/notifications/mark-client-messages-seen/:clientId', requireAuth, requireCoach, async (req, res) => {
@@ -6040,7 +7106,7 @@ app.post('/api/notifications/mark-client-messages-seen/:clientId', requireAuth, 
       .eq('coach_id', req.user.id).eq('client_id', clientId)
       .eq('sender_role', 'client').is('read_at', null);
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/coach/clients/:clientId/review-settings', requireAuth, requireCoach, async (req, res) => {
@@ -6062,7 +7128,7 @@ app.patch('/api/coach/clients/:clientId/review-settings', requireAuth, requireCo
       .upsert(row, { onConflict: 'coach_id,client_id' }).select().maybeSingle();
     if (error) throw error;
     res.json({ ok: true, settings: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Programmes ────────────────────────────────────────
@@ -6071,14 +7137,19 @@ app.get('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => 
     const { data } = await supabase.from('coach_programmes')
       .select('*').eq('coach_id', req.user.id).order('updated_at', { ascending: false });
     res.json({ programmes: data || [] });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => {
   try {
-    const { client_id, name, programme_data, nutrition_data, programme_type, is_template } = req.body;
+    let { client_id, name, programme_data, nutrition_data, programme_type, is_template } = req.body;
     if (!name) return res.status(400).json({ error: 'Missing name' });
     const ptype = programme_type || 'workout';
+
+    // SECURITY (IDOR fix): a template must never be bound to a client. Forcing client_id to
+    // null when is_template is true closes the bypass where is_template:true skipped the
+    // connection check below while the row still persisted an attacker-supplied client_id.
+    if (is_template) client_id = null;
 
     if (client_id && !is_template) {
       if (!await verifyClientConnection(req.user.id, client_id)) {
@@ -6113,7 +7184,22 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
           day_name: s.name || `Day ${i + 1}`,
           label: s.name || `Day ${i + 1}`,
           coach_note: s.note || null,
-          exercises: (s.exercises || []).map(e => ({
+          scheduled_days: Array.isArray(s.scheduled_days) ? s.scheduled_days : [],
+          exercises: (s.exercises || []).map(e => (e.cardio ? {
+            name: e.name,
+            cardio: true,
+            sets_data: [{
+              cardio: true,
+              type: 'cardio',
+              duration: { value: parseFloat(String(e.duration||'').replace(',','.')) || null, unit: 'min' },
+              distance: { value: parseFloat(String(e.distance||'').replace(',','.')) || null, unit: 'km' },
+              intensity: e.intensity || null,
+              intervals: null
+            }],
+            sets: 1,
+            reps_range: e.reps || null,
+            target_sets: 1
+          } : {
             name: e.name,
             sets: e.sets,
             reps: e.reps,
@@ -6128,8 +7214,15 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
 
       // Get existing plan to update or create new
       const { data: existingPlan } = await supabase.from('plans')
-        .select('id').eq('user_id', client_id)
+        .select('id, workout_plan').eq('user_id', client_id)
         .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+
+      // FIX 7: preserve the client's AI workout plan so they can toggle back to it.
+      // Mirrors the nutrition _ai_backup logic above. If the current plan is already a
+      // coach plan, carry its existing backup forward rather than backing up a coach plan.
+      coachPlanData._ai_backup = existingPlan?.workout_plan
+        ? (existingPlan.workout_plan.coach_assigned ? (existingPlan.workout_plan._ai_backup || null) : existingPlan.workout_plan)
+        : null;
 
       if (existingPlan?.id) {
         await supabase.from('plans').update({
@@ -6144,6 +7237,14 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
           generated_at: new Date().toISOString(),
         });
       }
+
+      // Deactivate the client's saved workout/custom programmes so they don't shadow
+      // the coach plan on next boot. Best-effort: must never block the response or push.
+      try {
+        await supabase.from('programmes').update({ is_active: false })
+          .eq('user_id', client_id)
+          .in('programme_type', ['workout', 'custom']);
+      } catch (_) {}
     }
 
     // Nutrition assignment → write nutrition_plan into the client's live plan
@@ -6175,13 +7276,22 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
           generated_at: new Date().toISOString(),
         });
       }
+      // Deactivate the client's saved nutrition programmes so they don't shadow the
+      // coach plan on next boot. Best-effort: must never block the response or push.
+      try {
+        await supabase
+          .from('programmes')
+          .update({ is_active: false })
+          .eq('user_id', client_id)
+          .eq('programme_type', 'nutrition');
+      } catch (_) { /* best-effort */ }
       await sendPushToUser(client_id, 'Nutrition plan updated',
         'Your coach has updated your nutrition plan',
         '/app.html?panel=nutrition').catch(() => {});
     }
 
     res.json({ ok: true, programme: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // FIX 7: generate a weekly shopping list from a coach-built nutrition plan's meals.
@@ -6196,11 +7306,19 @@ app.post('/api/coach/generate-shopping-list', requireAuth, requireCoach, async (
     }
     const mealsForPrompt = meals.map(m => ({
       name: m.name || '',
-      foods: m.foods || m.note || m.notes || '',
+      foods: (Array.isArray(m.foods) && m.foods.length)
+        ? m.foods
+        : (m.notes || m.note || ''),
       kcal: m.kcal != null ? m.kcal : m.calories,
       protein_g: m.protein_g, carbs_g: m.carbs_g, fat_g: m.fat_g,
     }));
-    const prompt = `Based on these meals for a client's weekly nutrition plan, generate a practical weekly shopping list grouped by category (Proteins, Vegetables, Fruits, Grains/Carbs, Dairy, Fats/Oils, Other). Assume a full 7-day week and be specific with quantities where possible. Return ONLY the shopping list as plain text: each category as an UPPERCASE heading on its own line, followed by "- item (quantity)" bullet lines. No preamble, no closing remarks.\n\nMeals: ${JSON.stringify(mealsForPrompt)}`;
+    const prompt = `Based on these meals for a client's weekly nutrition plan, generate a practical weekly shopping list grouped by category (Proteins, Vegetables, Fruits, Grains/Carbs, Dairy, Fats/Oils, Other). Assume a full 7-day week and be specific with quantities where possible. Return ONLY the shopping list as plain text: each category as an UPPERCASE heading on its own line, followed by "- item (quantity)" bullet lines. No preamble, no closing remarks.\n\nMeals:\n${mealsForPrompt.map(m => {
+    const detail = Array.isArray(m.foods) && m.foods.length
+      ? 'Foods: ' + m.foods.map(f => f.name || f).join(', ')
+      : (m.foods ? 'Description: ' + m.foods : 'No specific foods listed');
+    return m.name + ' (' + m.kcal + ' kcal, ' + m.protein_g + 'g protein, ' +
+      m.carbs_g + 'g carbs, ' + m.fat_g + 'g fat) — ' + detail;
+  }).join('\n')}`;
     const message = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 1500,
@@ -6211,7 +7329,7 @@ app.post('/api/coach/generate-shopping-list', requireAuth, requireCoach, async (
     res.json({ shopping_list });
   } catch (err) {
     console.error('generate-shopping-list error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -6225,7 +7343,18 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
     const { data, error } = await supabase.from('coach_programmes')
       .update(update).eq('id', programmeId).eq('coach_id', req.user.id).select().maybeSingle();
     if (error) throw error;
-    if (data?.client_id) {
+    // SECURITY (IDOR fix): re-verify the coach still has an active connection with this client
+    // before any client-facing write. Without this, a coach disconnected from a client — or
+    // never connected, via a pre-fix template row that still carries a client_id — could
+    // overwrite that user's live plan and push to their device. Templates never touch a
+    // client's live plan, so they are exempt from the check AND from the write block below.
+    if (data?.client_id && !data?.is_template) {
+      const stillConnected = await verifyClientConnection(req.user.id, data.client_id);
+      if (!stillConnected) {
+        return res.status(403).json({ error: 'no_connection' });
+      }
+    }
+    if (data?.client_id && !data?.is_template) {
       await sendPushToUser(data.client_id, 'Programme updated',
         'Your coach has updated your programme.', '/app.html?panel=workout').catch(() => {});
 
@@ -6237,7 +7366,22 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
             day_name: s.name || `Day ${i + 1}`,
             label: s.name || `Day ${i + 1}`,
             coach_note: s.note || null,
-            exercises: (s.exercises || []).map(e => ({
+            scheduled_days: Array.isArray(s.scheduled_days) ? s.scheduled_days : [],
+            exercises: (s.exercises || []).map(e => (e.cardio ? {
+              name: e.name,
+              cardio: true,
+              sets_data: [{
+                cardio: true,
+                type: 'cardio',
+                duration: { value: parseFloat(String(e.duration||'').replace(',','.')) || null, unit: 'min' },
+                distance: { value: parseFloat(String(e.distance||'').replace(',','.')) || null, unit: 'km' },
+                intensity: e.intensity || null,
+                intervals: null
+              }],
+              sets: 1,
+              reps_range: e.reps || null,
+              target_sets: 1
+            } : {
               name: e.name, sets: e.sets, reps: e.reps,
               rest: e.rpe || e.weight || null,
             }))
@@ -6247,8 +7391,12 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
           programme_name: data.name,
         };
         const { data: existingPlan } = await supabase.from('plans')
-          .select('id').eq('user_id', data.client_id)
+          .select('id, workout_plan').eq('user_id', data.client_id)
           .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+        // FIX 7: preserve the AI workout backup across coach programme edits.
+        updatedPlanData._ai_backup = existingPlan?.workout_plan
+          ? (existingPlan.workout_plan.coach_assigned ? (existingPlan.workout_plan._ai_backup || null) : existingPlan.workout_plan)
+          : null;
         if (existingPlan?.id) {
           await supabase.from('plans').update({
             workout_plan: updatedPlanData, translations: {},
@@ -6258,7 +7406,7 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
       }
     }
     res.json({ ok: true, programme: data });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.delete('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async (req, res) => {
@@ -6267,7 +7415,7 @@ app.delete('/api/coach/programmes/:programmeId', requireAuth, requireCoach, asyn
     await supabase.from('coach_programmes')
       .delete().eq('id', programmeId).eq('coach_id', req.user.id);
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Returns the client's current live nutrition plan (coach-assigned or AI).
@@ -6283,7 +7431,59 @@ app.get('/api/coach/clients/:clientId/nutrition-plan', requireAuth, requireCoach
     res.json({ nutrition_plan: planRow?.nutrition_plan || null });
   } catch(err) {
     console.error('[nutrition-plan GET]', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Returns the client's bodyweight log (weight history) — coach view.
+// Reads bodyweight_log (weight_kg, logged_at) — same source as GET /api/bodyweight.
+app.get('/api/coach/clients/:clientId/bodyweight', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data, error } = await supabase
+      .from('bodyweight_log')
+      .select('weight_kg, logged_at')
+      .eq('user_id', clientId)
+      .order('logged_at', { ascending: false })
+      .limit(60);
+    if (error) throw error;
+    res.json({ bodyweight: data || [] });
+  } catch(err) {
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Reads body_metrics (all columns) for a connected client — coach read-only view.
+app.get('/api/coach/clients/:clientId/metrics', requireAuth, requireCoach, async (req, res) => {
+  if (res.headersSent) return;
+  try {
+    const { clientId } = req.params;
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(clientId)) {
+      return res.status(400).json({ error: 'Invalid client ID' });
+    }
+    const connected = await verifyClientConnection(req.user.id, clientId);
+    if (!connected) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+
+    const { data, error } = await supabase
+      .from('body_metrics')
+      .select('*')
+      .eq('user_id', clientId)
+      .order('logged_at', { ascending: false })
+      .limit(90);
+
+    if (error) throw error;
+    return res.json({ metrics: data || [] });
+  } catch (e) {
+    if (!res.headersSent) {
+      console.error('[coach metrics] error:', e.message);
+      return res.status(500).json({ error: 'Failed to fetch client metrics' });
+    }
   }
 });
 
@@ -6313,36 +7513,265 @@ app.post('/api/coach/clients/:clientId/reset-nutrition', requireAuth, requireCoa
     res.json({ ok: true, nutrition_plan: restored });
   } catch(err) {
     console.error('[reset-nutrition]', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── SET ACTIVE PLAN (coach toggles a client between their AI and coach plans) ──────
+// Switch the client's live workout plan to their AI plan (coach_assigned:false).
+app.patch('/api/coach/clients/:clientId/activate-ai-plan', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data: planRow } = await supabase.from('plans')
+      .select('id, workout_plan').eq('user_id', clientId)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    const wp = planRow?.workout_plan || null;
+    // The AI plan is the live plan when no coach plan is active, else the preserved backup.
+    const aiPlan = wp ? (wp.coach_assigned ? (wp._ai_backup || null) : wp) : null;
+    if (!aiPlan || !((aiPlan.days || []).length)) {
+      return res.status(400).json({ error: 'no_ai_plan' });
+    }
+    const newPlan = { ...aiPlan, coach_assigned: false };
+    delete newPlan._ai_backup;
+    if (planRow?.id) {
+      await supabase.from('plans').update({
+        workout_plan: newPlan, translations: {},
+        generated_at: new Date().toISOString(),
+      }).eq('id', planRow.id);
+    }
+    // Switching back to the AI plan: reactivate the client's most recent non-archived
+    // workout/custom programme so My Programmes shows an ACTIVE plan again. Best-effort.
+    try {
+      const { data: latestProg } = await supabase
+        .from('programmes')
+        .select('id')
+        .eq('user_id', clientId)
+        .in('programme_type', ['workout', 'custom'])
+        .or('is_archived.is.null,is_archived.eq.false')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (latestProg?.id) {
+        await supabase.from('programmes')
+          .update({ is_active: true })
+          .eq('id', latestProg.id);
+      }
+    } catch (_) {}
+    await sendPushToUser(clientId, 'Workout plan updated',
+      'Your coach switched you to the AI workout plan.',
+      '/app.html?panel=workout').catch(() => {});
+    res.json({ ok: true });
+  } catch(err) {
+    console.error('[activate-ai-plan]', err.message);
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Switch the client's live workout plan to their coach-assigned plan (coach_assigned:true).
+// Rebuilds the live plan from the coach's saved programme so the AI backup is preserved.
+app.patch('/api/coach/clients/:clientId/activate-coach-plan', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data: prog } = await supabase.from('coach_programmes')
+      .select('*').eq('coach_id', req.user.id).eq('client_id', clientId)
+      .neq('programme_type', 'nutrition').eq('is_template', false)
+      .order('updated_at', { ascending: false }).limit(1).maybeSingle();
+    if (!prog) return res.status(404).json({ error: 'no_coach_plan' });
+    const coachPlanData = {
+      days: (prog.programme_data?.sessions || []).map((s, i) => ({
+        day_index: i,
+        day_name: s.name || `Day ${i + 1}`,
+        label: s.name || `Day ${i + 1}`,
+        coach_note: s.note || null,
+        scheduled_days: Array.isArray(s.scheduled_days) ? s.scheduled_days : [],
+        exercises: (s.exercises || []).map(e => (e.cardio ? {
+          name: e.name,
+          cardio: true,
+          sets_data: [{
+            cardio: true,
+            type: 'cardio',
+            duration: { value: parseFloat(String(e.duration||'').replace(',','.')) || null, unit: 'min' },
+            distance: { value: parseFloat(String(e.distance||'').replace(',','.')) || null, unit: 'km' },
+            intensity: e.intensity || null,
+            intervals: null
+          }],
+          sets: 1,
+          reps_range: e.reps || null,
+          target_sets: 1
+        } : {
+          name: e.name, sets: e.sets, reps: e.reps,
+          rest: e.rpe || e.weight || null,
+          note: `${e.rpe ? 'RPE ' + e.rpe : ''}${e.weight ? e.weight : ''}`.trim() || null,
+        }))
+      })),
+      coach_assigned: true,
+      coach_name: req.coachProfile.name || 'Your coach',
+      programme_name: prog.name,
+    };
+    const { data: existingPlan } = await supabase.from('plans')
+      .select('id, workout_plan').eq('user_id', clientId)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    coachPlanData._ai_backup = existingPlan?.workout_plan
+      ? (existingPlan.workout_plan.coach_assigned ? (existingPlan.workout_plan._ai_backup || null) : existingPlan.workout_plan)
+      : null;
+    if (existingPlan?.id) {
+      await supabase.from('plans').update({
+        workout_plan: coachPlanData, translations: {},
+        generated_at: new Date().toISOString(),
+      }).eq('id', existingPlan.id);
+    } else {
+      await supabase.from('plans').insert({
+        user_id: clientId, workout_plan: coachPlanData,
+        generated_at: new Date().toISOString(),
+      });
+    }
+    // Deactivate the client's saved workout/custom programmes so they don't shadow the
+    // coach plan on next boot (mirrors the nutrition deactivation in POST /coach/programmes).
+    try {
+      await supabase.from('programmes').update({ is_active: false })
+        .eq('user_id', clientId)
+        .in('programme_type', ['workout', 'custom']);
+    } catch (_) {}
+    await sendPushToUser(clientId, 'Workout plan updated',
+      'Your coach switched you to their workout plan.',
+      '/app.html?panel=workout').catch(() => {});
+    res.json({ ok: true });
+  } catch(err) {
+    console.error('[activate-coach-plan]', err.message);
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Switch the client's live nutrition plan to their AI nutrition (coach_assigned:false).
+app.patch('/api/coach/clients/:clientId/activate-ai-nutrition', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data: planRow } = await supabase.from('plans')
+      .select('id, nutrition_plan').eq('user_id', clientId)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    const np = planRow?.nutrition_plan || null;
+    const aiNutrition = np ? (np.coach_assigned ? (np._ai_backup || null) : np) : null;
+    if (!aiNutrition || !(aiNutrition.calories || aiNutrition.daily_calories || (aiNutrition.meals || []).length)) {
+      return res.status(400).json({ error: 'no_ai_nutrition' });
+    }
+    const newN = { ...aiNutrition, coach_assigned: false };
+    delete newN._ai_backup;
+    if (planRow?.id) {
+      await supabase.from('plans').update({
+        nutrition_plan: newN, translations: {},
+        generated_at: new Date().toISOString(),
+      }).eq('id', planRow.id);
+    }
+    await sendPushToUser(clientId, 'Nutrition plan updated',
+      'Your coach switched you to the AI nutrition plan.',
+      '/app.html?panel=nutrition').catch(() => {});
+    res.json({ ok: true });
+  } catch(err) {
+    console.error('[activate-ai-nutrition]', err.message);
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Switch the client's live nutrition plan to their coach-assigned nutrition (coach_assigned:true).
+app.patch('/api/coach/clients/:clientId/activate-coach-nutrition', requireAuth, requireCoach, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data: prog } = await supabase.from('coach_programmes')
+      .select('*').eq('coach_id', req.user.id).eq('client_id', clientId)
+      .eq('programme_type', 'nutrition').eq('is_template', false)
+      .order('updated_at', { ascending: false }).limit(1).maybeSingle();
+    if (!prog || !prog.nutrition_data) return res.status(404).json({ error: 'no_coach_nutrition' });
+    const coachName = req.coachProfile.coach_title || req.coachProfile.name || 'Your coach';
+    const { data: existingPlanN } = await supabase.from('plans')
+      .select('id, nutrition_plan').eq('user_id', clientId)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    const prevN = existingPlanN?.nutrition_plan || null;
+    const aiBackup = prevN ? (prevN.coach_assigned ? (prevN._ai_backup || null) : prevN) : null;
+    const liveNutrition = {
+      ...prog.nutrition_data,
+      coach_assigned: true,
+      coach_name: coachName,
+      assigned_at: new Date().toISOString(),
+      _ai_backup: aiBackup,
+    };
+    if (existingPlanN?.id) {
+      await supabase.from('plans').update({
+        nutrition_plan: liveNutrition, translations: {},
+        generated_at: new Date().toISOString(),
+      }).eq('id', existingPlanN.id);
+    } else {
+      await supabase.from('plans').insert({
+        user_id: clientId, nutrition_plan: liveNutrition,
+        generated_at: new Date().toISOString(),
+      });
+    }
+    // Deactivate the client's saved nutrition programmes so they don't shadow the
+    // coach plan on next boot. Best-effort: must never block the response or push.
+    try {
+      await supabase
+        .from('programmes')
+        .update({ is_active: false })
+        .eq('user_id', clientId)
+        .eq('programme_type', 'nutrition');
+    } catch (_) { /* best-effort */ }
+    await sendPushToUser(clientId, 'Nutrition plan updated',
+      'Your coach switched you to their nutrition plan.',
+      '/app.html?panel=nutrition').catch(() => {});
+    res.json({ ok: true });
+  } catch(err) {
+    console.error('[activate-coach-nutrition]', err.message);
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ── Client-facing endpoints ───────────────────────────
 app.get('/api/my-coach', requireAuth, async (req, res) => {
   try {
-    // Active coach
-    const { data: link } = await supabase.from('coach_clients')
-      .select('id, coach_id, connected_at, status')
-      .eq('client_id', req.user.id).eq('status', 'active').maybeSingle();
-    // Pending request (most recent)
-    const { data: pending } = await supabase.from('coach_clients')
-      .select('id, coach_id, created_at, status')
-      .eq('client_id', req.user.id).eq('status', 'pending').order('created_at', { ascending: false }).limit(1).maybeSingle();
+    // Active coach + pending request are independent of each other — fetch concurrently.
+    const [{ data: link }, { data: pending }] = await Promise.all([
+      // Active coach
+      supabase.from('coach_clients')
+        .select('id, coach_id, connected_at, status')
+        .eq('client_id', req.user.id).eq('status', 'active').maybeSingle(),
+      // Pending request (most recent)
+      supabase.from('coach_clients')
+        .select('id, coach_id, created_at, status')
+        .eq('client_id', req.user.id).eq('status', 'pending').order('created_at', { ascending: false }).limit(1).maybeSingle(),
+    ]);
+
+    // Each profile lookup depends on its row above, but the two lookups are independent
+    // of each other — run them concurrently too (resolve to null when not needed).
+    const [{ data: linkProfile }, { data: pendingProfile }] = await Promise.all([
+      link?.coach_id
+        ? supabase.from('profiles').select('name, coach_title, coach_bio').eq('id', link.coach_id).maybeSingle()
+        : Promise.resolve({ data: null }),
+      pending?.coach_id
+        ? supabase.from('profiles').select('name, coach_title, coach_bio').eq('id', pending.coach_id).maybeSingle()
+        : Promise.resolve({ data: null }),
+    ]);
 
     let coach = null;
     let pendingCoach = null;
     if (link?.coach_id) {
-      const { data: coachProfile } = await supabase.from('profiles')
-        .select('name, coach_title, coach_bio').eq('id', link.coach_id).maybeSingle();
-      coach = { coach_id: link.coach_id, connected_at: link.connected_at, ...coachProfile };
+      coach = { coach_id: link.coach_id, connected_at: link.connected_at, ...linkProfile };
     }
     if (pending?.coach_id) {
-      const { data: coachProfile } = await supabase.from('profiles')
-        .select('name, coach_title, coach_bio').eq('id', pending.coach_id).maybeSingle();
-      pendingCoach = { connection_id: pending.id, coach_id: pending.coach_id, requested_at: pending.created_at, ...coachProfile };
+      pendingCoach = { connection_id: pending.id, coach_id: pending.coach_id, requested_at: pending.created_at, ...pendingProfile };
     }
     res.json({ coach, pending: pendingCoach });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Lightweight check used by the Account panel every time it opens — returns the most recent
@@ -6356,7 +7785,6 @@ app.get('/api/my-pending-coach-request', requireAuth, async (req, res) => {
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
-    console.log('[my-pending] result for user', req.user.id, ':', JSON.stringify(row));
     if (!row) return res.json({ pending: false });
     const { data: coachProfile } = await supabase.from('profiles')
       .select('name, coach_title, coach_bio').eq('id', row.coach_id).maybeSingle();
@@ -6371,7 +7799,7 @@ app.get('/api/my-pending-coach-request', requireAuth, async (req, res) => {
         requested_at: row.created_at,
       }
     });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/coach-connection/:connectionId/respond', requireAuth, async (req, res) => {
@@ -6412,7 +7840,7 @@ app.post('/api/coach-connection/:connectionId/respond', requireAuth, async (req,
         '/app.html?panel=clients').catch(() => {});
     }
     res.json({ ok: true, action });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.post('/api/coach-connection/disconnect', requireAuth, async (req, res) => {
@@ -6427,7 +7855,7 @@ app.post('/api/coach-connection/disconnect', requireAuth, async (req, res) => {
       'A client has ended your coaching connection.',
       '/app.html?panel=clients').catch(() => {});
     res.json({ ok: true });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Commission ────────────────────────────────────────
@@ -6465,7 +7893,7 @@ app.get('/api/coach/commissions', requireAuth, requireCoach, async (req, res) =>
       pending: sum(pendingRes.data),
       clients: clientList,
     });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ── Seat count ────────────────────────────────────────
@@ -6479,7 +7907,57 @@ app.get('/api/coach/seat-count', requireAuth, requireCoach, async (req, res) => 
       limit: limit === Infinity ? null : limit,
       plan,
     });
-  } catch(err) { console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// ── Cron — daily workout reminders ─────────────────────
+// Call every ~5 min from Railway cron. Sends a push to users whose reminder_time
+// (their LOCAL HH:MM) matches the current time in their reminder_timezone, within a
+// 10-min window. Authenticated with the shared x-cron-secret.
+app.post('/api/cron/reminders', async (req, res) => {
+  try {
+    // Fail-closed: if CRON_SECRET is unset, `undefined !== undefined` is false and the old
+    // check passed — letting an unauthenticated caller trigger mass push. Require the header
+    // to be present AND match (mirrors the sibling check in /api/coach/check-inactive-clients).
+    const cronSecret = req.headers['x-cron-secret'];
+    if (!cronSecret || cronSecret !== process.env.CRON_SECRET) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    const now = new Date();
+    // Active + trial users with a reminder set (is_frozen filtered in JS for correct NULL handling).
+    const { data: users } = await supabase
+      .from('profiles')
+      .select('id, name, reminder_time, reminder_timezone, is_frozen, subscription_status')
+      .not('reminder_time', 'is', null)
+      .in('subscription_status', ['active', 'trial']);
+
+    let sent = 0;
+    for (const user of users || []) {
+      if (user.is_frozen === true) continue;
+      try {
+        // Current wall-clock time in the user's own timezone (reminder_time is LOCAL).
+        const tz = user.reminder_timezone || 'UTC';
+        const nowLocal = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }).format(now);
+        const [nh, nm] = nowLocal.split(':').map(Number);
+        const [rh, rm] = String(user.reminder_time).split(':').map(Number);
+        if (rh === nh && Math.abs(rm - nm) <= 10) {
+          await sendPushToUser(
+            user.id,
+            'Time to train, ' + (user.name || 'champion'),
+            'Your programme is ready. Open FORGE.',
+            '/app.html'
+          ).catch(() => {});
+          sent++;
+        }
+      } catch (e) {
+        console.error('[reminder]', e.message);
+      }
+    }
+    res.json({ sent });
+  } catch (err) {
+    console.error('reminders cron error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // ── Cron — inactive client check ──────────────────────
@@ -6498,7 +7976,7 @@ app.post('/api/coach/check-inactive-clients', async (req, res) => {
     let notified = 0;
     for (const link of (links || [])) {
       if (!link.client_id) continue;
-      const { data: lastLog } = await supabase.from('workout_logs')
+      const { data: lastLog } = await supabase.from('session_logs')
         .select('created_at').eq('user_id', link.client_id)
         .order('created_at', { ascending: false }).limit(1).maybeSingle();
       if (!lastLog?.created_at) continue;
@@ -6515,6 +7993,6 @@ app.post('/api/coach/check-inactive-clients', async (req, res) => {
     res.json({ ok: true, notified });
   } catch(err) {
     console.error('check-inactive-clients error:', err.message);
-    console.error('Server error:', err); res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
