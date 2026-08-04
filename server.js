@@ -7462,9 +7462,18 @@ app.get('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => 
 
 app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => {
   try {
-    let { client_id, name, programme_data, nutrition_data, programme_type, is_template } = req.body;
+    let { client_id, name, programme_data, nutrition_data, programme_type, is_template, source_programme_id } = req.body;
     if (!name) return res.status(400).json({ error: 'Missing name' });
     const ptype = programme_type || 'workout';
+
+    // Optional provenance: the library row this assigned copy was made from. Assigning
+    // COPIES, so without this the library cannot tell which of its rows is live for a
+    // client. Anything that is not a UUID is ignored rather than rejected — the column is
+    // additive and a null value must behave exactly as before.
+    const SRC_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const sourceProgrammeId = (typeof source_programme_id === 'string' && SRC_UUID_RE.test(source_programme_id))
+      ? source_programme_id
+      : null;
 
     // SECURITY (IDOR fix): a template must never be bound to a client. Forcing client_id to
     // null when is_template is true closes the bypass where is_template:true skipped the
@@ -7487,6 +7496,9 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
       nutrition_data: nutrition_data || null,
       assigned_at: (client_id && !is_template) ? new Date().toISOString() : null,
       updated_at: new Date().toISOString(),
+      // Only sent when present, so an un-migrated database still accepts every existing
+      // write instead of failing on an unknown column.
+      ...(sourceProgrammeId ? { source_programme_id: sourceProgrammeId } : {}),
     };
     const { data, error } = await supabase.from('coach_programmes').insert(row).select().maybeSingle();
     if (error) throw error;
