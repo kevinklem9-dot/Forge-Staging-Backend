@@ -7347,13 +7347,16 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
             }],
             sets: 1,
             reps_range: e.reps || null,
-            target_sets: 1
+            target_sets: 1,
+            rest: e.rest || null,
+            note: e.note || null
           } : {
             name: e.name,
             sets: e.sets,
             reps: e.reps,
-            rest: e.rpe || e.weight || null,
-            note: `${e.rpe ? 'RPE ' + e.rpe : ''}${e.weight ? e.weight : ''}`.trim() || null,
+            rest: e.rest || null,
+            rpe: e.rpe || null,
+            note: e.note || null,
           }))
         })),
         coach_assigned: true,
@@ -7493,10 +7496,16 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
               }],
               sets: 1,
               reps_range: e.reps || null,
-              target_sets: 1
+              target_sets: 1,
+              rest: e.rest || null,
+              note: e.note || null
             } : {
-              name: e.name, sets: e.sets, reps: e.reps,
-              rest: e.rpe || e.weight || null,
+              name: e.name,
+              sets: e.sets,
+              reps: e.reps,
+              rest: e.rest || null,
+              rpe: e.rpe || null,
+              note: e.note || null,
             }))
           })),
           coach_assigned: true,
@@ -7716,11 +7725,16 @@ app.patch('/api/coach/clients/:clientId/activate-coach-plan', requireAuth, requi
           }],
           sets: 1,
           reps_range: e.reps || null,
-          target_sets: 1
+          target_sets: 1,
+          rest: e.rest || null,
+          note: e.note || null
         } : {
-          name: e.name, sets: e.sets, reps: e.reps,
-          rest: e.rpe || e.weight || null,
-          note: `${e.rpe ? 'RPE ' + e.rpe : ''}${e.weight ? e.weight : ''}`.trim() || null,
+          name: e.name,
+          sets: e.sets,
+          reps: e.reps,
+          rest: e.rest || null,
+          rpe: e.rpe || null,
+          note: e.note || null,
         }))
       })),
       coach_assigned: true,
