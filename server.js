@@ -719,11 +719,17 @@ function getTierFromPriceId(priceId) {
 const corsOptions = {
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
+    // Origin allow-list — environment-driven so this file stays byte-identical
+    // across production and staging. FRONTEND_URL covers the primary domain of
+    // whichever service is running; ALLOWED_ORIGINS (comma-separated) adds any
+    // extras, e.g. the apex domain on production. The GitHub Pages origin is
+    // allowed unconditionally — both Pages deploys share it.
+    const extraOrigins = (process.env.ALLOWED_ORIGINS || '')
+      .split(',').map(s => s.trim()).filter(Boolean);
     const allowed = [
       process.env.FRONTEND_URL,
       'https://kevinklem9-dot.github.io',
-      'https://www.klemforge.com',
-      'https://klemforge.com',
+      ...extraOrigins,
       // Dev origins only outside production — never trust localhost in prod.
       ...(process.env.NODE_ENV !== 'production' ? ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:8080'] : []),
     ].filter(Boolean);
@@ -734,8 +740,6 @@ const corsOptions = {
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization']
 };
-const compression = require('compression');
-app.use(compression()); // gzip all responses — first so every downstream response is compressed
 app.use(helmet({ contentSecurityPolicy: false })); // Security headers
 // Explicit hardening on top of helmet — DENY framing outright (helmet defaults to
 // SAMEORIGIN) and lock down powerful browser features the app never uses.
@@ -761,19 +765,42 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // ── IDEMPOTENCY ───────────────────────────────────────
-  // Ignore an event already processed by this instance so a Stripe retry can't
-  // double-apply (e.g. double credits). Keyed on the verified event.id.
+  // ── IDEMPOTENCY (F6 — Claude 5 audit, MEDIUM) ─────────
+  // Durable dedup. A Stripe retry can arrive up to ~3 days later and, after a Railway
+  // redeploy, land on a process whose in-memory Set was wiped — re-running non-idempotent
+  // side effects (referral credit, founding/launch counters). The processedWebhookEvents
+  // Set stays as a fast in-process cache (avoids a DB read for a repeat within one process);
+  // stripe_webhook_events is the durable source of truth that survives restarts and is
+  // shared across instances. Keyed on the verified event.id.
   if (processedWebhookEvents.has(event.id)) {
-    console.log('[webhook] duplicate event ignored:', event.id);
+    console.log('[webhook] duplicate ignored (cache):', event.id);
     return res.json({ received: true });
   }
+  const { data: existing } = await supabase
+    .from('stripe_webhook_events')
+    .select('id')
+    .eq('event_id', event.id)
+    .maybeSingle();
+  if (existing) {
+    console.log('[webhook] duplicate ignored:', event.id);
+    processedWebhookEvents.add(event.id); // warm the in-process cache
+    return res.json({ received: true });
+  }
+  // New event — record it BEFORE running the handlers so a near-simultaneous retry is more
+  // likely to be caught. Fast cache first, then the durable row.
   processedWebhookEvents.add(event.id);
   // Prune oldest entries to prevent unbounded growth (add first, then prune).
   if (processedWebhookEvents.size > 10000) {
     const first = processedWebhookEvents.values().next().value;
     processedWebhookEvents.delete(first);
   }
+  // Durable marker. The insert must NOT block webhook processing — a DB hiccup here should
+  // never turn into a 500 that makes Stripe retry a fully-processed event, so errors are
+  // caught and logged, not thrown.
+  await supabase
+    .from('stripe_webhook_events')
+    .insert({ event_id: event.id })
+    .catch(e => console.error('[webhook] idempotency insert failed:', event.id, e));
 
   try {
     switch (event.type) {
@@ -1143,7 +1170,6 @@ app.use('/api/programmes/generate', programmesGenLimiter);
 app.use('/api/translate-plan', aiLimiter);
 app.use('/api/review/generate', aiLimiter);
 app.use('/api/monthly-review/generate', aiLimiter);
-app.use('/api/coach/generate-shopping-list', aiLimiter);
 
 // ── REQUEST TIMEOUT ────────────────────────────
 // Fail a stuck request at 30s instead of holding the socket open to the 180s
@@ -1196,7 +1222,7 @@ async function requireAuth(req, res, next) {
     // Check frozen status on every authenticated request
     const { data: profile } = await supabase
       .from('profiles')
-      .select('is_frozen, subscription_tier, subscription_status, trial_ends_at, is_exempt')
+      .select('is_frozen, subscription_tier, subscription_status, trial_ends_at, is_exempt, coach_plan_status, coach_trial_start, is_coach_exempt, account_type')
       .eq('id', user.id)
       .maybeSingle();
 
@@ -1271,13 +1297,44 @@ function hasAccess(feature, tier, isExempt) {
   return allowed.includes(tier || 'iron');
 }
 
+// ── COACH PLAN ACTIVE ─────────────────────────
+// Single source of truth for "is this user's coach plan currently active",
+// including the 7-day coach-trial window. Mirrors requireCoach's logic exactly
+// (see the exempt bypass and window check below) so the two cannot drift.
+// Callers: requireCoach (window check) and loadSubscription (access elevation).
+// NOTE: every branch below requires account_type === 'coach'. Two admin endpoints can
+// set coach fields on ANY userId with no account_type requirement —
+// PATCH /api/admin/users/:userId/coach-exempt (is_coach_exempt) and
+// PATCH /api/admin/users/:userId/coach-plan (coach_plan_status + coach_trial_start) —
+// so without the guard below a non-coach carrying stray coach fields would resolve to
+// full individual access. requireCoach is unaffected: it already rejects non-coaches
+// before reaching any of this.
+function isCoachPlanActive(profile) {
+  // Null guard stays first — loadSubscription can pass null (maybeSingle), and a throw
+  // here is swallowed by its catch, which sets status:'active' and would SUPPRESS the
+  // paywall. account_type is the first actual check, immediately below.
+  if (!profile) return false;
+  // Coach fields only mean anything on an actual coach account
+  if (profile.account_type !== 'coach') return false;
+  // Exempt coaches are always active (account_type re-checked here, redundant but explicit)
+  if (profile.is_coach_exempt && profile.account_type === 'coach') return true;
+  const status = profile.coach_plan_status;
+  if (status === 'active') return true;
+  if (status === 'trial' && profile.coach_trial_start) {
+    const trialEnd = new Date(profile.coach_trial_start);
+    trialEnd.setDate(trialEnd.getDate() + 7);
+    return new Date() <= trialEnd;
+  }
+  return false;
+}
+
 // Load subscription info onto req.subscription
 async function loadSubscription(req, res, next) {
   try {
     // Use cached profile from requireAuth if available, otherwise fetch
     const profile = req.profileCache || (await supabase
       .from('profiles')
-      .select('subscription_tier, subscription_status, trial_ends_at, is_exempt, is_frozen')
+      .select('subscription_tier, subscription_status, trial_ends_at, is_exempt, is_frozen, coach_plan_status, coach_trial_start, is_coach_exempt, account_type')
       .eq('id', req.user.id)
       .maybeSingle()).data;
 
@@ -1317,6 +1374,15 @@ async function loadSubscription(req, res, next) {
     const PAID_STATUSES = ['active', 'past_due', 'lifetime'];
     if (!isExempt && effectiveStatus !== 'trial' && !PAID_STATUSES.includes(effectiveStatus)) {
       effectiveTier = 'iron';
+    }
+
+    // An active coach plan grants full individual access. Runs AFTER the entitlement
+    // guard (so it is a deliberate grant, not a stored-tier leak) and BEFORE accessTier
+    // is computed, so both effectiveTier and accessTier derive from 'forge'. Resolution
+    // only — nothing is written to the DB, so subscription_status stays truthful.
+    if (isCoachPlanActive(profile)) {
+      effectiveStatus = 'active';
+      effectiveTier = 'forge';
     }
 
     // During trial, full access to everything — best sales tool
@@ -1561,6 +1627,33 @@ app.post('/api/reset-password', resetLimiter, async (req, res) => {
 
 // ── GENERATE PLAN ──────────────────────────────
 app.post('/api/generate-plan', requireAuth, async (req, res) => {
+  // ── PER-ACCOUNT COOLDOWN (F2 — Claude 5 audit, MEDIUM) ────────────────────
+  // /api/generate-plan is the app's most expensive AI call. Block a regenerate within
+  // 60 min of the user's last plan generation. Runs BEFORE the streaming headers are
+  // committed (res.writeHead(200) below) so a real 429 can still be sent. Exempt (comped)
+  // accounts bypass; first-time users (no plan row) pass through.
+  // NOTE: `plans` has no `updated_at` column — `generated_at` is the freshness column
+  // (set on generation and on every plan edit), so it is the correct cooldown signal.
+  if (!req.profileCache?.is_exempt) {
+    const { data: recentPlan } = await supabase
+      .from('plans')
+      .select('generated_at')
+      .eq('user_id', req.user.id)
+      .order('generated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (recentPlan?.generated_at) {
+      const minutesSince = (Date.now() - new Date(recentPlan.generated_at).getTime()) / 60000;
+      if (minutesSince < 60) {
+        return res.status(429).json({
+          error: 'plan_recently_generated',
+          message: 'Please wait before generating a new plan',
+          retry_after: Math.ceil(60 - minutesSince)
+        });
+      }
+    }
+  }
+
   // Keep connection alive during long generation — Railway times out at 60s
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Transfer-Encoding', 'chunked');
@@ -2249,7 +2342,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         response = await anthropic.messages.create({
-          model: 'claude-sonnet-4-6',
+          model: 'claude-sonnet-5',
           max_tokens: 12000,
           system: systemPrompt,
           messages: sanitised
@@ -2265,7 +2358,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
       }
     }
 
-    const rawReply = response.content[0].text;
+    const rawReply = response.content.find(b => b.type === 'text')?.text || '';
     const cleanedRaw = rawReply.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '').trim();
 
     // Extract ALL plan update tags (there could be multiple)
@@ -2561,8 +2654,9 @@ app.post('/api/checkin', requireAuth, loadSubscription, async (req, res) => {
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         response = await anthropic.messages.create({
-          model: 'claude-sonnet-4-6',
+          model: 'claude-sonnet-5',
           max_tokens: 1500,
+          thinking: { type: 'disabled' },
           system: systemPrompt,
           messages: messages || [{ role: 'user', content: `I just finished training. Feeling: ${feeling}. Difficulty: ${difficulty}.` }]
         });
@@ -2574,7 +2668,7 @@ app.post('/api/checkin', requireAuth, loadSubscription, async (req, res) => {
       }
     }
 
-    const rawReply = response.content[0].text;
+    const rawReply = response.content.find(b => b.type === 'text')?.text || '';
     const planUpdateMatch = rawReply.match(/<PLAN_UPDATE>([\s\S]*?)<\/PLAN_UPDATE>/);
     let planUpdate = null;
     let cleanReply = rawReply.replace(/<PLAN_UPDATE>[\s\S]*?<\/PLAN_UPDATE>/g, '').trim();
@@ -2965,22 +3059,50 @@ app.get('/api/stats', requireAuth, async (req, res) => {
     // Get unique workout dates sorted descending
     const uniqueDates = [...new Set(sessions.map(s => s.logged_at))].sort().reverse();
 
-    // Compute current streak
+    // Compute current streak -- REST-DAY AWARE.
+    // Walk calendar days back from the anchor (today or yesterday). A logged day
+    // extends the streak; a scheduled REST day with no session is SKIPPED (it does
+    // not break the streak); only a missed SCHEDULED TRAINING day ends it. When the
+    // user has no plan, scheduledDayIndexes is empty and every day counts as a
+    // training day -- the safe default that reproduces the old consecutive-calendar-day
+    // behaviour exactly. Date keys stay YYYY-MM-DD strings and weekday math is UTC, to
+    // stay off-by-one-safe near midnight (see decisions.md -- logged_at is a DATE
+    // column, never millisecond math).
+    const { data: planData } = await supabase
+      .from('plans')
+      .select('workout_plan')
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const scheduledDayIndexes = (planData?.workout_plan?.days || [])
+      .map(d => d.day_index)
+      .filter(i => typeof i === 'number'); // plan weekday convention: Mon=0 .. Sun=6
+    const isTrainingWeekday = (dateStr) => {
+      if (!scheduledDayIndexes.length) return true; // no plan -> treat every day as training
+      const wd = new Date(dateStr + 'T00:00:00Z').getUTCDay(); // 0=Sun .. 6=Sat
+      return scheduledDayIndexes.includes(wd === 0 ? 6 : wd - 1);
+    };
+
     const today = new Date().toISOString().split('T')[0];
     const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+    const loggedSet = new Set(uniqueDates);
     let streak = 0;
-    let checkDate = uniqueDates[0] === today || uniqueDates[0] === yesterday ? uniqueDates[0] : null;
 
-    if (checkDate) {
-      for (const date of uniqueDates) {
-        if (date === checkDate) {
-          streak++;
-          const prev = new Date(checkDate);
-          prev.setDate(prev.getDate() - 1);
-          checkDate = prev.toISOString().split('T')[0];
-        } else {
-          break;
-        }
+    // Anchor rule unchanged: only start counting if the most recent session is today
+    // or yesterday (so the streak doesn't break before today has been logged).
+    if (uniqueDates[0] === today || uniqueDates[0] === yesterday) {
+      const oldest = uniqueDates[uniqueDates.length - 1]; // never walk past the first-ever log
+      let cur = new Date(uniqueDates[0] + 'T00:00:00Z');
+      while (true) {
+        const curStr = cur.toISOString().split('T')[0];
+        if (loggedSet.has(curStr)) {
+          streak++;                     // session logged this day -> extends the streak
+        } else if (isTrainingWeekday(curStr)) {
+          break;                        // scheduled training day, nothing logged -> streak ends
+        }                               // else: rest day with no session -> skip, keep walking back
+        if (curStr <= oldest) break;    // reached the first logged day -- done
+        cur.setUTCDate(cur.getUTCDate() - 1);
       }
     }
 
@@ -5532,16 +5654,23 @@ server.timeout = 180000;
 server.keepAliveTimeout = 180000;
 server.headersTimeout = 185000;
 
-// Keep Railway dyno warm — ping every 10 minutes
+// Keep Railway dyno warm — ping every 10 minutes.
+// Priority: Railway's injected domain → PUBLIC_BACKEND_URL → disabled.
+// Never fall back to a hardcoded environment URL: a production default here
+// made the staging service ping the production backend every 10 minutes.
 const BACKEND_URL = process.env.RAILWAY_PUBLIC_DOMAIN
   ? 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN
-  : 'https://forge-production-db97.up.railway.app';
+  : (process.env.PUBLIC_BACKEND_URL || null);
 
-setInterval(() => {
-  fetch(BACKEND_URL + '/health')
-    .then(() => console.log('[keep-alive] ping ok'))
-    .catch(e => console.log('[keep-alive] ping failed:', e.message));
-}, 10 * 60 * 1000);
+if (!BACKEND_URL) {
+  console.warn('⚠️  [keep-alive] disabled — neither RAILWAY_PUBLIC_DOMAIN nor PUBLIC_BACKEND_URL is set.');
+} else {
+  setInterval(() => {
+    fetch(BACKEND_URL + '/health')
+      .then(() => console.log('[keep-alive] ping ok'))
+      .catch(e => console.log('[keep-alive] ping failed:', e.message));
+  }, 10 * 60 * 1000);
+}
 
 // ── DEBUG — View raw plan (admin only) ────────
 app.get('/api/debug/plan', requireAuth, requireAdmin, async (req, res) => {
@@ -6027,16 +6156,15 @@ async function requireCoach(req, res, next) {
       }
       return res.status(403).json({ error: 'not_coach', message: 'Coach account required.' });
     }
-    // Active trial — check the 7-day window
-    if (profile.coach_plan_status === 'trial' && profile.coach_trial_start) {
-      const trialEnd = new Date(profile.coach_trial_start);
-      trialEnd.setDate(trialEnd.getDate() + 7);
-      if (new Date() > trialEnd) {
-        await supabase.from('profiles')
-          .update({ coach_plan_status: 'expired' })
-          .eq('id', req.user.id);
-        return res.status(403).json({ error: 'coach_trial_expired', message: 'Your coach trial has ended.' });
-      }
+    // Active trial — check the 7-day window via the shared helper. Equivalent to the
+    // previous inline math: is_coach_exempt already returned above, and the status is
+    // guarded to 'trial' here, so isCoachPlanActive() reduces to (now <= trialEnd).
+    if (profile.coach_plan_status === 'trial' && profile.coach_trial_start
+        && !isCoachPlanActive(profile)) {
+      await supabase.from('profiles')
+        .update({ coach_plan_status: 'expired' })
+        .eq('id', req.user.id);
+      return res.status(403).json({ error: 'coach_trial_expired', message: 'Your coach trial has ended.' });
     }
     req.coachProfile = profile;
     next();
@@ -6127,8 +6255,9 @@ Be direct and factual. Use the client's actual name.
 Client data: ${JSON.stringify(clientData)}`;
 
   const msg = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     max_tokens: 1200,
+    thinking: { type: 'disabled' },
     messages: [{ role: 'user', content: prompt }],
   });
   const summary = (msg.content?.[0]?.text || '').trim();
@@ -6579,14 +6708,33 @@ app.get('/api/coach/clients/:clientId/overview', requireAuth, requireCoach, asyn
       const { data: allLogs } = await supabase.from('session_logs')
         .select('logged_at').eq('user_id', clientId).order('logged_at', { ascending: false }).limit(120);
       const dateSet = new Set((allLogs || []).map(l => (l.logged_at + '').split('T')[0]));
+      // REST-DAY AWARE (mirrors /api/stats): skip the client's scheduled rest days;
+      // only a missed SCHEDULED TRAINING day ends the streak. No plan -> every day counts
+      // (safe default = old consecutive-day behaviour). UTC weekday math, string date keys.
+      const { data: streakPlan } = await supabase.from('plans')
+        .select('workout_plan').eq('user_id', clientId).order('created_at', { ascending: false }).limit(1).maybeSingle();
+      const scheduledDayIndexes = (streakPlan?.workout_plan?.days || [])
+        .map(d => d.day_index).filter(i => typeof i === 'number');
+      const isTrainingWeekday = (dateStr) => {
+        if (!scheduledDayIndexes.length) return true;
+        const wd = new Date(dateStr + 'T00:00:00Z').getUTCDay();
+        return scheduledDayIndexes.includes(wd === 0 ? 6 : wd - 1);
+      };
+      const oldest = [...dateSet].sort()[0]; // first-ever logged day (lower bound)
       let streak = 0;
       const cursor = new Date();
       // allow today OR yesterday as the starting anchor so a streak doesn't break before today is logged
       const todayStr = cursor.toISOString().split('T')[0];
-      if (!dateSet.has(todayStr)) cursor.setDate(cursor.getDate() - 1);
-      while (dateSet.has(cursor.toISOString().split('T')[0])) {
-        streak++;
-        cursor.setDate(cursor.getDate() - 1);
+      if (!dateSet.has(todayStr)) cursor.setUTCDate(cursor.getUTCDate() - 1);
+      while (oldest) {
+        const curStr = cursor.toISOString().split('T')[0];
+        if (dateSet.has(curStr)) {
+          streak++;
+        } else if (isTrainingWeekday(curStr)) {
+          break;
+        }
+        if (curStr <= oldest) break;
+        cursor.setUTCDate(cursor.getUTCDate() - 1);
       }
       currentStreak = streak;
     }
@@ -6791,7 +6939,8 @@ app.get('/api/my-coach-feedback', requireAuth, async (req, res) => {
     let sessionLabelById = {};
     if (sessionIds.length) {
       const { data: sessions } = await supabase.from('session_logs')
-        .select('id, day_label, logged_at').in('id', sessionIds);
+        .select('id, day_label, logged_at').in('id', sessionIds)
+        .eq('user_id', req.user.id); // F11: scope to the requesting client's own sessions
       for (const s of (sessions || [])) sessionLabelById[s.id] = { day_label: s.day_label, logged_at: s.logged_at };
     }
     res.json({
@@ -7256,8 +7405,11 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
       const prevN = existingPlanN?.nutrition_plan || null;
       // Preserve the original AI nutrition so "Reset to AI plan" can restore it.
       const aiBackup = prevN ? (prevN.coach_assigned ? (prevN._ai_backup || null) : prevN) : null;
+      // Coach shopping lists are removed — strip any legacy shopping_list field so an
+      // old stored blob can never re-apply to a client's live plan.
+      const { shopping_list: _dropSL, ...restNutrition } = nutrition_data;
       const liveNutrition = {
-        ...nutrition_data,
+        ...restNutrition,
         coach_assigned: true,
         coach_name: coachName,
         assigned_at: new Date().toISOString(),
@@ -7292,45 +7444,6 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
 
     res.json({ ok: true, programme: data });
   } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
-});
-
-// FIX 7: generate a weekly shopping list from a coach-built nutrition plan's meals.
-// Called from the coach nutrition builder when the "Include shopping list" toggle is on.
-// Returns plain-text grouped list which is stored on nutrition_data.shopping_list and
-// surfaced in the client's Food panel.
-app.post('/api/coach/generate-shopping-list', requireAuth, requireCoach, async (req, res) => {
-  try {
-    const { meals, client_name } = req.body || {};
-    if (!Array.isArray(meals) || !meals.length) {
-      return res.status(400).json({ error: 'no_meals', message: 'No meals to build a shopping list from.' });
-    }
-    const mealsForPrompt = meals.map(m => ({
-      name: m.name || '',
-      foods: (Array.isArray(m.foods) && m.foods.length)
-        ? m.foods
-        : (m.notes || m.note || ''),
-      kcal: m.kcal != null ? m.kcal : m.calories,
-      protein_g: m.protein_g, carbs_g: m.carbs_g, fat_g: m.fat_g,
-    }));
-    const prompt = `Based on these meals for a client's weekly nutrition plan, generate a practical weekly shopping list grouped by category (Proteins, Vegetables, Fruits, Grains/Carbs, Dairy, Fats/Oils, Other). Assume a full 7-day week and be specific with quantities where possible. Return ONLY the shopping list as plain text: each category as an UPPERCASE heading on its own line, followed by "- item (quantity)" bullet lines. No preamble, no closing remarks.\n\nMeals:\n${mealsForPrompt.map(m => {
-    const detail = Array.isArray(m.foods) && m.foods.length
-      ? 'Foods: ' + m.foods.map(f => f.name || f).join(', ')
-      : (m.foods ? 'Description: ' + m.foods : 'No specific foods listed');
-    return m.name + ' (' + m.kcal + ' kcal, ' + m.protein_g + 'g protein, ' +
-      m.carbs_g + 'g carbs, ' + m.fat_g + 'g fat) — ' + detail;
-  }).join('\n')}`;
-    const message = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1500,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    const shopping_list = (message.content?.[0]?.text || '').trim();
-    if (!shopping_list) return res.status(500).json({ error: 'generation_failed' });
-    res.json({ shopping_list });
-  } catch (err) {
-    console.error('generate-shopping-list error:', err.message);
-    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
-  }
 });
 
 app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async (req, res) => {
@@ -7699,8 +7812,11 @@ app.patch('/api/coach/clients/:clientId/activate-coach-nutrition', requireAuth, 
       .order('generated_at', { ascending: false }).limit(1).maybeSingle();
     const prevN = existingPlanN?.nutrition_plan || null;
     const aiBackup = prevN ? (prevN.coach_assigned ? (prevN._ai_backup || null) : prevN) : null;
+    // Coach shopping lists are removed — strip any legacy shopping_list field so an
+    // old stored blob can never re-apply to a client's live plan.
+    const { shopping_list: _dropSL, ...restNutrition } = prog.nutrition_data;
     const liveNutrition = {
-      ...prog.nutrition_data,
+      ...restNutrition,
       coach_assigned: true,
       coach_name: coachName,
       assigned_at: new Date().toISOString(),
@@ -7973,14 +8089,35 @@ app.post('/api/coach/check-inactive-clients', async (req, res) => {
 
     const { data: links } = await supabase.from('coach_clients')
       .select('coach_id, client_id').eq('status', 'active');
+
+    // F9 (Claude 5 audit): replace the per-client N+1 session_logs lookup with ONE batched
+    // query. The notify rule is unchanged — a coach is pinged when a client's MOST RECENT
+    // session was between 5 and 6 days ago — so we still need each client's latest session
+    // timestamp, not just a boolean active/inactive flag. Fetch every active client's
+    // sessions from the last 6 days (newest-first) and keep the first (= most recent) per
+    // client. A client whose true last session is older than 6 days has no row here and is
+    // correctly skipped (the old per-client code skipped them too, since ts >= sixDaysAgo
+    // would be false).
+    const clientIds = (links || []).map(l => l.client_id).filter(Boolean);
+    const sixDaysAgoIso = new Date(fiveDaysAgo.getTime() - 24 * 60 * 60 * 1000).toISOString();
+    const lastSessionByClient = {};
+    if (clientIds.length) {
+      const { data: recentSessions } = await supabase.from('session_logs')
+        .select('user_id, created_at')
+        .in('user_id', clientIds)
+        .gte('created_at', sixDaysAgoIso)
+        .order('created_at', { ascending: false });
+      for (const s of (recentSessions || [])) {
+        if (!lastSessionByClient[s.user_id]) lastSessionByClient[s.user_id] = s.created_at;
+      }
+    }
+
     let notified = 0;
     for (const link of (links || [])) {
       if (!link.client_id) continue;
-      const { data: lastLog } = await supabase.from('session_logs')
-        .select('created_at').eq('user_id', link.client_id)
-        .order('created_at', { ascending: false }).limit(1).maybeSingle();
-      if (!lastLog?.created_at) continue;
-      const ts = new Date(lastLog.created_at).getTime();
+      const lastCreatedAt = lastSessionByClient[link.client_id];
+      if (!lastCreatedAt) continue;
+      const ts = new Date(lastCreatedAt).getTime();
       if (ts < fiveDaysAgo.getTime() && ts >= fiveDaysAgo.getTime() - 24 * 60 * 60 * 1000) {
         // Last session was between 5 and 6 days ago — single notification
         const { data: clientProfile } = await supabase.from('profiles').select('name').eq('id', link.client_id).maybeSingle();
