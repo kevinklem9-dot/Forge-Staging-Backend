@@ -7347,6 +7347,7 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
             }],
             sets: 1,
             reps_range: e.reps || null,
+            reps: e.reps || null,
             target_sets: 1,
             rest: e.rest || null,
             note: e.note || null
@@ -7496,6 +7497,7 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
               }],
               sets: 1,
               reps_range: e.reps || null,
+              reps: e.reps || null,
               target_sets: 1,
               rest: e.rest || null,
               note: e.note || null
@@ -7725,6 +7727,7 @@ app.patch('/api/coach/clients/:clientId/activate-coach-plan', requireAuth, requi
           }],
           sets: 1,
           reps_range: e.reps || null,
+          reps: e.reps || null,
           target_sets: 1,
           rest: e.rest || null,
           note: e.note || null
