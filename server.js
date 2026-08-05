@@ -1174,6 +1174,17 @@ const coachProgrammeGenLimiter = rateLimit({
   keyGenerator: (req) => req.user?.id || 'anonymous',
   message: { error: 'Too many programme generations. Please wait before trying again.' }
 });
+
+// Coach-scoped AI nutrition generation. Same shape and budget as the programme limiter above
+// and deliberately a SEPARATE bucket: a coach who has spent their programme generations
+// should still be able to build a meal plan, and vice versa.
+const coachNutritionGenLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  skip: skipNonProd,
+  keyGenerator: (req) => req.user?.id || 'anonymous',
+  message: { error: 'Too many nutrition generations. Please wait before trying again.' }
+});
 app.use('/api/', limiter);
 app.use('/api/chat', chatLimiter);
 app.use('/api/generate-plan', planLimiter);
@@ -1198,6 +1209,8 @@ const TIMEOUT_EXEMPT = [
   // every other coach-client route from the 30s timeout. String entries above are matched
   // by prefix exactly as before; only RegExp entries take the test() branch.
   /^\/api\/coach\/clients\/[^/]+\/generate-programme$/,
+  // Coach-scoped AI nutrition generation — same reasoning, same mid-path clientId.
+  /^\/api\/coach\/clients\/[^/]+\/generate-nutrition$/,
 ];
 app.use((req, res, next) => {
   if (!TIMEOUT_EXEMPT.some(p => (typeof p === 'string' ? req.path.startsWith(p) : p.test(req.path)))) {
@@ -6455,6 +6468,152 @@ app.post('/api/coach/clients/:clientId/generate-programme', requireAuth, require
     });
   } catch (err) {
     console.error('[coach/generate-programme]', err.message);
+    sendResponse(500, { error: 'generation_failed', detail: err.message });
+  }
+});
+
+// ── Coach-scoped AI nutrition generation ──────────────────────────────────────
+// The nutrition twin of generate-programme above, structured identically on purpose so the
+// two features behave the same. A coach describes a meal plan in plain language; the AI
+// generates it from the CLIENT's profile (never the coach's) and the nutrition object is
+// returned for review in the nutrition builder. This endpoint writes NOTHING — no
+// coach_programmes row, no plans update, no push. The coach reviews, edits, and saves
+// through the builder, which owns all persistence.
+//
+// Same reasoning as the workout endpoint for not reusing POST /api/programmes/generate:
+// that route is requireAuth-only, tier-gates on the CALLER's individual subscription, and
+// inserts into the caller's own `programmes` table. Here an active coach plan — enforced by
+// requireCoach — is the entitlement, so the coach's personal tier is never consulted.
+app.post('/api/coach/clients/:clientId/generate-nutrition', requireAuth, requireCoach, coachNutritionGenLimiter, async (req, res) => {
+  const { clientId } = req.params;
+
+  // ── GUARDS (pre-header) ─────────────────────────────────────────────────────
+  // Run BEFORE res.writeHead(200) commits the streaming headers, so a real 400/403/404 can
+  // still be sent. After writeHead, sendResponse can only emit a 200 with an error body.
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!UUID_RE.test(clientId)) {
+    return res.status(400).json({ error: 'Invalid client ID' });
+  }
+
+  let clientProfile = null;
+  try {
+    if (!await verifyClientConnection(req.user.id, clientId)) {
+      return res.status(403).json({ error: 'no_connection' });
+    }
+    const { data, error } = await supabase
+      .from('profiles')
+      .select(PLAN_PROFILE_FIELDS)
+      .eq('id', clientId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'client_profile_not_found' });
+    clientProfile = data;
+  } catch (err) {
+    console.error('[coach/generate-nutrition] pre-check:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+    return;
+  }
+
+  // ── TRANSPORT ───────────────────────────────────────────────────────────────
+  // Same chunked-heartbeat transport as the workout endpoint. The heartbeat writes a real
+  // '\n' byte: res.write('') sends zero bytes under chunked encoding and never actually
+  // keeps the socket alive. This path is in TIMEOUT_EXEMPT, without which the 30s request
+  // timeout would kill it mid-generation.
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.writeHead(200);
+
+  const heartbeat = setInterval(() => {
+    try { res.write('\n'); } catch(e) { clearInterval(heartbeat); }
+  }, 20000);
+
+  const sendResponse = (status, data) => {
+    clearInterval(heartbeat);
+    res.end(JSON.stringify(data));
+  };
+
+  try {
+    const b = req.body || {};
+    const language = b.language || 'en';
+
+    // Physical stats, dietary data and injuries always come from the client's own profile.
+    // Only goal and experience are overridable, matching the workout endpoint's rule that a
+    // coach may steer intent but never restate the client's body or restrictions.
+    const profile = {
+      name: clientProfile.name || 'Client',
+      age: clientProfile.age, sex: clientProfile.sex,
+      height_cm: clientProfile.height_cm, weight_kg: clientProfile.weight_kg,
+      goal: b.goal || clientProfile.goal || 'muscle',
+      experience: b.experience || clientProfile.experience || 'intermediate',
+      days_per_week: clientProfile.days_per_week || 4,
+      preferred_days: clientProfile.preferred_days || 'flexible',
+      equipment: clientProfile.equipment || 'full_gym',
+      diet_style: clientProfile.diet_style || 'anything',
+      diet_restrictions: clientProfile.diet_restrictions || 'none',
+      injuries: clientProfile.injuries || 'none',
+      session_duration_varies: clientProfile.session_duration_varies,
+      session_duration_mins: clientProfile.session_duration_mins,
+      session_duration_by_day: clientProfile.session_duration_by_day,
+    };
+
+    // Capped at 500 chars to match the injuries cap in PATCH /api/profile. Appended to
+    // buildPlanPrompt's OUTPUT — buildPlanPrompt is shared with /api/generate-plan and
+    // /api/programmes/generate and is not modified here.
+    const brief = b.brief ? String(b.brief).slice(0, 500).trim() : '';
+
+    // mwExercises is passed as null deliberately. buildPlanPrompt guards the exercise
+    // database block on that argument, so passing null drops several thousand tokens of
+    // exercise names this request has no use for. The workout half of the returned JSON is
+    // simply ignored — only plan.nutrition is read. The prompt already demands a full
+    // 7-day weekly_meals object with per-meal foods, which is exactly what the day-aware
+    // builder consumes, so no nutrition-specific prompt is needed.
+    let prompt = buildPlanPrompt(profile, language, null);
+    if (brief) {
+      prompt += `\n\nCOACH BRIEF (nutrition instructions from the coach — follow these over the defaults above; they may cover calorie targets, dietary preferences, meal count, foods to include or avoid, and timing):\n${brief}`;
+    }
+
+    let plan = null, lastError = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const message = await anthropic.messages.create({
+          model: 'claude-haiku-4-5-20251001', max_tokens: 8000,
+          messages: [{ role: 'user', content: prompt }]
+        });
+        // Find the text block rather than reading content[0]. A leading thinking block
+        // shifts the text out of index 0 — the bug that broke /api/chat on the Sonnet 5
+        // migration. Haiku doesn't enable thinking today; this stays correct if it ever does.
+        const raw = message.content.find(bl => bl.type === 'text')?.text || '';
+        let clean = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+        const start = clean.indexOf('{'), end = clean.lastIndexOf('}');
+        if (start === -1 || end === -1) throw new Error('No JSON object found');
+        plan = JSON.parse(clean.substring(start, end + 1));
+        // Nutrition-only. The workout half is not required here, mirroring how the workout
+        // endpoint ignores the nutrition half. A plan is usable if it carries the daily
+        // calorie target and at least one meal to review.
+        if (!plan.nutrition) throw new Error('Plan missing nutrition');
+        if (!plan.nutrition.calories) throw new Error('Nutrition missing calorie target');
+        const hasFlatMeals = Array.isArray(plan.nutrition.meals) && plan.nutrition.meals.length;
+        const hasWeekly = plan.nutrition.weekly_meals
+          && typeof plan.nutrition.weekly_meals === 'object'
+          && Object.keys(plan.nutrition.weekly_meals).length;
+        if (!hasFlatMeals && !hasWeekly) throw new Error('Nutrition missing meals');
+        break;
+      } catch (err) { lastError = err; if (attempt < 2) await new Promise(r => setTimeout(r, 1000)); }
+    }
+
+    // Validate the shape before returning — a parsed-but-empty plan must never reach the
+    // builder, where it would silently wipe whatever the coach had open.
+    if (!plan || !plan.nutrition || !plan.nutrition.calories) {
+      return sendResponse(500, { error: 'generation_failed', detail: lastError?.message });
+    }
+
+    // Review only — nothing is persisted here by design. The full nutrition object goes back
+    // untouched, weekly_meals and per-meal foods included: the day-aware builder reads both,
+    // and stripping either would hand the coach a plan poorer than the one generated.
+    sendResponse(200, { nutrition: plan.nutrition });
+  } catch (err) {
+    console.error('[coach/generate-nutrition]', err.message);
     sendResponse(500, { error: 'generation_failed', detail: err.message });
   }
 });
