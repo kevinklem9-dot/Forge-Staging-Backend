@@ -7460,10 +7460,20 @@ app.get('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => 
   } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// nutrition_data must be a plain object. A string, array or number is ignored rather than
+// rejected — the field is optional on every caller, and a malformed value must never be
+// persisted on the row or spread over a client's live nutrition plan.
+function coerceNutritionData(v) {
+  return (v && typeof v === 'object' && !Array.isArray(v)) ? v : null;
+}
+
 app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => {
   try {
     let { client_id, name, programme_data, nutrition_data, programme_type, is_template, source_programme_id } = req.body;
     if (!name) return res.status(400).json({ error: 'Missing name' });
+    // Normalised once, so the row insert, the `nutrition_data &&` branch guard and the
+    // live-plan spread below all read the same validated value.
+    nutrition_data = coerceNutritionData(nutrition_data);
     const ptype = programme_type || 'workout';
 
     // Optional provenance: the library row this assigned copy was made from. Assigning
@@ -7637,9 +7647,15 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
   try {
     const { programmeId } = req.params;
     const { name, programme_data } = req.body;
+    // nutrition_data was never read here. Every PATCH silently discarded it and still returned
+    // 200, so the moment the nutrition builder started editing an existing row instead of
+    // inserting a new one, the coach's edit would have been dropped on the floor. Validated
+    // exactly as POST does.
+    const nutrition_data = coerceNutritionData(req.body.nutrition_data);
     const update = { updated_at: new Date().toISOString() };
     if (typeof name === 'string') update.name = name.slice(0, 200);
     if (programme_data) update.programme_data = programme_data;
+    if (nutrition_data) update.nutrition_data = nutrition_data;
     const { data, error } = await supabase.from('coach_programmes')
       .update(update).eq('id', programmeId).eq('coach_id', req.user.id).select().maybeSingle();
     if (error) throw error;
@@ -7655,8 +7671,13 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
       }
     }
     if (data?.client_id && !data?.is_template) {
-      await sendPushToUser(data.client_id, 'Programme updated',
-        'Your coach has updated your programme.', '/app.html?panel=workout').catch(() => {});
+      // Unchanged for every workout edit. Gated only so a nutrition-only PATCH — a request
+      // shape that could not reach this handler before — does not push the client to the
+      // workout panel and then push again for nutrition a few lines below.
+      if (!nutrition_data) {
+        await sendPushToUser(data.client_id, 'Programme updated',
+          'Your coach has updated your programme.', '/app.html?panel=workout').catch(() => {});
+      }
 
       // Update client's actual plan
       if (programme_data) {
@@ -7710,6 +7731,54 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
             generated_at: new Date().toISOString(),
           }).eq('id', existingPlan.id);
         }
+      }
+
+      // Nutrition edit → write the client's live plan. PATCH never had this block at all: it
+      // updated the coach_programmes row and stopped, so an edited nutrition plan would have
+      // saved to the coach's row and stayed invisible to the client, whose renderer reads
+      // plans.nutrition_plan. Mirrors the POST handler's nutrition branch exactly, including
+      // the _ai_backup rule and the legacy shopping_list strip.
+      if (nutrition_data) {
+        const coachName = req.coachProfile.coach_title || req.coachProfile.name || 'Your coach';
+        const { data: existingPlanN } = await supabase.from('plans')
+          .select('id, nutrition_plan').eq('user_id', data.client_id)
+          .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+        const prevN = existingPlanN?.nutrition_plan || null;
+        // Never back a coach plan up over the real AI one — carry the existing backup forward.
+        const aiBackup = prevN ? (prevN.coach_assigned ? (prevN._ai_backup || null) : prevN) : null;
+        const { shopping_list: _dropSLPatch, ...restNutrition } = nutrition_data;
+        const liveNutrition = {
+          ...restNutrition,
+          coach_assigned: true,
+          coach_name: coachName,
+          assigned_at: new Date().toISOString(),
+          _ai_backup: aiBackup,
+        };
+        if (existingPlanN?.id) {
+          await supabase.from('plans').update({
+            nutrition_plan: liveNutrition,
+            translations: {},
+            generated_at: new Date().toISOString(),
+          }).eq('id', existingPlanN.id);
+        } else {
+          await supabase.from('plans').insert({
+            user_id: data.client_id,
+            nutrition_plan: liveNutrition,
+            generated_at: new Date().toISOString(),
+          });
+        }
+        // Deactivate the client's saved nutrition programmes so they don't shadow the coach
+        // plan on next boot. Best-effort: must never block the response or the push.
+        try {
+          await supabase
+            .from('programmes')
+            .update({ is_active: false })
+            .eq('user_id', data.client_id)
+            .eq('programme_type', 'nutrition');
+        } catch (_) { /* best-effort */ }
+        await sendPushToUser(data.client_id, 'Nutrition plan updated',
+          'Your coach has updated your nutrition plan',
+          '/app.html?panel=nutrition').catch(() => {});
       }
     }
     res.json({ ok: true, programme: data });
