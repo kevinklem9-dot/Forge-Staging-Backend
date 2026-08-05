@@ -6210,6 +6210,127 @@ async function verifyClientConnection(coachId, clientId) {
   return !!data;
 }
 
+// ── Coach relationship ended → restore the client's own plans ─────────────────────
+// Fields the coach assignment paths stamp onto a live plan (server.js:7715-7717, 7769-7772,
+// 7876-7878, 7911-7914, 8154-8156, 8248-8251). Removing them is what turns a coach-assigned
+// plan back into the client's own. coach_assigned is set false rather than deleted, matching
+// activate-ai-plan (server.js:8072). Day-level `coach_note` is deliberately KEPT: it is
+// training content on the session, not a label, and no client-side renderer gates on it.
+function stripCoachLabelling(plan) {
+  if (!plan || typeof plan !== 'object') return plan;
+  const out = { ...plan, coach_assigned: false };
+  delete out._ai_backup;
+  delete out.coach_name;
+  delete out.programme_name;
+  delete out.coach_notes;
+  delete out.assigned_at;
+  return out;
+}
+
+// Restores a client's own plans after a coach relationship ends. Called from all three paths
+// that end one:
+//   DELETE /api/coach/clients/:clientId     — coach removes a client
+//   POST   /api/coach-connection/disconnect — client leaves their coach
+//   POST   /api/coach/downgrade             — coach cancels; orphans every client at once
+//
+// The restore rule is the one already used by PATCH /api/coach/clients/:clientId/activate-ai-plan
+// (server.js:8068) and .../activate-ai-nutrition (server.js:8203):
+//     const aiPlan = wp ? (wp.coach_assigned ? (wp._ai_backup || null) : wp) : null;
+// Those two endpoints cannot simply be called here: both are requireCoach + verifyClientConnection
+// gated, and verifyClientConnection requires status 'active' (server.js:6209), so they 403 the
+// instant the connection ends — exactly when the flags need clearing. They are left untouched
+// because their 400 no_ai_plan bail (server.js:8069) is not byte-equivalent to what a disconnect
+// needs, so the rule is duplicated here rather than extracted out of them.
+//
+// MISSING _ai_backup — the case activate-ai-* rejects with 400. A disconnect cannot reject:
+// bailing is what leaves the client flagged forever, which is the bug being fixed. So this keeps
+// the coach's plan CONTENT and clears only the labelling. The client keeps training on the
+// programme they were mid-way through; it is simply no longer presented as coach-assigned.
+// Blanking the plan instead would hand an empty Plan panel to every client invited by a coach
+// before they ever generated an AI plan — _ai_backup is null for them by construction
+// (server.js:7730) — and reset-nutrition (server.js:8035) already ships that failure mode.
+//
+// NEVER THROWS. Returns a status object for the caller to log. A failed restore must never
+// abort the disconnect that triggered it.
+async function restoreClientAiPlans(userId) {
+  const out = { userId, ok: false, workout: 'none', nutrition: 'none', error: null };
+  if (!userId) { out.error = 'no_user_id'; return out; }
+  try {
+    const { data: planRow, error: readErr } = await supabase.from('plans')
+      .select('id, workout_plan, nutrition_plan').eq('user_id', userId)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    if (readErr) throw readErr;
+    if (!planRow?.id) { out.ok = true; return out; }  // no plan row — nothing to clear
+
+    const update = {};
+
+    // Workout — restore the backup when it actually has days, else unflag the coach plan
+    // in place. Same usability test activate-ai-plan applies (server.js:8069).
+    const wp = planRow.workout_plan;
+    if (wp && wp.coach_assigned) {
+      const backup = wp._ai_backup;
+      const usable = !!(backup && (backup.days || []).length);
+      update.workout_plan = stripCoachLabelling(usable ? backup : wp);
+      out.workout = usable ? 'restored' : 'unflagged';
+    }
+
+    // Nutrition — same rule, with activate-ai-nutrition's usability test (server.js:8204).
+    const np = planRow.nutrition_plan;
+    if (np && np.coach_assigned) {
+      const backup = np._ai_backup;
+      const usable = !!(backup && (backup.calories || backup.daily_calories || (backup.meals || []).length));
+      update.nutrition_plan = stripCoachLabelling(usable ? backup : np);
+      out.nutrition = usable ? 'restored' : 'unflagged';
+    }
+
+    // Neither plan carried coach labelling — leave the row completely untouched. This is the
+    // guard that makes the helper safe to call on a client who never had a coach.
+    if (!Object.keys(update).length) { out.ok = true; return out; }
+
+    update.translations = {};
+    update.generated_at = new Date().toISOString();
+    const { error: writeErr } = await supabase.from('plans').update(update).eq('id', planRow.id);
+    if (writeErr) throw writeErr;
+
+    // Coach assignment deactivated the client's own programmes (server.js:7749, 8178), so
+    // reactivate the most recent non-archived one — the same best-effort block activate-ai-plan
+    // runs (server.js:8082). Only when a coach workout plan was actually cleared.
+    if (out.workout !== 'none') {
+      try {
+        const { data: latestProg } = await supabase.from('programmes')
+          .select('id').eq('user_id', userId)
+          .in('programme_type', ['workout', 'custom'])
+          .or('is_archived.is.null,is_archived.eq.false')
+          .order('created_at', { ascending: false }).limit(1).maybeSingle();
+        if (latestProg?.id) {
+          await supabase.from('programmes').update({ is_active: true }).eq('id', latestProg.id);
+        }
+      } catch (_) { /* best-effort — never blocks the disconnect */ }
+    }
+
+    out.ok = true;
+    return out;
+  } catch (e) {
+    out.error = e.message;
+    console.error('[restore-ai-plans] user', userId, 'failed:', e.message);
+    return out;
+  }
+}
+
+// Restore many clients at once (coach downgrade). Each client's plan row holds different
+// jsonb, so the writes cannot be collapsed into a single statement; they are run in small
+// concurrent batches instead of serialised. restoreClientAiPlans never throws, so one
+// client's failure never stops the rest — every result comes back for logging.
+async function restoreAiPlansForClients(userIds) {
+  const ids = [...new Set((userIds || []).filter(Boolean))];
+  const results = [];
+  const BATCH = 5;
+  for (let i = 0; i < ids.length; i += BATCH) {
+    results.push(...await Promise.all(ids.slice(i, i + BATCH).map(id => restoreClientAiPlans(id))));
+  }
+  return results;
+}
+
 // Count active clients for a coach
 async function countActiveClients(coachId) {
   const { count } = await supabase
@@ -6758,6 +6879,34 @@ app.post('/api/coach/downgrade', requireAuth, async (req, res) => {
       coach_plan_status: 'cancelled',
     }).eq('id', req.user.id);
     if (error) throw error;
+
+    // Downgrading stranded every connected client. requireCoach rejects this account from here
+    // on (server.js:6174), so the coach can no longer reach a single client-facing endpoint —
+    // but the coach_clients rows were left 'active' and the clients' plans were left
+    // coach_assigned, with no path remaining to clear either. Sever the connections, then
+    // restore each client's own plans.
+    //
+    // Both steps are best-effort and wrapped: the profile downgrade above has already
+    // committed, so this must never turn a successful downgrade into a 500.
+    try {
+      const { data: links } = await supabase.from('coach_clients')
+        .select('id, client_id').eq('coach_id', req.user.id).neq('status', 'disconnected');
+      const rows = links || [];
+      if (rows.length) {
+        // One round trip severs every connection.
+        await supabase.from('coach_clients').update({
+          status: 'disconnected', disconnected_at: new Date().toISOString()
+        }).eq('coach_id', req.user.id).neq('status', 'disconnected');
+        // Plan restore is per-client by necessity — batched, and one failure never stops the rest.
+        const results = await restoreAiPlansForClients(rows.map(r => r.client_id));
+        const failed = results.filter(r => !r.ok);
+        console.log(`[coach-downgrade] coach ${req.user.id}: severed ${rows.length} connection(s), restored ${results.length - failed.length}/${results.length} client plan(s)`);
+        for (const f of failed) console.error('[coach-downgrade] plan restore failed for', f.userId, f.error);
+      }
+    } catch (e) {
+      console.error('[coach-downgrade] client cleanup failed:', e.message);
+    }
+
     res.json({ ok: true });
   } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -6995,6 +7144,13 @@ app.delete('/api/coach/clients/:clientId', requireAuth, requireCoach, async (req
       status: 'disconnected', disconnected_at: new Date().toISOString()
     }).eq('id', link.id);
     if (link.client_id) {
+      // Connection is severed — give the client their own plans back before notifying them,
+      // so the app they open from the push already shows an un-flagged plan. Never throws;
+      // a failed restore is logged and must not fail the removal itself.
+      const restored = await restoreClientAiPlans(link.client_id);
+      if (!restored.ok) {
+        console.error('[coach-remove-client] plan restore failed for', link.client_id, restored.error);
+      }
       await sendPushToUser(link.client_id, 'Coach disconnected',
         'Your coach has ended the connection. Your training data stays yours.',
         '/app.html?panel=account').catch(() => {});
@@ -8395,6 +8551,14 @@ app.post('/api/coach-connection/disconnect', requireAuth, async (req, res) => {
     await supabase.from('coach_clients').update({
       status: 'disconnected', disconnected_at: new Date().toISOString()
     }).eq('id', link.id);
+    // Connection is severed — restore this client's own plans BEFORE responding. The frontend
+    // awaits this call and then fires reloadPlan(), so doing it here means the refetch already
+    // returns an un-flagged plan and the "FROM YOUR COACH" banner cannot come back. Never
+    // throws; a failed restore is logged and must not fail the disconnect.
+    const restored = await restoreClientAiPlans(req.user.id);
+    if (!restored.ok) {
+      console.error('[coach-disconnect] plan restore failed for', req.user.id, restored.error);
+    }
     await sendPushToUser(link.coach_id, 'Client disconnected',
       'A client has ended your coaching connection.',
       '/app.html?panel=clients').catch(() => {});
