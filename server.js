@@ -4625,16 +4625,46 @@ app.post('/api/programmes/:id/activate', requireAuth, async (req, res) => {
     if (progType === 'nutrition') {
       const nutrition_plan = pd.nutrition ?? pd.nutrition_plan ?? null;
       if (!nutrition_plan) return res.status(400).json({ error: 'programme_has_no_plan' });
-      // For nutrition-only programmes: only update nutrition_plan, never touch workout_plan
+      // For nutrition-only programmes: only update nutrition_plan, never touch workout_plan.
+      // nutrition_plan is now selected too — the live plan's _ai_backup has to be read off it
+      // and carried onto the incoming plan (see below).
+      //
+      // .order().limit(1) rather than a bare .maybeSingle(): every other reader of `plans` in
+      // this file takes the newest row that way (server.js:6368, 7868, 8452, 8491), because
+      // .maybeSingle() throws outright if a user somehow has more than one plan row. Reading
+      // defensively here can only avoid a 500; it cannot change the result for the ordinary
+      // single-row case.
       const { data: existingPlan } = await supabase
-        .from('plans').select('workout_plan, translations, source_language')
-        .eq('user_id', req.user.id).maybeSingle();
+        .from('plans').select('workout_plan, nutrition_plan, translations, source_language')
+        .eq('user_id', req.user.id)
+        .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+
+      // _ai_backup is the client's own pre-coach AI nutrition and the ONLY stored record of it.
+      // It lives on plans.nutrition_plan, which this endpoint replaces wholesale, so without
+      // carrying it across a single nutrition switch would destroy it — and with it the
+      // coach-restore path, PATCH /api/coach/clients/:clientId/activate-ai-nutrition
+      // (server.js:8456), which reads exactly this field.
+      //
+      // Read from the LIVE plan, never from the saved programme: a programme row is a snapshot
+      // the user chose to keep and has no business carrying someone else's backup.
+      const prevNutrition = existingPlan?.nutrition_plan || null;
+      const carriedBackup = prevNutrition ? (prevNutrition._ai_backup ?? null) : null;
+      const nutritionToWrite = carriedBackup
+        ? { ...nutrition_plan, _ai_backup: carriedBackup }
+        : nutrition_plan;
+
       await supabase.from('plans').delete().eq('user_id', req.user.id);
       const { error: planErr } = await supabase.from('plans').insert({
         user_id: req.user.id,
         workout_plan: existingPlan?.workout_plan ?? null,
-        nutrition_plan,
-        translations: existingPlan?.translations ?? {},
+        nutrition_plan: nutritionToWrite,
+        // translations is a per-language cache of translated meal and food NAMES, keyed by the
+        // plan it was built from (getTranslatedPlan, server.js:2093/2056-2072). Carrying it
+        // across a plan swap replays the OLD plan's meal names over the NEW plan's data — a
+        // fault invisible in English and visible to every French user. Every other writer of
+        // plans.nutrition_plan resets it (1874, 2446, 2720, 4665, 4715, 8036, 8178, 8464, 8508);
+        // this branch was the only one that did not.
+        translations: {},
         source_language: existingPlan?.source_language ?? 'en'
       });
       if (planErr) throw planErr;
@@ -4665,8 +4695,23 @@ app.post('/api/programmes/:id/activate', requireAuth, async (req, res) => {
       .insert({ user_id: req.user.id, workout_plan, nutrition_plan, translations: {}, source_language: 'en' });
     if (planErr) throw planErr;
 
-    // Flip active flags.
-    await supabase.from('programmes').update({ is_active: false }).eq('user_id', req.user.id);
+    // Flip active flags — WORKOUT-SIDE ONLY.
+    //
+    // This previously cleared is_active on every row the user owned, with no type filter, while
+    // the nutrition branch above correctly scoped its deactivation to programme_type
+    // 'nutrition'. So activating a workout programme silently de-activated the user's active
+    // nutrition programme, and holding one active programme of each type — the whole point of
+    // typing the table — was impossible.
+    //
+    // .or() rather than .in(): a PostgREST .in() does not match NULL, so any row predating the
+    // programme_type column would stop being deactivated and could linger as a second active
+    // workout programme. NULL is treated as 'workout' by every reader (server.js:4623,
+    // app.html:16116), so it is matched explicitly here. Same idiom as the is_archived filter
+    // on GET /api/programmes (server.js:4373). Once the Part A migration sets the column NOT
+    // NULL the null arm is simply redundant, never wrong.
+    await supabase.from('programmes').update({ is_active: false })
+      .eq('user_id', req.user.id)
+      .or('programme_type.is.null,programme_type.eq.workout,programme_type.eq.custom');
     await supabase.from('programmes').update({ is_active: true, updated_at: new Date().toISOString() })
       .eq('id', id).eq('user_id', req.user.id);
 
@@ -4713,6 +4758,32 @@ app.patch('/api/programmes/:id', requireAuth, async (req, res) => {
         }
         await supabase.from('plans').delete().eq('user_id', req.user.id);
         await supabase.from('plans').insert({ user_id: req.user.id, workout_plan, nutrition_plan, translations: {}, source_language: 'en' });
+      } else if (nutrition_plan && (data.programme_type || 'workout') === 'nutrition') {
+        // Editing the ACTIVE nutrition programme has to reach the live plan too. Without this
+        // the write-through fell out on `if (workout_plan)` — a nutrition row carries no
+        // workout — so the row updated and the Food panel kept rendering the old meals.
+        //
+        // Deliberately narrower than the workout arm: gated on programme_type as well as on
+        // there being nutrition data, so a workout/custom row that happens to carry a nutrition
+        // blob still takes the branch above and nothing about that path changes.
+        //
+        // Same _ai_backup carry-forward and same translations reset as the activate endpoint —
+        // see the reasoning there (server.js:4625-4665). These are the only two places a saved
+        // nutrition programme is written into plans.nutrition_plan, so they must agree.
+        const { data: existingPlan } = await supabase
+          .from('plans').select('workout_plan, nutrition_plan, source_language')
+          .eq('user_id', req.user.id)
+          .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+        const prevNutrition = existingPlan?.nutrition_plan || null;
+        const carriedBackup = prevNutrition ? (prevNutrition._ai_backup ?? null) : null;
+        await supabase.from('plans').delete().eq('user_id', req.user.id);
+        await supabase.from('plans').insert({
+          user_id: req.user.id,
+          workout_plan: existingPlan?.workout_plan ?? null,
+          nutrition_plan: carriedBackup ? { ...nutrition_plan, _ai_backup: carriedBackup } : nutrition_plan,
+          translations: {},
+          source_language: existingPlan?.source_language ?? 'en'
+        });
       }
     }
 
@@ -6276,20 +6347,46 @@ const PROGRAMME_NAME_MAX = 80;
 // done here. A duplicate row is recoverable by the client (Delete); a lost programme is not.
 //
 // NEVER THROWS. Returns a short status string for the caller to log.
+// ── Shared machinery for the two disconnect copies ───────────────────────────────────────
+// The workout and nutrition copies differ only in what they read off the plan and what they
+// put in plan_data. Name construction, the duplicate guard and the insert are identical, so
+// they live here once rather than as a near-duplicate that can drift.
+
+// "Upper Lower x2" + "Kevin" → "Upper Lower x2 (from Kevin)", capped at PROGRAMME_NAME_MAX.
+// The BASE is truncated, never the suffix — the provenance is the point of the name.
+function copiedProgrammeName(baseName, coachName) {
+  const suffix = ` (from ${coachName})`;
+  return (baseName.slice(0, Math.max(1, PROGRAMME_NAME_MAX - suffix.length)) + suffix)
+    .slice(0, PROGRAMME_NAME_MAX);
+}
+
+async function programmeNameTaken(userId, name) {
+  const { data } = await supabase.from('programmes')
+    .select('id').eq('user_id', userId).eq('name', name).limit(1).maybeSingle();
+  return !!data?.id;
+}
+
+// Insert, with the same degrade-without-column fallback as POST /api/programmes
+// (server.js:4470-4477) so an un-migrated database still accepts the row. Throws on a real
+// failure; both callers catch.
+async function insertProgrammeRow(insertRow) {
+  let { error } = await supabase.from('programmes').insert(insertRow);
+  if (error && /programme_type/.test(error.message || '')) {
+    const { programme_type: _dropType, ...withoutType } = insertRow;
+    ({ error } = await supabase.from('programmes').insert(withoutType));
+  }
+  if (error) throw error;
+}
+
 async function copyCoachWorkoutToProgrammes(userId, wp) {
   try {
     if (!userId || !wp || !Array.isArray(wp.days) || !wp.days.length) return 'skipped_no_days';
 
     const coachName = (wp.coach_name || 'your coach').toString().trim();
     const baseName = (wp.programme_name || 'Coach Programme').toString().trim();
-    const suffix = ` (from ${coachName})`;
-    // Truncate the BASE name, never the suffix — the provenance is the point of the name.
-    const name = (baseName.slice(0, Math.max(1, PROGRAMME_NAME_MAX - suffix.length)) + suffix)
-      .slice(0, PROGRAMME_NAME_MAX);
+    const name = copiedProgrammeName(baseName, coachName);
 
-    const { data: dupe } = await supabase.from('programmes')
-      .select('id').eq('user_id', userId).eq('name', name).limit(1).maybeSingle();
-    if (dupe?.id) return 'skipped_duplicate';
+    if (await programmeNameTaken(userId, name)) return 'skipped_duplicate';
 
     const workout = stripCoachLabelling(wp);
     delete workout._ai_backup;
@@ -6298,25 +6395,68 @@ async function copyCoachWorkoutToProgrammes(userId, wp) {
     // the client later activates this row.
     if (!workout.split_name && baseName) workout.split_name = baseName;
 
-    const insertRow = {
+    await insertProgrammeRow({
       user_id: userId,
       name,
       description: wp.split_description ? wp.split_description.toString().slice(0, 300) : null,
       plan_data: { workout },
       is_active: false,
       programme_type: 'workout'
-    };
-
-    let { error } = await supabase.from('programmes').insert(insertRow);
-    // Same degrade-without-column fallback as POST /api/programmes (server.js:4470-4477).
-    if (error && /programme_type/.test(error.message || '')) {
-      delete insertRow.programme_type;
-      ({ error } = await supabase.from('programmes').insert(insertRow));
-    }
-    if (error) throw error;
+    });
     return 'copied';
   } catch (e) {
     console.error('[clear-coach-assignment] copying coach workout for', userId, 'failed:', e.message);
+    return 'failed';
+  }
+}
+
+// The nutrition twin of copyCoachWorkoutToProgrammes. Same rules, same guarantees; only the
+// plan_data key and the usability test differ.
+//
+// SHAPE: plan_data: { nutrition: <nutrition plan object> } — matched to what the client's own
+// save path already writes (app.html:8515-8520) and to what the activate endpoint reads,
+// `pd.nutrition ?? pd.nutrition_plan` (server.js:4626). The stored object is the same shape as
+// plans.nutrition_plan: calories / protein_g / carbs_g / fat_g / strategy / meals[] /
+// weekly_meals{} — meals and weekly_meals carry their own foods[], so nothing is flattened.
+//
+// USABILITY TEST mirrors activate-ai-nutrition (server.js:8457): a nutrition plan is worth
+// keeping if it has calories or any meals. A plan with neither would save as an empty row the
+// client can activate into a blank Food panel.
+//
+// coach_notes is dropped with the rest of the labelling by stripCoachLabelling(). That is
+// deliberate and matches the workout copy: it is a message from a coach the client no longer
+// has, and `strategy` — which the builder seeds from the same text (app.html:14401-14402) —
+// survives on the plan and becomes the row's description.
+//
+// NEVER THROWS. Returns a short status string for the caller to log.
+async function copyCoachNutritionToProgrammes(userId, np) {
+  try {
+    if (!userId || !np) return 'skipped_no_nutrition';
+    const hasContent = !!(np.calories || np.daily_calories || (np.meals || []).length);
+    if (!hasContent) return 'skipped_no_nutrition';
+
+    const coachName = (np.coach_name || 'your coach').toString().trim();
+    // Coach nutrition plans carry no programme_name — the coach builder writes calories,
+    // macros, strategy, meals and weekly_meals and nothing else (app.html:14396-14406) — so
+    // there is no per-plan title to inherit and the base name is a constant.
+    const name = copiedProgrammeName('Nutrition Plan', coachName);
+
+    if (await programmeNameTaken(userId, name)) return 'skipped_duplicate';
+
+    const nutrition = stripCoachLabelling(np);
+    delete nutrition._ai_backup;
+
+    await insertProgrammeRow({
+      user_id: userId,
+      name,
+      description: np.strategy ? np.strategy.toString().slice(0, 300) : null,
+      plan_data: { nutrition },
+      is_active: false,
+      programme_type: 'nutrition'
+    });
+    return 'copied';
+  } catch (e) {
+    console.error('[clear-coach-assignment] copying coach nutrition for', userId, 'failed:', e.message);
     return 'failed';
   }
 }
@@ -6333,10 +6473,12 @@ async function copyCoachWorkoutToProgrammes(userId, wp) {
 // The client carries on training on the programme they were mid-way through; it is simply no
 // longer presented as coach-assigned.
 //
-// This helper now ALSO writes to `programmes` — see copyCoachWorkoutToProgrammes() above. The
-// coach's workout is copied into the client's own My Programmes (is_active:false) before the
-// flags are cleared, so keeping it no longer depends on the client never switching plans.
-// Nutrition is deliberately NOT copied in this pass.
+// This helper now ALSO writes to `programmes` — see copyCoachWorkoutToProgrammes() and
+// copyCoachNutritionToProgrammes() above. The coach's workout AND nutrition are each copied
+// into the client's own My Programmes (is_active:false) before the flags are cleared, so
+// keeping either no longer depends on the client never switching plans. The two copies are
+// independent: a client with only one of them gets only that one, and a failure on one has no
+// effect on the other or on the clear itself.
 //
 // This previously swapped _ai_backup in over the top whenever the backup was usable, which
 // discarded the coach's programme at the exact moment the client lost the coach who could
@@ -6362,7 +6504,7 @@ async function copyCoachWorkoutToProgrammes(userId, wp) {
 // NEVER THROWS. Returns a status object for the caller to log. A failed clear must never
 // abort the disconnect that triggered it.
 async function clearCoachAssignment(userId) {
-  const out = { userId, ok: false, workout: 'none', nutrition: 'none', programme: 'none', error: null };
+  const out = { userId, ok: false, workout: 'none', nutrition: 'none', programme: 'none', nutritionProgramme: 'none', error: null };
   if (!userId) { out.error = 'no_user_id'; return out; }
   try {
     const { data: planRow, error: readErr } = await supabase.from('plans')
@@ -6389,9 +6531,13 @@ async function clearCoachAssignment(userId) {
       out.workout = 'cleared';
     }
 
-    // Nutrition — same rule.
+    // Nutrition — same rule, and now the same copy. Identical error boundary to the workout
+    // copy above: copyCoachNutritionToProgrammes() never throws, so a failed insert cannot stop
+    // the flags clearing or fail the disconnect, and sitting inside this per-client helper means
+    // the downgrade batch keeps its per-client isolation.
     const np = planRow.nutrition_plan;
     if (np && np.coach_assigned) {
+      out.nutritionProgramme = await copyCoachNutritionToProgrammes(userId, np);
       update.nutrition_plan = stripCoachLabelling(np);
       out.nutrition = 'cleared';
     }
