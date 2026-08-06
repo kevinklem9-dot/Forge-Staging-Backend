@@ -4337,6 +4337,44 @@ app.get('/api/version', (req, res) => {
 // prompt), Steel = 3, Forge/exempt = unlimited. See decisions.md.
 const PROGRAMME_TIER_LIMIT = { iron: 1, steel: 3, forge: Infinity };
 
+// ── The degrade-without-column fallback, and the bug it used to cause ────────────────────
+// Both inserts that carry a programme_type (POST /api/programmes below, and
+// insertProgrammeRow() at server.js:6369) retry without the column when it appears to be
+// missing, so an un-migrated database still accepts the row. Dropping the column lets the
+// default ('workout') apply. That is a no-op for a workout-family row and DESTRUCTIVE for a
+// nutrition one: the row lists among workout programmes, and activating it takes the workout
+// branch and writes a nutrition object into plans.workout_plan.
+//
+// That is not hypothetical — it shipped. A coach nutrition copy landed as programme_type
+// 'workout' because the fallback fired, stripped the type, and returned success with nothing
+// logged. The type was always set correctly on the insert; the retry threw it away.
+//
+// Two guards, either of which alone would have prevented it.
+//
+// 1. Only treat an error as "the column is absent". The old test was
+//    /programme_type/.test(error.message) — it matched ANY failure that merely mentioned the
+//    column, including a CHECK or NOT NULL violation, which are real faults that must surface
+//    rather than be retried into a mistyped row.
+//    PGRST204 = not in PostgREST's schema cache — the likely trigger, since DDL on the table
+//    leaves that cache stale, so running a migration can open exactly this window.
+//    42703 = Postgres "column does not exist".
+function isMissingProgrammeTypeColumn(error) {
+  if (!error) return false;
+  const msg = (error.message || '').toLowerCase();
+  if (!msg.includes('programme_type')) return false;
+  return error.code === 'PGRST204' || error.code === '42703'
+    || msg.includes('schema cache') || msg.includes('does not exist');
+}
+
+// 2. Only drop the column when losing it cannot change how the row is treated — i.e. when the
+//    intended type is workout-family, which is exactly what the column default and every
+//    reader's `programme_type || 'workout'` coalescing (server.js:4623+, app.html:16116)
+//    already mean. A nutrition row never degrades: it fails loudly and the caller logs it.
+//    Losing the insert is recoverable — at that moment the coach plan is still on
+//    plans.nutrition_plan — whereas a silently mistyped row is not, because nothing
+//    downstream can tell it was ever wrong.
+const WORKOUT_FAMILY_TYPES = new Set(['workout', 'custom']);
+
 // Generate a one-line AI description (Haiku, max ~12 words) for a programme and store
 // it on the row. Fire-and-forget: callers do NOT await this — it runs after the
 // response is sent and the frontend picks the description up on the next
@@ -4467,7 +4505,14 @@ app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
       .maybeSingle();
     // Graceful fallback if the programmes.programme_type column has not been migrated yet
     // (mirrors the units/enabled_features degrade-without-column pattern).
-    if (error && /programme_type/.test(error.message || '')) {
+    //
+    // Guarded on BOTH counts — see insertProgrammeRow() (server.js:6369) for the full reasoning.
+    // The old test fired on any error merely mentioning the column and dropped the type for any
+    // programme_type, so a caller asking for 'nutrition' — which saveCurrentNutritionPlan()
+    // does (app.html:8518) — could silently receive a row typed 'workout' by the column default.
+    // That row would then list among workout programmes and, if activated, write a nutrition
+    // object into plans.workout_plan. A nutrition insert now fails loudly instead.
+    if (error && isMissingProgrammeTypeColumn(error) && WORKOUT_FAMILY_TYPES.has(insertRow.programme_type)) {
       delete insertRow.programme_type;
       ({ data, error } = await supabase
         .from('programmes')
@@ -6366,12 +6411,12 @@ async function programmeNameTaken(userId, name) {
   return !!data?.id;
 }
 
-// Insert, with the same degrade-without-column fallback as POST /api/programmes
-// (server.js:4470-4477) so an un-migrated database still accepts the row. Throws on a real
-// failure; both callers catch.
+// Insert, sharing the guarded degrade-without-column fallback with POST /api/programmes.
+// See isMissingProgrammeTypeColumn() / WORKOUT_FAMILY_TYPES (server.js:4340) for why both
+// guards exist. Throws on a real failure; both callers catch and log.
 async function insertProgrammeRow(insertRow) {
   let { error } = await supabase.from('programmes').insert(insertRow);
-  if (error && /programme_type/.test(error.message || '')) {
+  if (error && isMissingProgrammeTypeColumn(error) && WORKOUT_FAMILY_TYPES.has(insertRow.programme_type)) {
     const { programme_type: _dropType, ...withoutType } = insertRow;
     ({ error } = await supabase.from('programmes').insert(withoutType));
   }
