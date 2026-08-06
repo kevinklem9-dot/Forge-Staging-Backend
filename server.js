@@ -6229,6 +6229,98 @@ function stripCoachLabelling(plan) {
   return out;
 }
 
+// Name cap for a `programmes` row — matches POST /api/programmes (server.js:4457).
+const PROGRAMME_NAME_MAX = 80;
+
+// ── Coach disconnect → the client KEEPS the coach's workout programme ────────────────────
+// PROJECT RULE: a client who loses their coach keeps the coach-built workout permanently.
+// Until now it lived ONLY in plans.workout_plan, so the first time the client switched to
+// their AI plan it was destroyed — POST /api/programmes/:id/activate does `delete from plans`
+// then re-inserts from the target programme's plan_data (server.js:4662), and nothing had ever
+// written the coach's work anywhere else. Gone, at the exact moment the coach who could
+// rebuild it is also gone.
+//
+// So on disconnect we copy it into the client's OWN `programmes` table as an ordinary
+// user-owned row. From there it is switchable through the normal My Programmes flow — no
+// toggle, no coach state, nothing coach-gated.
+//
+// SHAPE — matched to the existing user-owned create path (server.js:1887-1892), NOT to
+// coach_programmes:
+//     plan_data: { workout: <workout plan object, days nested inside> }
+// activate reads `pd.workout ?? pd.workout_plan` (server.js:4620) and the frontend reads
+// plan_data.workout.days (app.html:4939). A bare { days: [...] } is unreadable by both:
+// activate would 400 programme_has_no_plan and the row would render dead in My Programmes.
+//
+// The copy is run through stripCoachLabelling() so it can never re-flag the client as
+// coach-assigned. Without that, activating their own kept copy would write coach_assigned:true
+// back into plans.workout_plan — bringing back the "FROM YOUR COACH" banner and re-locking the
+// My Programmes Switch button (hasCoach, app.html:8391), locking the client out of the very
+// switching this change exists to give them.
+//
+// _ai_backup is stripped from the COPY only — a saved programme has no business carrying a
+// nested backup of a different plan. The LIVE plans.workout_plan._ai_backup is untouched.
+//
+// is_active:false — a disconnect must never change which programme the client is training on.
+//
+// Deliberately a direct insert, NOT POST /api/programmes: that route enforces
+// PROGRAMME_TIER_LIMIT (iron:1, steel:3) and would 409 for most clients, silently losing the
+// programme at the one moment it cannot be rebuilt. Onboarding inserts directly for the same
+// reason (server.js:1887).
+//
+// DUPLICATE GUARD is name-based, and that is a real limit, not a claim of completeness. The
+// name is deterministic (programme_name + coach_name), so the case that actually recurs —
+// connect → disconnect → reconnect the same coach → disconnect again — collides on it and is
+// caught. What it does NOT catch: the same programme content re-assigned under a different
+// programme_name, or by a coach whose display name changed. Detecting that needs a deep jsonb
+// comparison of every stored programme against the live plan, which is not cheap and is not
+// done here. A duplicate row is recoverable by the client (Delete); a lost programme is not.
+//
+// NEVER THROWS. Returns a short status string for the caller to log.
+async function copyCoachWorkoutToProgrammes(userId, wp) {
+  try {
+    if (!userId || !wp || !Array.isArray(wp.days) || !wp.days.length) return 'skipped_no_days';
+
+    const coachName = (wp.coach_name || 'your coach').toString().trim();
+    const baseName = (wp.programme_name || 'Coach Programme').toString().trim();
+    const suffix = ` (from ${coachName})`;
+    // Truncate the BASE name, never the suffix — the provenance is the point of the name.
+    const name = (baseName.slice(0, Math.max(1, PROGRAMME_NAME_MAX - suffix.length)) + suffix)
+      .slice(0, PROGRAMME_NAME_MAX);
+
+    const { data: dupe } = await supabase.from('programmes')
+      .select('id').eq('user_id', userId).eq('name', name).limit(1).maybeSingle();
+    if (dupe?.id) return 'skipped_duplicate';
+
+    const workout = stripCoachLabelling(wp);
+    delete workout._ai_backup;
+    // Coach plans carry no split_name (server.js:7829-7865). The Plan panel renders it as the
+    // subtitle (app.html:4662), so seed it from the programme name to avoid a blank header if
+    // the client later activates this row.
+    if (!workout.split_name && baseName) workout.split_name = baseName;
+
+    const insertRow = {
+      user_id: userId,
+      name,
+      description: wp.split_description ? wp.split_description.toString().slice(0, 300) : null,
+      plan_data: { workout },
+      is_active: false,
+      programme_type: 'workout'
+    };
+
+    let { error } = await supabase.from('programmes').insert(insertRow);
+    // Same degrade-without-column fallback as POST /api/programmes (server.js:4470-4477).
+    if (error && /programme_type/.test(error.message || '')) {
+      delete insertRow.programme_type;
+      ({ error } = await supabase.from('programmes').insert(insertRow));
+    }
+    if (error) throw error;
+    return 'copied';
+  } catch (e) {
+    console.error('[clear-coach-assignment] copying coach workout for', userId, 'failed:', e.message);
+    return 'failed';
+  }
+}
+
 // Clears the coach labelling off a client's plans after a coach relationship ends. Called from
 // all three paths that end one:
 //   DELETE /api/coach/clients/:clientId     — coach removes a client
@@ -6240,6 +6332,11 @@ function stripCoachLabelling(plan) {
 // "FROM YOUR COACH" banner (app.html:4677, 5606) and everything else gated on coach_assigned.
 // The client carries on training on the programme they were mid-way through; it is simply no
 // longer presented as coach-assigned.
+//
+// This helper now ALSO writes to `programmes` — see copyCoachWorkoutToProgrammes() above. The
+// coach's workout is copied into the client's own My Programmes (is_active:false) before the
+// flags are cleared, so keeping it no longer depends on the client never switching plans.
+// Nutrition is deliberately NOT copied in this pass.
 //
 // This previously swapped _ai_backup in over the top whenever the backup was usable, which
 // discarded the coach's programme at the exact moment the client lost the coach who could
@@ -6265,7 +6362,7 @@ function stripCoachLabelling(plan) {
 // NEVER THROWS. Returns a status object for the caller to log. A failed clear must never
 // abort the disconnect that triggered it.
 async function clearCoachAssignment(userId) {
-  const out = { userId, ok: false, workout: 'none', nutrition: 'none', error: null };
+  const out = { userId, ok: false, workout: 'none', nutrition: 'none', programme: 'none', error: null };
   if (!userId) { out.error = 'no_user_id'; return out; }
   try {
     const { data: planRow, error: readErr } = await supabase.from('plans')
@@ -6276,9 +6373,18 @@ async function clearCoachAssignment(userId) {
 
     const update = {};
 
-    // Workout — keep the coach's days, drop the coach labelling, keep _ai_backup.
+    // Workout — copy the coach's programme into the client's OWN programmes FIRST (while
+    // coach_name and programme_name are still on the plan and can be read for the row name),
+    // then keep the coach's days on the live plan, drop the coach labelling, keep _ai_backup.
+    //
+    // The copy is best-effort by construction: copyCoachWorkoutToProgrammes() never throws, so
+    // a failed insert can never stop the flags clearing or fail the disconnect. And because it
+    // sits inside this per-client helper, the coach downgrade path keeps its per-client error
+    // boundary for free — clearCoachAssignmentForClients() maps over clients independently, so
+    // one client's failed copy cannot abort the rest of the batch.
     const wp = planRow.workout_plan;
     if (wp && wp.coach_assigned) {
+      out.programme = await copyCoachWorkoutToProgrammes(userId, wp);
       update.workout_plan = stripCoachLabelling(wp);
       out.workout = 'cleared';
     }
