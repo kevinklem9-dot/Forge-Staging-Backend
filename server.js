@@ -1882,12 +1882,23 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     console.log('Plan saved to DB successfully');
 
     // Also save to programmes table (deactivate existing, add new active one)
+    //
+    // programme_type is now sent explicitly. It used to be omitted, leaving the row to the
+    // column default — a default no migration in this repo applies to `programmes` — so the row
+    // could land NULL. A NULL type is invisible to every reader that filters on it, because
+    // PostgREST .eq()/.in() do not match NULL (server.js:2383, 4431, 8549, 8642).
+    //
+    // BACKSTOP, NOT SUBSTITUTE: the DB trigger programmes_set_type sets 'nutrition' when
+    // plan_data carries `nutrition` and no `workout`. THIS row carries both, so the trigger
+    // deliberately leaves it alone and the value below is the only thing that types it. Do not
+    // drop it on the assumption the trigger covers this path — it does not.
     const planName = `${profile?.goal || 'My'} Plan — ${new Date().toLocaleDateString('en-GB', { month: 'short', year: 'numeric' })}`;
     await supabase.from('programmes').update({ is_active: false }).eq('user_id', req.user.id);
     const { data: obProg, error: progInsertError } = await supabase.from('programmes').insert({
       user_id: req.user.id,
       name: planName,
       plan_data: { workout: plan.workout, nutrition: plan.nutrition },
+      programme_type: 'workout',
       is_active: true
     }).select('id').maybeSingle();
     if (progInsertError) console.error('[generate-plan] programmes insert error:', progInsertError);
@@ -1896,6 +1907,13 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
     // in My Programmes (and stays available to switch back to if a coach later assigns a custom
     // nutrition plan). Deactivate any existing nutrition programmes first so only one is active.
     // Best-effort — must never block onboarding.
+    //
+    // BACKSTOP, NOT SUBSTITUTE: the DB trigger programmes_set_type types a row 'nutrition' when
+    // plan_data carries `nutrition` and no `workout` — exactly this row's shape — so the trigger
+    // would also catch this insert if the value below were ever lost. Keep sending it anyway.
+    // The trigger exists to cover insert paths this block cannot see (notably the
+    // degrade-without-column fallback in insertProgrammeRow(), server.js:6435), not to excuse
+    // the application from sending the right value. Code that reads honestly is the point.
     try {
       await supabase.from('programmes')
         .update({ is_active: false })
