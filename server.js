@@ -8088,9 +8088,57 @@ function coerceNutritionData(v) {
   return (v && typeof v === 'object' && !Array.isArray(v)) ? v : null;
 }
 
+// The coach_programmes twin of isMissingProgrammeTypeColumn (server.js:4379). Same narrow test,
+// and narrow for the same reason: match the column NAME **and** an error shape that actually
+// means "the column is not there". A CHECK or NOT NULL violation that merely mentions the column
+// must surface, never be retried into a row silently missing the field.
+//   PGRST204 = not in PostgREST's schema cache — the likely trigger, since DDL on the table
+//              leaves that cache stale, so running the migration itself opens this window.
+//   42703    = Postgres "column does not exist".
+//
+// Unlike programme_type, dropping this column is SAFE to degrade. programme_type has a DEFAULT
+// that silently retypes the row, which is how the nutrition-copy bug shipped (server.js:4366).
+// built_for_client_id has no default behaviour attached: a row without it is indistinguishable
+// from every legacy row, and those render in BUILD 2's catch-all section. Losing the field costs
+// the coach some sorting. Losing the insert costs them the programme.
+function isMissingBuiltForColumn(error) {
+  if (!error) return false;
+  const msg = (error.message || '').toLowerCase();
+  if (!msg.includes('built_for_client_id')) return false;
+  return error.code === 'PGRST204' || error.code === '42703'
+    || msg.includes('schema cache') || msg.includes('does not exist');
+}
+
+// One UUID test for every optional pointer column on this table. Was declared inline inside
+// POST as SRC_UUID_RE; hoisted so POST and PATCH cannot drift apart on what counts as a valid
+// built_for_client_id.
+const COACH_PROGRAMME_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Resolve an optional built_for_client_id off a request body. Three distinct outcomes, and the
+// difference between the first two is the whole optional contract:
+//   undefined → the caller never mentioned the field; leave the row exactly as it is
+//   null      → an explicit clear, or a value that failed validation
+//   uuid      → a UUID the coach has an ACTIVE connection with
+//
+// A bad value is DOWNGRADED to null, never rejected with a 4xx. This column is a sorting hint
+// with no behaviour attached to it, so a bad value must cost the coach a shelf, never the
+// programme. Downgraded rows land in BUILD 2's catch-all section, which exists precisely so
+// that no row can be invisible.
+//
+// The connection check is what keeps garbage out of the column: without it a coach could stamp
+// any UUID onto their own row. It is skipped when the value matches a client_id the caller has
+// already verified, so the common assign path costs no extra query.
+async function resolveBuiltForClientId(coachId, raw, alreadyVerifiedClientId) {
+  if (raw === undefined) return undefined;
+  if (raw === null) return null;
+  if (typeof raw !== 'string' || !COACH_PROGRAMME_UUID_RE.test(raw)) return null;
+  if (alreadyVerifiedClientId && raw === alreadyVerifiedClientId) return raw;
+  return (await verifyClientConnection(coachId, raw)) ? raw : null;
+}
+
 app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) => {
   try {
-    let { client_id, name, programme_data, nutrition_data, programme_type, is_template, source_programme_id } = req.body;
+    let { client_id, name, programme_data, nutrition_data, programme_type, is_template, source_programme_id, built_for_client_id } = req.body;
     if (!name) return res.status(400).json({ error: 'Missing name' });
     // Normalised once, so the row insert, the `nutrition_data &&` branch guard and the
     // live-plan spread below all read the same validated value.
@@ -8101,8 +8149,7 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
     // COPIES, so without this the library cannot tell which of its rows is live for a
     // client. Anything that is not a UUID is ignored rather than rejected — the column is
     // additive and a null value must behave exactly as before.
-    const SRC_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    const sourceProgrammeId = (typeof source_programme_id === 'string' && SRC_UUID_RE.test(source_programme_id))
+    const sourceProgrammeId = (typeof source_programme_id === 'string' && COACH_PROGRAMME_UUID_RE.test(source_programme_id))
       ? source_programme_id
       : null;
 
@@ -8111,11 +8158,28 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
     // connection check below while the row still persisted an attacker-supplied client_id.
     if (is_template) client_id = null;
 
-    if (client_id && !is_template) {
+    const isAssignedRow = !!client_id && !is_template;
+    if (isAssignedRow) {
       if (!await verifyClientConnection(req.user.id, client_id)) {
         return res.status(403).json({ error: 'no_connection' });
       }
     }
+
+    // Which client this row was BUILT FOR — deliberately independent of whether it is assigned,
+    // which is the entire point of the column: a row saved from inside a client's card but not
+    // assigned to them still belongs on that client's shelf, and client_id cannot say that.
+    //
+    // Explicit value wins. Absent, an ASSIGNED row scopes itself to the client it was assigned
+    // to — that is what carries provenance through assign-by-COPY, where the copy already gets
+    // client_id and now gets a matching built_for_client_id.
+    //
+    // NOT force-nulled on templates, unlike client_id. client_id is cleared there because it
+    // drives live-plan writes and pushes; built_for_client_id drives nothing but which shelf the
+    // row renders on, so there is no bypass to close. The template box only suppresses the
+    // DEFAULT — a coach who explicitly scopes a template keeps that scope.
+    let builtForClientId = await resolveBuiltForClientId(
+      req.user.id, built_for_client_id, isAssignedRow ? client_id : null);
+    if (builtForClientId === undefined) builtForClientId = isAssignedRow ? client_id : null;
 
     const row = {
       coach_id: req.user.id,
@@ -8130,8 +8194,20 @@ app.post('/api/coach/programmes', requireAuth, requireCoach, async (req, res) =>
       // Only sent when present, so an un-migrated database still accepts every existing
       // write instead of failing on an unknown column.
       ...(sourceProgrammeId ? { source_programme_id: sourceProgrammeId } : {}),
+      ...(builtForClientId ? { built_for_client_id: builtForClientId } : {}),
     };
-    const { data, error } = await supabase.from('coach_programmes').insert(row).select().maybeSingle();
+    let { data, error } = await supabase.from('coach_programmes').insert(row).select().maybeSingle();
+    // Deploy-before-migration window: this code can be live before the ALTER runs. Retry once
+    // without the new field rather than 500ing the save. Safe to degrade for the reason set out
+    // on isMissingBuiltForColumn — the column has no DEFAULT and no behaviour hanging off it, so
+    // a row missing it is indistinguishable from every legacy row and renders in the catch-all.
+    // That is what makes this NOT a repeat of the programme_type bug, which degraded into a
+    // DEFAULT that silently retyped the row. Guarded twice: only when the field was actually
+    // sent, and only for an error shape that genuinely means the column is absent.
+    if (error && builtForClientId && isMissingBuiltForColumn(error)) {
+      const { built_for_client_id: _dropBuiltFor, ...withoutBuiltFor } = row;
+      ({ data, error } = await supabase.from('coach_programmes').insert(withoutBuiltFor).select().maybeSingle());
+    }
     if (error) throw error;
 
     // Workout assignment → write workout_plan into the client's live plan
@@ -8277,8 +8353,21 @@ app.patch('/api/coach/programmes/:programmeId', requireAuth, requireCoach, async
     if (typeof name === 'string') update.name = name.slice(0, 200);
     if (programme_data) update.programme_data = programme_data;
     if (nutrition_data) update.nutrition_data = nutrition_data;
-    const { data, error } = await supabase.from('coach_programmes')
+    // Scope an existing row to a client, or clear that scope with an explicit null. Omitting the
+    // field leaves the row exactly as it was, which is the only way a legacy draft can stay
+    // legacy. This is the path that lets a coach adopt a pre-migration row into a client's shelf
+    // instead of rebuilding it. Nothing is pre-verified on a PATCH, so every value is checked.
+    const builtFor = await resolveBuiltForClientId(req.user.id, req.body.built_for_client_id, null);
+    if (builtFor !== undefined) update.built_for_client_id = builtFor;
+    let { data, error } = await supabase.from('coach_programmes')
       .update(update).eq('id', programmeId).eq('coach_id', req.user.id).select().maybeSingle();
+    // Same deploy-before-migration retry as POST. A name or programme_data edit must never be
+    // lost to a column that has not landed yet — every other field in `update` still applies.
+    if (error && 'built_for_client_id' in update && isMissingBuiltForColumn(error)) {
+      const { built_for_client_id: _dropBuiltFor, ...withoutBuiltFor } = update;
+      ({ data, error } = await supabase.from('coach_programmes')
+        .update(withoutBuiltFor).eq('id', programmeId).eq('coach_id', req.user.id).select().maybeSingle());
+    }
     if (error) throw error;
     // SECURITY (IDOR fix): re-verify the coach still has an active connection with this client
     // before any client-facing write. Without this, a coach disconnected from a client — or
