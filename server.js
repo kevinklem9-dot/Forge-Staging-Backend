@@ -2490,6 +2490,42 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
               .update({ plan_data: { ...prog.plan_data, workout: progWorkout } })
               .eq('id', prog.id);
           }
+
+          // Same for the active NUTRITION programme. It is a DIFFERENT ROW: activation
+          // deactivates siblings scoped by programme_type (the nutrition branch at
+          // server.js:4792, the workout branch at server.js:4833), so a user holds one active
+          // workout row and one active nutrition row. The query above carries no type filter,
+          // but its guard requires plan_data.workout — which a nutrition row does not have —
+          // so nutrition programmes were skipped entirely and their meals never updated.
+          //
+          // This matters because the Food panel renders from the ACTIVE NUTRITION PROGRAMME,
+          // not from the live plan: getActiveNutrition() (app.html:5584) prefers
+          // window._activeNutritionProgramme.plan_data.nutrition. So without this a chat macro
+          // edit landed on plans.nutrition_plan and appeared to vanish — the panel kept showing
+          // the programme's stale meals.
+          //
+          // workout: {} mirrors the nutrition: {} above — workout-type instructions become
+          // harmless no-ops against a throwaway object, and only .nutrition is persisted.
+          // Spread preserves every other plan_data key, exactly as the workout sync does.
+          const { data: activeNutri } = await supabase
+            .from('programmes')
+            .select('id, plan_data')
+            .eq('user_id', req.user.id)
+            .eq('programme_type', 'nutrition')
+            .eq('is_active', true)
+            .eq('is_archived', false)
+            .limit(1);
+          if (activeNutri?.length && activeNutri[0].plan_data?.nutrition) {
+            const nprog = activeNutri[0];
+            let progNutrition = nprog.plan_data.nutrition;
+            for (const instr of appliedInstructions) {
+              progNutrition = applyPlanUpdate({ workout: {}, nutrition: progNutrition }, instr).nutrition;
+            }
+            await supabase
+              .from('programmes')
+              .update({ plan_data: { ...nprog.plan_data, nutrition: progNutrition } })
+              .eq('id', nprog.id);
+          }
         } catch (e) {
           console.error('Programme sync error:', e.message);
         }
@@ -2755,6 +2791,26 @@ app.post('/api/checkin', requireAuth, loadSubscription, async (req, res) => {
               .from('programmes')
               .update({ plan_data: { ...prog.plan_data, workout: progWorkout } })
               .eq('id', prog.id);
+          }
+
+          // Active NUTRITION programme — a different, type-scoped row that the query above can
+          // never reach (its guard requires plan_data.workout). See the chat handler's sync
+          // block for the full reasoning. Single instruction here, matching this handler.
+          const { data: activeNutri } = await supabase
+            .from('programmes')
+            .select('id, plan_data')
+            .eq('user_id', req.user.id)
+            .eq('programme_type', 'nutrition')
+            .eq('is_active', true)
+            .eq('is_archived', false)
+            .limit(1);
+          if (activeNutri?.length && activeNutri[0].plan_data?.nutrition) {
+            const nprog = activeNutri[0];
+            const progNutrition = applyPlanUpdate({ workout: {}, nutrition: nprog.plan_data.nutrition }, updateInstruction).nutrition;
+            await supabase
+              .from('programmes')
+              .update({ plan_data: { ...nprog.plan_data, nutrition: progNutrition } })
+              .eq('id', nprog.id);
           }
         } catch (e) {
           console.error('Programme sync error (checkin):', e.message);
