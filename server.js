@@ -661,20 +661,23 @@ try {
   console.error('Stripe init failed:', e.message);
 }
 
-// Price ID map — swap these for live IDs when going to production
+// Price ID map — env-only. NO hardcoded fallbacks: a silent fallback to the wrong Price
+// is worse than a hard failure. An unset variable yields undefined, which create-checkout
+// rejects with 400 'Invalid plan selection' rather than charging a stale test price.
+// The _promo keys stay in this map PERMANENTLY, even after launch pricing ends — removing
+// them would make getTierFromPriceId() return null for launch-priced subscribers and stop
+// their tier syncing on renewal.
 const STRIPE_PRICES = {
-  iron_monthly:        process.env.STRIPE_PRICE_IRON_MONTHLY        || 'price_1TRVyYCP6MFAx438g7OtULUQ',
-  iron_annual:         process.env.STRIPE_PRICE_IRON_ANNUAL         || 'price_1TRVz4CP6MFAx438Bph4XBhA',
-  steel_monthly:       process.env.STRIPE_PRICE_STEEL_MONTHLY       || 'price_1TRVzOCP6MFAx438TZ91bkEL',
-  steel_annual:        process.env.STRIPE_PRICE_STEEL_ANNUAL        || 'price_1TRW00CP6MFAx4383yXNBGFU',
-  forge_monthly:       process.env.STRIPE_PRICE_FORGE_MONTHLY       || 'price_1TRW0OCP6MFAx438U9PU9vMV',
-  forge_annual:        process.env.STRIPE_PRICE_FORGE_ANNUAL        || 'price_1TRW0jCP6MFAx438kn5AaNUk',
-  steel_monthly_promo: process.env.STRIPE_PRICE_STEEL_MONTHLY_PROMO || 'price_1TRW19CP6MFAx438Z9q3divk',
-  steel_annual_promo:  process.env.STRIPE_PRICE_STEEL_ANNUAL_PROMO  || 'price_1TRW1hCP6MFAx438y1Ce7oNs',
-  forge_monthly_promo: process.env.STRIPE_PRICE_FORGE_MONTHLY_PROMO || 'price_1TRW27CP6MFAx438cccyiUmk',
-  forge_annual_promo:  process.env.STRIPE_PRICE_FORGE_ANNUAL_PROMO  || 'price_1TRW2YCP6MFAx438qTEPAtwj',
-  iron_founding:       process.env.STRIPE_PRICE_IRON_FOUNDING       || 'price_1TRW33CP6MFAx438rk9GZZ6P',
-  steel_founding:      process.env.STRIPE_PRICE_STEEL_FOUNDING      || 'price_1TRW3PCP6MFAx438tgVOex9V',
+  iron_monthly:         process.env.STRIPE_PRICE_IRON_MONTHLY,
+  iron_annual:          process.env.STRIPE_PRICE_IRON_ANNUAL,
+  iron_monthly_promo:   process.env.STRIPE_PRICE_IRON_MONTHLY_PROMO,
+  iron_annual_promo:    process.env.STRIPE_PRICE_IRON_ANNUAL_PROMO,
+  forge_monthly:        process.env.STRIPE_PRICE_FORGE_MONTHLY,
+  forge_annual:         process.env.STRIPE_PRICE_FORGE_ANNUAL,
+  forge_monthly_promo:  process.env.STRIPE_PRICE_FORGE_MONTHLY_PROMO,
+  forge_annual_promo:   process.env.STRIPE_PRICE_FORGE_ANNUAL_PROMO,
+  iron_founding:        process.env.STRIPE_PRICE_IRON_FOUNDING,
+  forge_founding:       process.env.STRIPE_PRICE_FORGE_FOUNDING,
   // Coach plans — create in Stripe dashboard, set as env vars on Railway
   coach_starter_monthly: process.env.STRIPE_PRICE_COACH_STARTER_MONTHLY || '',
   coach_starter_annual:  process.env.STRIPE_PRICE_COACH_STARTER_ANNUAL  || '',
@@ -704,12 +707,14 @@ function getCoachPlanFromPriceId(priceId) {
   return map[priceId] || null;
 }
 
-// Map price IDs back to tiers — used by webhook and sync endpoint
+// Map price IDs back to tiers — used by webhook and sync endpoint.
+// The !id guard matters now that STRIPE_PRICES has no fallbacks: without it an unset env
+// var writes map['undefined'] and a later undefined lookup could resolve to a real tier.
 function getTierFromPriceId(priceId) {
   const map = {};
   Object.entries(STRIPE_PRICES).forEach(([key, id]) => {
+    if (!id) return;
     if (key.startsWith('iron')) map[id] = 'iron';
-    else if (key.startsWith('steel')) map[id] = 'steel';
     else if (key.startsWith('forge')) map[id] = 'forge';
   });
   return map[priceId] || null;
@@ -886,13 +891,15 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
               '[mailchimp] lifetime tag error:',
               err.message));
           }
-          // Increment founding member counter
+          // Increment founding member counter. forge_total/forge_sold now exist in Supabase;
+          // before they did, a Forge lifetime purchase wrote to a missing column and the
+          // upsert failed silently (Supabase returns an error object, it does not throw).
           const { data: fmConfig } = await supabase.from('founding_member_config').select('*').maybeSingle();
           await supabase.from('founding_member_config').upsert({
             id: 1,
             [`${tier}_sold`]: (fmConfig?.[`${tier}_sold`] || 0) + 1,
             iron_total: fmConfig?.iron_total || 500,
-            steel_total: fmConfig?.steel_total || 250,
+            forge_total: fmConfig?.forge_total || 250,
           });
         } else {
           // Subscription — set active
@@ -941,7 +948,7 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             );
           }
           // Increment launch promo counter if applicable
-          if (isPromo && ['steel','forge'].includes(tier)) {
+          if (isPromo && ['iron','forge'].includes(tier)) {
             await stripe_recordLaunchSub(tier);
           }
           // Handle referral credit
@@ -1092,18 +1099,20 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
   }
 });
 
-// Helper: record launch promo subscription
+// Helper: record a launch-priced subscription.
+// TELEMETRY ONLY. This must NEVER deactivate a launch price. There is no headcount cap —
+// the 500-subscriber auto-kill that used to live here is gone. The only thing that ends
+// launch pricing is the admin toggle (PATCH /api/admin/launch-pricing).
 async function stripe_recordLaunchSub(tier) {
   try {
+    if (!['iron','forge'].includes(tier)) return;
     const { data: config } = await supabase.from('launch_pricing_config').select('*').maybeSingle();
-    const newSold = (config?.[`${tier}_sold`] || 0) + 1;
-    const nowEnded = newSold >= 500;
     await supabase.from('launch_pricing_config').upsert({
       id: 1,
-      steel_active: tier === 'steel' ? !nowEnded : (config?.steel_active ?? true),
-      steel_sold: tier === 'steel' ? newSold : (config?.steel_sold || 0),
-      forge_active: tier === 'forge' ? !nowEnded : (config?.forge_active ?? true),
-      forge_sold: tier === 'forge' ? newSold : (config?.forge_sold || 0),
+      iron_active: config?.iron_active ?? true,
+      iron_sold: (config?.iron_sold || 0) + (tier === 'iron' ? 1 : 0),
+      forge_active: config?.forge_active ?? true,
+      forge_sold: (config?.forge_sold || 0) + (tier === 'forge' ? 1 : 0),
     });
   } catch(e) { console.error('stripe_recordLaunchSub error:', e.message); }
 }
@@ -1299,19 +1308,20 @@ const PLAN_CORE_FIELDS = 'id, workout_plan, nutrition_plan';
 const HISTORY_PROMPT_FIELDS = 'exercise_name, sets, reps, weight_kg, logged_at';
 
 // ── SUBSCRIPTION HELPERS ───────────────────────
-const TIER_RANK = { iron: 0, steel: 1, forge: 2 };
-
+// Two tiers: iron, forge. Steel retired — every feature it carried was already
+// ['steel','forge'], so nothing moved; 'steel' was simply dropped from each array.
+// TIER_RANK was deleted here: it had zero references anywhere in this file.
 const TIER_FEATURES = {
-  unlimited_coach:    ['steel', 'forge'],
-  weekly_review:      ['steel', 'forge'],
-  checkin:            ['steel', 'forge'],
-  overload_tracker:   ['steel', 'forge'],
-  body_metrics:       ['steel', 'forge'],
-  plan_editing:       ['steel', 'forge'],
-  deload:             ['steel', 'forge'],
-  shopping_list:      ['steel', 'forge'],
-  multiple_programmes:['steel', 'forge'],
-  export_history:     ['steel', 'forge'],
+  unlimited_coach:    ['forge'],
+  weekly_review:      ['forge'],
+  checkin:            ['forge'],
+  overload_tracker:   ['forge'],
+  body_metrics:       ['forge'],
+  plan_editing:       ['forge'],
+  deload:             ['forge'],
+  shopping_list:      ['forge'],
+  multiple_programmes:['forge'],
+  export_history:     ['forge'],
   video_demos:        ['forge'],
   barcode_scanner:    ['forge'],
   wearable_sync:      ['forge'],
@@ -1399,7 +1409,7 @@ async function loadSubscription(req, res, next) {
     // is actually paid/active. PATCH /api/subscription/tier lets a user set a
     // cosmetic tier "preference" during the trial; without this guard that value
     // would persist as a real entitlement after the trial ends, letting anyone keep
-    // Steel/Forge access for free. Trial access is granted separately below
+    // Forge access for free. Trial access is granted separately below
     // (accessTier='forge'). Exempt accounts bypass this.
     const PAID_STATUSES = ['active', 'past_due', 'lifetime'];
     if (!isExempt && effectiveStatus !== 'trial' && !PAID_STATUSES.includes(effectiveStatus)) {
@@ -2347,7 +2357,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
     const { messages, context, language } = req.body;
     if (!messages?.length) return res.status(400).json({ error: 'No messages' });
 
-    // Check Iron message limit (20/month) — use actual tier not accessTier
+    // Check the Iron message limit (20/month) — use actual tier not accessTier
     const { isExempt } = req.subscription;
     const checkTier = req.subscription?.tier || 'iron';
     if (!isExempt && !hasAccess('unlimited_coach', checkTier, false)) {
@@ -2355,7 +2365,7 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
       if (usage >= 20) {
         return res.status(403).json({
           error: 'message_limit_reached',
-          message: 'You have used all 20 AI coach messages this month. Upgrade to Steel for unlimited coaching.',
+          message: 'You have used all 20 AI coach messages this month. Upgrade to Forge for unlimited coaching.',
           usage,
           limit: 20
         });
@@ -2421,12 +2431,12 @@ app.post('/api/chat', requireAuth, loadSubscription, async (req, res) => {
       .trim();
 
     // ── PLAN-EDITING TIER GATE (Audit 5, F4) ──
-    // plan_editing is a Steel+ feature (trial/exempt resolve to accessTier 'forge', so they
+    // plan_editing is a Forge feature (trial/exempt resolve to accessTier 'forge', so they
     // keep it). Iron users still get the chat reply — the PLAN_UPDATE tags are already
     // stripped from cleanReply above; we append an upgrade note and skip applying any edit.
     const canEditPlan = hasAccess('plan_editing', req.subscription?.accessTier, req.subscription?.isExempt);
     if (planUpdateMatches.length > 0 && !canEditPlan) {
-      cleanReply = cleanReply + '\n\n' + 'Plan editing is available on Steel and above. Upgrade to let your AI coach update your programme.';
+      cleanReply = cleanReply + '\n\n' + 'Plan editing is available on Forge. Upgrade to let your AI coach update your programme.';
     }
 
     if (planUpdateMatches.length > 0 && planData && canEditPlan) {
@@ -2708,9 +2718,9 @@ app.post('/api/checkin', requireAuth, loadSubscription, async (req, res) => {
       return res.json({ disabled: true });
     }
 
-    // Enforce the monthly AI cap for Iron tier (mirrors /api/chat). loadSubscription
-    // resolves exempt/trial accounts to a non-iron tier, so they bypass this automatically.
-    if (req.subscription?.tier === 'iron') {
+    // Enforce the monthly AI cap (mirrors /api/chat). Driven by TIER_FEATURES rather than a
+    // hardcoded tier name so the two enforcement points cannot drift apart when tiers change.
+    if (!req.subscription?.isExempt && !hasAccess('unlimited_coach', req.subscription?.tier || 'iron', false)) {
       const usage = await getCoachUsage(req.user.id);
       if (usage >= 20) {
         return res.status(429).json({
@@ -3968,7 +3978,7 @@ app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
     if (!tier || !billing) return res.status(400).json({ error: 'Missing tier or billing' });
 
     // Validate tier + billing against an allow-list — never trust raw client values.
-    if (!['iron','steel','forge','coach_starter','coach_pro','coach_elite'].includes(tier)) {
+    if (!['iron','forge','coach_starter','coach_pro','coach_elite'].includes(tier)) {
       return res.status(400).json({ error: 'Invalid tier' });
     }
     if (!['monthly','annual','lifetime'].includes(billing)) {
@@ -3976,19 +3986,20 @@ app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
     }
 
     // Derive promo eligibility server-side instead of trusting a client-supplied is_promo.
-    // A tier only qualifies for promo pricing while ITS launch promo is still active.
+    // Launch pricing now covers BOTH paid tiers and is admin-toggled only — no headcount cap.
     const pricingStatus = await getLaunchPricingStatus();
-    const is_promo = (tier === 'steel' && !!pricingStatus?.steel_active) ||
+    const is_promo = (tier === 'iron'  && !!pricingStatus?.iron_active) ||
                      (tier === 'forge' && !!pricingStatus?.forge_active) || false;
 
     const userId = req.user.id;
     const userEmail = req.user.email;
 
-    // Determine price ID
+    // Determine price ID. is_promo is already false for every non-paid-tier value, so no
+    // extra tier guard is needed here — coach_* always takes the plain `${tier}_${billing}` key.
     let priceKey;
     if (billing === 'lifetime') {
       priceKey = `${tier}_founding`;
-    } else if (is_promo && (tier === 'steel' || tier === 'forge')) {
+    } else if (is_promo) {
       priceKey = `${tier}_${billing}_promo`;
     } else {
       priceKey = `${tier}_${billing}`;
@@ -4229,7 +4240,7 @@ app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, re
 // ── ADMIN — Set user tier ──────────────────────
 // ── USER TIER SELECTION (trial-only cosmetic preview) ──
 // SECURITY (F3 — Claude 5 audit, HIGH): tier self-selection is a TRIAL-ONLY preview so the
-// UI can show "you're on Steel" during the free trial. It grants no paid entitlement and is
+// UI can show "you're on Forge" during the free trial. It grants no paid entitlement and is
 // gated to subscription_status === 'trial' below. A paid (active/past_due/lifetime) or expired
 // account is rejected with 403: loadSubscription's ENTITLEMENT GUARD honours a stored
 // subscription_tier whenever the status is paid, so WITHOUT this gate an active lower-tier
@@ -4238,7 +4249,7 @@ app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, re
 // customer.subscription.updated → getTierFromPriceId).
 app.patch('/api/subscription/tier', requireAuth, async (req, res) => {
   const { tier } = req.body;
-  const validTiers = ['iron', 'steel', 'forge'];
+  const validTiers = ['iron', 'forge'];
   if (!validTiers.includes(tier)) return res.status(400).json({ error: 'Invalid tier' });
   try {
     // Trial-only gate (F3): load the caller's current status and refuse the change for any
@@ -4329,9 +4340,9 @@ app.patch('/api/admin/users/:userId/tier', requireAuth, requireAdmin, async (req
   const { userId } = req.params;
   const { tier, is_exempt } = req.body;
 
-  const validTiers = ['iron', 'steel', 'forge'];
+  const validTiers = ['iron', 'forge'];
   if (tier && !validTiers.includes(tier)) {
-    return res.status(400).json({ error: 'Invalid tier. Must be iron, steel, or forge.' });
+    return res.status(400).json({ error: 'Invalid tier. Must be iron or forge.' });
   }
 
   try {
@@ -4408,8 +4419,8 @@ app.get('/api/version', (req, res) => {
 // NOTE: table is `programmes` (pre-existing live feature + data), NOT
 // `saved_programmes` from the task spec. Extended in place with a `description`
 // column rather than forking a parallel table. Tier limits: Iron = 1 (upgrade
-// prompt), Steel = 3, Forge/exempt = unlimited. See decisions.md.
-const PROGRAMME_TIER_LIMIT = { iron: 1, steel: 3, forge: Infinity };
+// prompt), Forge/exempt = unlimited. See decisions.md.
+const PROGRAMME_TIER_LIMIT = { iron: 1, forge: Infinity };
 
 // ── The degrade-without-column fallback, and the bug it used to cause ────────────────────
 // Both inserts that carry a programme_type (POST /api/programmes below, and
@@ -4549,16 +4560,18 @@ app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
       .or('is_archived.is.null,is_archived.eq.false'); // FIX 8: archived don't count toward the limit
 
     if ((count || 0) >= limit) {
-      // Iron → upgrade prompt; Steel → at its 3-programme cap.
-      if (tier === 'iron') {
+      // No multiple-programme entitlement → upgrade prompt. Driven by hasAccess, not a
+      // hardcoded tier name. The limit_reached branch below is a safety net: Forge is
+      // Infinity, so with two tiers nothing reaches it.
+      if (!hasAccess('multiple_programmes', tier, isExempt)) {
         return res.status(409).json({
           error: 'upgrade_required',
-          message: 'Save multiple programmes for different goals — available on Steel and Forge.'
+          message: 'Save multiple programmes for different goals. Available on Forge.'
         });
       }
       return res.status(409).json({
         error: 'programme_limit_reached',
-        message: `You've reached your ${limit} programme limit on ${tier[0].toUpperCase() + tier.slice(1)}. Upgrade to Forge for unlimited programmes.`
+        message: `You've reached your ${limit} programme limit. Upgrade to Forge for unlimited programmes.`
       });
     }
 
@@ -4607,7 +4620,7 @@ app.post('/api/programmes', requireAuth, loadSubscription, async (req, res) => {
 // Builds a synthetic profile from the supplied answers (physical stats fall back to
 // the user's saved profile), runs the same AI plan generation as onboarding, and
 // saves the result to `programmes` with is_active:false. Tier-gated: Iron locked,
-// Steel max 3, Forge unlimited.
+// Forge unlimited.
 app.post('/api/programmes/generate', requireAuth, loadSubscription, async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Transfer-Encoding', 'chunked');
@@ -4618,8 +4631,8 @@ app.post('/api/programmes/generate', requireAuth, loadSubscription, async (req, 
     const { accessTier, isExempt } = req.subscription;
     const tier = isExempt ? 'forge' : (accessTier || 'iron');
     const limit = PROGRAMME_TIER_LIMIT[tier] != null ? PROGRAMME_TIER_LIMIT[tier] : 1;
-    if (tier === 'iron') {
-      return sendResponse(409, { error: 'upgrade_required', message: 'Save multiple programmes for different goals — available on Steel and Forge.' });
+    if (!hasAccess('multiple_programmes', tier, isExempt)) {
+      return sendResponse(409, { error: 'upgrade_required', message: 'Save multiple programmes for different goals. Available on Forge.' });
     }
     const { count } = await supabase.from('programmes')
       .select('id', { count: 'exact', head: true }).eq('user_id', req.user.id)
@@ -4976,7 +4989,7 @@ app.get('/api/export/history', requireAuth, loadSubscription, async (req, res) =
     if (!hasAccess('export_history', accessTier, isExempt)) {
       return res.status(403).json({
         error: 'feature_locked',
-        message: 'Workout history export is available on Steel and Forge plans.'
+        message: 'Workout history export is available on the Forge plan.'
       });
     }
 
@@ -5031,7 +5044,7 @@ app.post('/api/review/generate', requireAuth, loadSubscription, async (req, res)
   try {
     const { accessTier, isExempt } = req.subscription;
     if (!hasAccess('weekly_review', accessTier, isExempt)) {
-      return res.status(403).json({ error: 'feature_locked', message: 'Weekly reviews are available on Steel and above.' });
+      return res.status(403).json({ error: 'feature_locked', message: 'Weekly reviews are available on the Forge plan.' });
     }
 
     const userId = req.user.id;
@@ -5794,8 +5807,15 @@ app.post('/api/exercise/remap-plan', requireAuth, async (req, res) => {
 // ═══════════════════════════════════════════════════════
 // LAUNCH PRICING SYSTEM
 // ═══════════════════════════════════════════════════════
-
-const LAUNCH_PROMO_THRESHOLD = 500;
+// Manual only. There is NO headcount cap. LAUNCH_PROMO_THRESHOLD (was 500) is gone, along
+// with every `*_sold < threshold` test — those four sites used to switch launch pricing off
+// by themselves once 500 subscribers signed up. The *_sold counters are telemetry and are
+// read by nothing that decides eligibility. Only the admin toggle ends a tier's launch price.
+//
+// Grandfathering needs no code: a Stripe subscription stays bound to the Price it was
+// created with, so an active subscriber keeps the launch rate. Cancel and resubscribe and
+// checkout re-derives the Price from this config at that moment. Never DELETE a launch
+// Price in Stripe — archive it, and keep its key in STRIPE_PRICES.
 
 // Get current launch pricing status
 async function getLaunchPricingStatus() {
@@ -5805,23 +5825,20 @@ async function getLaunchPricingStatus() {
       .select('*')
       .maybeSingle();
     if (!data) {
-      // Default state — both active, 0 sold
-      return {
-        steel_active: true, steel_sold: 0, steel_threshold: LAUNCH_PROMO_THRESHOLD,
-        forge_active: true, forge_sold: 0, forge_threshold: LAUNCH_PROMO_THRESHOLD,
-      };
+      // No config row — launch pricing is live on both tiers.
+      return { iron_active: true, iron_sold: 0, forge_active: true, forge_sold: 0 };
     }
     return {
-      steel_active: data.steel_active && data.steel_sold < LAUNCH_PROMO_THRESHOLD,
-      steel_sold: data.steel_sold || 0,
-      steel_threshold: LAUNCH_PROMO_THRESHOLD,
-      forge_active: data.forge_active && data.forge_sold < LAUNCH_PROMO_THRESHOLD,
+      iron_active: data.iron_active ?? true,
+      iron_sold: data.iron_sold || 0,
+      forge_active: data.forge_active ?? true,
       forge_sold: data.forge_sold || 0,
-      forge_threshold: LAUNCH_PROMO_THRESHOLD,
     };
   } catch(e) {
     console.error('getLaunchPricingStatus error:', e.message);
-    return { steel_active: false, steel_sold: 0, forge_active: false, forge_sold: 0 };
+    // Fail closed: on a read error nobody gets promo pricing. Charging standard is
+    // recoverable; undercharging on a permanent rate is not.
+    return { iron_active: false, iron_sold: 0, forge_active: false, forge_sold: 0 };
   }
 }
 
@@ -5847,12 +5864,12 @@ app.get('/api/admin/launch-pricing', requireAuth, requireAdmin, async (req, res)
 
 app.patch('/api/admin/launch-pricing', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const { steel_active, forge_active } = req.body;
+    const { iron_active, forge_active } = req.body;
     const { data: config } = await supabase.from('launch_pricing_config').select('*').maybeSingle();
     await supabase.from('launch_pricing_config').upsert({
       id: 1,
-      steel_active: steel_active !== undefined ? steel_active : (config?.steel_active ?? true),
-      steel_sold: config?.steel_sold || 0,
+      iron_active: iron_active !== undefined ? iron_active : (config?.iron_active ?? true),
+      iron_sold: config?.iron_sold || 0,
       forge_active: forge_active !== undefined ? forge_active : (config?.forge_active ?? true),
       forge_sold: config?.forge_sold || 0,
     });
@@ -6062,7 +6079,7 @@ app.post('/api/push/grace-period', requireAuth, async (req, res) => {
     if (profile?.subscription_status === 'active') return;
     await sendPushToUser(userId,
       'Your coach has something to say',
-      'Your AI coach has insight on your last session. Upgrade to Steel to hear it.'
+      'Your AI coach has insight on your last session. Upgrade to Forge to hear it.'
     );
   }, 24 * 60 * 60 * 1000);
   // Notification 3 — 48 hours
@@ -6072,14 +6089,14 @@ app.post('/api/push/grace-period', requireAuth, async (req, res) => {
     // Check founding member slots
     const { data: slots } = await supabase.from('founding_member_config').select('*').maybeSingle();
     const ironAvailable = (slots?.iron_sold || 0) < (slots?.iron_total || 500);
-    const steelAvailable = (slots?.steel_sold || 0) < (slots?.steel_total || 250);
-    // Check Steel launch promo
+    const forgeAvailable = (slots?.forge_sold || 0) < (slots?.forge_total || 250);
+    // Launch pricing status — admin-toggled, no headcount cap
     const promoStatus = await getLaunchPricingStatus();
-    // Priority: A (founding) → C (steel promo) → B (fallback)
-    if (ironAvailable || steelAvailable) {
-      await sendPushToUser(userId, 'Founding Member slots are going', 'Lifetime access to FORGE — pay once, train forever. Limited slots remaining.');
-    } else if (promoStatus.steel_active) {
-      await sendPushToUser(userId, 'Launch pricing is still live', 'Steel is CHF 11.99/mo while spots remain. That price locks in permanently — it never increases.');
+    // Priority: A (founding) → C (launch pricing) → B (fallback)
+    if (ironAvailable || forgeAvailable) {
+      await sendPushToUser(userId, 'Founding Member slots are going', 'Lifetime access to FORGE. Pay once, train forever. Limited slots remaining.');
+    } else if (promoStatus.forge_active) {
+      await sendPushToUser(userId, 'Launch pricing is still live', 'Forge is CHF 6.99/mo on annual while launch pricing runs. That rate stays yours for as long as your subscription stays active.');
     } else {
       await sendPushToUser(userId, 'Your coaching is on hold', 'It takes 30 seconds to restart it.');
     }
@@ -6099,9 +6116,9 @@ app.post('/api/push/founding-member-notify', requireAuth, async (req, res) => {
     if (profile?.subscription_status === 'active') return res.json({ ok: true, skipped: true });
     // Check slots
     const { data: slots } = await supabase.from('founding_member_config').select('*').maybeSingle();
-    const available = ((slots?.iron_sold || 0) < (slots?.iron_total || 500)) || ((slots?.steel_sold || 0) < (slots?.steel_total || 250));
+    const available = ((slots?.iron_sold || 0) < (slots?.iron_total || 500)) || ((slots?.forge_sold || 0) < (slots?.forge_total || 250));
     if (!available) return res.json({ ok: true, skipped: true });
-    await sendPushToUser(userId, 'Founding Member access — limited slots', 'Pay once, train forever. First 500 members only. You\'re eligible now.');
+    await sendPushToUser(userId, 'Founding Member access is open', 'Pay once, train forever. Iron CHF 149 or Forge CHF 249, one payment. 750 slots total.');
     await supabase.from('profiles').update({ founding_notified_at: new Date().toISOString() }).eq('id', userId);
     res.json({ ok: true });
   } catch(err) { console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
@@ -6148,8 +6165,8 @@ app.get('/api/founding-member/slots', async (req, res) => {
     res.json({
       iron_total: data?.iron_total || 500,
       iron_sold: data?.iron_sold || 0,
-      steel_total: data?.steel_total || 250,
-      steel_sold: data?.steel_sold || 0,
+      forge_total: data?.forge_total || 250,
+      forge_sold: data?.forge_sold || 0,
     });
   } catch(e) { console.error('Server error:', e); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -6165,8 +6182,8 @@ app.post('/api/founding-member/claim', requireAuth, async (req, res) => {
     return res.status(403).json({
       error: 'Founding member claims are closed.'
     });
-    const { tier } = req.body; // 'iron' or 'steel'
-    if (!['iron','steel'].includes(tier)) return res.status(400).json({ error: 'Invalid tier' });
+    const { tier } = req.body; // 'iron' or 'forge'
+    if (!['iron','forge'].includes(tier)) return res.status(400).json({ error: 'Invalid tier' });
     const { data: config } = await supabase.from('founding_member_config').select('*').maybeSingle();
     const sold = config?.[`${tier}_sold`] || 0;
     const total = config?.[`${tier}_total`] || (tier === 'iron' ? 500 : 250);
@@ -6176,7 +6193,7 @@ app.post('/api/founding-member/claim', requireAuth, async (req, res) => {
       id: config?.id || 1,
       [`${tier}_sold`]: sold + 1,
       iron_total: config?.iron_total || 500,
-      steel_total: config?.steel_total || 250,
+      forge_total: config?.forge_total || 250,
     });
     // Set user to lifetime
     await supabase.from('profiles').update({
@@ -6453,7 +6470,7 @@ const PROGRAMME_NAME_MAX = 80;
 // is_active:false — a disconnect must never change which programme the client is training on.
 //
 // Deliberately a direct insert, NOT POST /api/programmes: that route enforces
-// PROGRAMME_TIER_LIMIT (iron:1, steel:3) and would 409 for most clients, silently losing the
+// PROGRAMME_TIER_LIMIT (iron:1) and would 409 for most clients, silently losing the
 // programme at the one moment it cannot be rebuilt. Onboarding inserts directly for the same
 // reason (server.js:1887).
 //
