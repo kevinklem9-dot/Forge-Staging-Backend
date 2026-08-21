@@ -1564,12 +1564,26 @@ app.get('/api/vapid-public-key', (req, res) => {
   res.json({ key: process.env.VAPID_PUBLIC_KEY || '' });
 });
 
+// Minimum age to hold a FORGE account. Must stay in step with terms.html section 03
+// ("You must be at least 18 years old") and privacy.html section 10. Enforced on the
+// signup consent copy and on every write to profiles.age via PATCH /api/profile.
+const MIN_SIGNUP_AGE = 18;
+
+// The literal "Last updated" string from privacy.html / terms.html. Stored per account at
+// signup so a future policy change is detectable and re-consent can be targeted at the
+// users who accepted the older text. Bump this whenever those documents change.
+const PRIVACY_POLICY_VERSION = 'August 2026';
+
 // ── SIGNUP — Check email + create account ──────
 app.post('/api/signup', signupLimiter, async (req, res) => {
-  const { email, password, name, language } = req.body;
+  const { email, password, name, language, accepted_terms } = req.body;
   if (!email || !password || !name) return res.status(400).json({ error: 'All fields required.' });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Invalid email address.' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+  // Consent is required, and the client checkbox is not enforcement — /api/signup is a
+  // public POST. A missing or falsy flag is rejected here regardless of what the UI did.
+  if (accepted_terms !== true)
+    return res.status(400).json({ error: 'consent_required' });
 
   try {
     // Use signUp (not admin.createUser) so Supabase sends confirmation email automatically
@@ -1604,34 +1618,52 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
     // Retry up to 5 times — trigger may not have created the profile row yet
     if (data.user?.id) {
       const trialEndsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      // ONE payload shared by both write paths below (the retry loop AND the upsert
+      // fallback). Consent must ride on both — writing it on only one of them lets an
+      // account exist with no consent record whenever the retry loop exhausts.
+      const profilePayload = {
+        name,
+        subscription_tier: 'iron',
+        subscription_status: 'trial',
+        trial_ends_at: trialEndsAt,
+        preferred_language: language || 'en',
+        terms_accepted_at: new Date().toISOString(),
+        privacy_policy_version: PRIVACY_POLICY_VERSION
+      };
+      // If the consent migration has not been run yet those two columns do not exist and
+      // the write fails wholesale — which would break signup for everyone. Detect that
+      // specific error, drop the two columns, and let the rest of the profile land.
+      const isMissingConsentColumn = (err) =>
+        !!err && (err.message?.includes('terms_accepted_at') || err.message?.includes('privacy_policy_version'));
+      const stripConsent = () => {
+        delete profilePayload.terms_accepted_at;
+        delete profilePayload.privacy_policy_version;
+        console.error('[signup] consent columns missing — run the consent migration. Profile written without a consent record.');
+      };
+
       let profileSet = false;
       for (let attempt = 1; attempt <= 5; attempt++) {
         await new Promise(r => setTimeout(r, 300 * attempt)); // 300ms, 600ms, 900ms...
         const { data: updated, error: updateErr } = await supabase
           .from('profiles')
-          .update({
-            name,
-            subscription_tier: 'iron',
-            subscription_status: 'trial',
-            trial_ends_at: trialEndsAt,
-            preferred_language: language || 'en'
-          })
+          .update(profilePayload)
           .eq('id', data.user.id)
           .select('id')
           .maybeSingle();
         if (updated?.id) { profileSet = true; break; }
+        if (isMissingConsentColumn(updateErr)) stripConsent();
         if (attempt === 5) console.error('Profile update failed after 5 attempts:', updateErr?.message);
       }
-      // If profile row still doesn't exist, upsert it
+      // If profile row still doesn't exist, upsert it — same payload, consent included.
       if (!profileSet) {
-        await supabase.from('profiles').upsert({
+        const { error: upsertErr } = await supabase.from('profiles').upsert({
           id: data.user.id,
-          name,
-          subscription_tier: 'iron',
-          subscription_status: 'trial',
-          trial_ends_at: trialEndsAt,
-          preferred_language: language || 'en'
+          ...profilePayload
         });
+        if (isMissingConsentColumn(upsertErr)) {
+          stripConsent();
+          await supabase.from('profiles').upsert({ id: data.user.id, ...profilePayload });
+        }
       }
 
       // Add to Mailchimp audience (fire-and-forget)
@@ -2308,10 +2340,19 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
     const body = req.body;
 
     // A) Numeric range validation
+    // Minimum age is 18 — matches terms.html section 03 and privacy.html section 10.
+    // This is the ONLY real enforcement point: both write paths (the onboarding submit
+    // and a raw PATCH) land here, so raising the floor here raises it everywhere.
+    // The two failure codes are deliberately distinct. `invalid_age` means the value is
+    // nonsense (150, -4, 'abc'); `under_minimum_age` means the value is real but too
+    // young. The client maps the second to a terminal message — it used to surface as a
+    // generic save failure that told the user to check their connection.
     if (body.age !== undefined) {
       const age = Number(body.age);
-      if (!Number.isInteger(age) || age < 13 || age > 100)
-        return res.status(400).json({ error: 'Invalid age' });
+      if (!Number.isInteger(age) || age < 1 || age > 100)
+        return res.status(400).json({ error: 'invalid_age' });
+      if (age < MIN_SIGNUP_AGE)
+        return res.status(400).json({ error: 'under_minimum_age', minimum: MIN_SIGNUP_AGE });
     }
     if (body.height_cm !== undefined) {
       const h = Number(body.height_cm);
@@ -3576,6 +3617,11 @@ function buildPlanPrompt(profile, language, mwExercises) {
     ? `Session durations vary by day (minutes): ${JSON.stringify(profile.session_duration_by_day || {})}`
     : `Each session is approximately ${profile.session_duration_mins || 60} minutes.`;
 
+  // NOTE on the `${profile.age || 18}` below: that 18 is a PLAN-QUALITY fallback for a
+  // null age (a profile that never finished onboarding), NOT an age gate. It happens to
+  // equal MIN_SIGNUP_AGE now that the minimum is 18 — that is a coincidence, not
+  // enforcement. Never raise or lower the minimum by editing this line; the only real
+  // gate is the age check in PATCH /api/profile.
   return `You are an expert strength and conditioning coach. Generate a completely personalised workout and nutrition plan.
 
 PROFILE:
