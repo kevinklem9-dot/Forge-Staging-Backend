@@ -6127,21 +6127,94 @@ app.post('/api/push/founding-member-notify', requireAuth, async (req, res) => {
 // ═══════════════════════════════════════════════════════
 // TESTIMONIAL — dynamic, updatable without code deploy
 // ═══════════════════════════════════════════════════════
+// PER-LANGUAGE. The canonical stored/returned shape is:
+//   { en: { quote, attribution }, fr: { quote, attribution } }
+//
+// It used to be a single flat { quote, attribution } holding English only, and the client
+// preferred that fetched value over its own translated strings — so French users always
+// read English. app_config currently holds ZERO rows, so in practice every user was being
+// served the hardcoded default below; that default is now bilingual.
+//
+// GET returns the WHOLE object rather than taking a ?lang= param. Two reasons: the client
+// fetches once into module state and re-renders the upgrade sheet on every billing toggle
+// and language switch WITHOUT re-fetching, so a per-language response would go stale the
+// moment someone switched language; and /api/testimonial is in PUBLIC_CACHEABLE
+// (Cache-Control: public, max-age=300), so one language-independent URL keeps a single
+// cache entry instead of fragmenting it per query string and needing a Vary header.
+const TESTIMONIAL_LANGS = ['en', 'fr'];
+
+const TESTIMONIAL_DEFAULT = {
+  en: {
+    quote: "Built me a full programme in under 2 minutes. I've tried four other apps. This is the first one that felt like it actually knew what I needed.",
+    attribution: "— James, training for football season"
+  },
+  fr: {
+    quote: "Il m'a construit un programme complet en moins de 2 minutes. J'ai essayé quatre autres applis. C'est la première qui avait vraiment l'air de savoir ce qu'il me fallait.",
+    attribution: "— James, en prépa pour la saison de foot"
+  }
+};
+
+function isTestimonialEntry(v) {
+  return !!v && typeof v === 'object'
+    && typeof v.quote === 'string' && v.quote.trim() !== ''
+    && typeof v.attribution === 'string';
+}
+
+// Always returns the per-language shape, whatever is in the row.
+// BACKWARD COMPATIBILITY: a legacy flat { quote, attribution } row is mirrored into BOTH
+// languages rather than being paired with the built-in French default. That preserves
+// exactly the text an admin chose — substituting a French quote they never wrote would
+// silently put different words in front of French users. It leaves those users reading the
+// admin's original language until the row is re-saved through PATCH below, which is the
+// pre-existing behaviour, not a new regression.
+function normaliseTestimonial(stored) {
+  if (!stored || typeof stored !== 'object') return TESTIMONIAL_DEFAULT;
+  const hasLangKeys = TESTIMONIAL_LANGS.some(l => stored[l] !== undefined);
+  if (!hasLangKeys) {
+    if (!isTestimonialEntry(stored)) return TESTIMONIAL_DEFAULT;
+    console.warn('[testimonial] legacy flat row detected — re-save via PATCH /api/admin/testimonial to set a per-language quote');
+    const flat = { quote: stored.quote, attribution: stored.attribution || '' };
+    return TESTIMONIAL_LANGS.reduce((o, l) => { o[l] = { ...flat }; return o; }, {});
+  }
+  return TESTIMONIAL_LANGS.reduce((o, l) => {
+    o[l] = isTestimonialEntry(stored[l])
+      ? { quote: stored[l].quote, attribution: stored[l].attribution || '' }
+      : TESTIMONIAL_DEFAULT[l];
+    return o;
+  }, {});
+}
+
 app.get('/api/testimonial', async (req, res) => {
   try {
     const { data } = await supabase.from('app_config').select('value').eq('key', 'paywall_testimonial').maybeSingle();
-    res.json(data?.value || {
-      quote: "Built me a full programme in under 2 minutes. I've tried four other apps. This is the first one that felt like it actually knew what I needed.",
-      attribution: "— James, training for football season"
-    });
+    res.json(normaliseTestimonial(data?.value));
   } catch(e) { console.error('Server error:', e); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
 app.patch('/api/admin/testimonial', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const { quote, attribution } = req.body;
-    await supabase.from('app_config').upsert({ key: 'paywall_testimonial', value: { quote, attribution } }, { onConflict: 'key' });
-    res.json({ ok: true });
+    const body = req.body || {};
+    // Reject a single-language payload rather than storing something the client cannot
+    // fully read: the frontend selects by language, so a half-filled row silently serves
+    // one audience a fallback the admin never chose.
+    const missing = TESTIMONIAL_LANGS.filter(l => !isTestimonialEntry(body[l]));
+    if (missing.length) {
+      return res.status(400).json({
+        error: 'invalid_shape',
+        message: 'Testimonial must supply { quote, attribution } for every language: ' + TESTIMONIAL_LANGS.join(', ') + '. Missing or invalid: ' + missing.join(', ') + '.',
+        expected: { en: { quote: 'string', attribution: 'string' }, fr: { quote: 'string', attribution: 'string' } }
+      });
+    }
+    // Length caps: this text is rendered into innerHTML on the client (escaped there).
+    const value = TESTIMONIAL_LANGS.reduce((o, l) => {
+      o[l] = {
+        quote: String(body[l].quote).slice(0, 500),
+        attribution: String(body[l].attribution || '').slice(0, 120)
+      };
+      return o;
+    }, {});
+    await supabase.from('app_config').upsert({ key: 'paywall_testimonial', value }, { onConflict: 'key' });
+    res.json({ ok: true, value });
   } catch(e) { console.error('Server error:', e); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
