@@ -24,6 +24,10 @@ const MW_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 // IDs in-memory so a retry can't double-apply a handler (e.g. double credits). Covers
 // the common retry case within one server instance; pruned below to stay bounded.
 const processedWebhookEvents = new Set();
+// Events currently being handled by THIS process. Needed because an event is now marked
+// processed only AFTER its work succeeds: without this, a Stripe retry landing while the
+// first delivery is still running would pass both dedupe guards and process twice.
+const inFlightWebhookEvents = new Set();
 
 // ── YOUTUBE VIDEO LOOKUP ─────────────────────────────────
 // Replaces MuscleWiki — YouTube Data API v3, 10k free calls/day
@@ -568,9 +572,11 @@ async function saveExerciseLookup(aiName, mwExercise) {
   };
   _localLookupCache.set(aiNameLower, entry);
   // Upsert to Supabase — fire and forget
+  // .then(fn, fn) — NOT .catch(). The Supabase query builder is a thenable with no
+  // .catch() method (see the webhook incident in known-bugs.md); calling it throws.
   supabase.from('exercise_lookup_cache').upsert({
     ai_name: aiNameLower, ...entry, updated_at: new Date().toISOString()
-  }, { onConflict: 'ai_name' }).catch(() => {});
+  }, { onConflict: 'ai_name' }).then(() => {}, () => {});
 }
 
 // ── CLIENTS ────────────────────────────────────
@@ -777,6 +783,17 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
   // Set stays as a fast in-process cache (avoids a DB read for a repeat within one process);
   // stripe_webhook_events is the durable source of truth that survives restarts and is
   // shared across instances. Keyed on the verified event.id.
+  //
+  // ── ORDERING — the defect that orphaned a real payment ────────────────────────────────
+  // Both markers used to be set BEFORE the switch ran. The handler then died on the
+  // idempotency insert, so the event was already flagged as processed; Stripe's retry 14
+  // seconds later hit the guard below, got 200, and skipped the work entirely. The
+  // subscription was live, the profile stayed 'expired' with a null subscription id, and
+  // because Stripe saw a 200 it never retried again. The customer was asked to pay twice.
+  //
+  // An event is now marked processed ONLY after its work completes — see MARK PROCESSED
+  // at the end of the try block. Marking late means a crash leaves NO marker, so Stripe's
+  // retry finds a clean slate and re-runs the work, which is the entire point of the retry.
   if (processedWebhookEvents.has(event.id)) {
     console.log('[webhook] duplicate ignored (cache):', event.id);
     return res.json({ received: true });
@@ -791,21 +808,16 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     processedWebhookEvents.add(event.id); // warm the in-process cache
     return res.json({ received: true });
   }
-  // New event — record it BEFORE running the handlers so a near-simultaneous retry is more
-  // likely to be caught. Fast cache first, then the durable row.
-  processedWebhookEvents.add(event.id);
-  // Prune oldest entries to prevent unbounded growth (add first, then prune).
-  if (processedWebhookEvents.size > 10000) {
-    const first = processedWebhookEvents.values().next().value;
-    processedWebhookEvents.delete(first);
+
+  // In-flight guard. With marking moved to the end, a retry that lands WHILE the first
+  // delivery is still running would otherwise pass both guards above and process twice.
+  // 409 (not 200) so Stripe retries later: answering 200 here would report success for
+  // work that has not finished and might still fail — exactly the failure being fixed.
+  if (inFlightWebhookEvents.has(event.id)) {
+    console.log('[webhook] already in flight:', event.id);
+    return res.status(409).json({ error: 'in_flight' });
   }
-  // Durable marker. The insert must NOT block webhook processing — a DB hiccup here should
-  // never turn into a 500 that makes Stripe retry a fully-processed event, so errors are
-  // caught and logged, not thrown.
-  await supabase
-    .from('stripe_webhook_events')
-    .insert({ event_id: event.id })
-    .catch(e => console.error('[webhook] idempotency insert failed:', event.id, e));
+  inFlightWebhookEvents.add(event.id);
 
   try {
     switch (event.type) {
@@ -1092,10 +1104,38 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         break;
       }
     }
+
+    // ── MARK PROCESSED — only now that the work above has succeeded ──────────────────
+    // Deliberately AFTER the switch. If anything above threw we fall to the catch, do NOT
+    // mark, and return 500 so Stripe retries into a clean slate.
+    processedWebhookEvents.add(event.id);
+    // Prune oldest entries to prevent unbounded growth (add first, then prune).
+    if (processedWebhookEvents.size > 10000) {
+      const first = processedWebhookEvents.values().next().value;
+      processedWebhookEvents.delete(first);
+    }
+    // Durable marker. NON-FATAL by design, and it now runs AFTER the profile write, so a
+    // failure here can never block that write. Both failure modes are covered: PostgREST
+    // reports query errors by RESOLVING with { error } rather than rejecting, while a
+    // transport failure rejects. The previous `.catch(...)` handled neither — the query
+    // builder is a thenable with no .catch() method, so the call itself threw.
+    try {
+      const { error: markErr } = await supabase
+        .from('stripe_webhook_events')
+        .insert({ event_id: event.id });
+      if (markErr) console.error('[webhook] idempotency insert failed:', event.id, markErr.message);
+    } catch (e) {
+      console.error('[webhook] idempotency insert threw:', event.id, e.message);
+    }
+    // Still 200 even if the marker failed. The work is done; a 500 here would make Stripe
+    // retry and re-run the non-idempotent counters. Given the choice, a possible duplicate
+    // is far cheaper than re-charging or losing a completed payment.
     res.json({ received: true });
   } catch(err) {
     console.error('Webhook handler error:', err.message);
     console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    inFlightWebhookEvents.delete(event.id);
   }
 });
 
@@ -1635,7 +1675,12 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
           const extendedTrial = new Date(Date.now() + (codeRow.trial_days || 14) * 24 * 60 * 60 * 1000).toISOString();
           await supabase.from('profiles').update({ trial_ends_at: extendedTrial }).eq('id', data.user.id);
           await supabase.from('creator_codes').update({ uses_count: (codeRow.uses_count || 0) + 1 }).eq('id', codeRow.id);
-          await supabase.from('creator_code_uses').insert({ code_id: codeRow.id, user_id: data.user.id, used_at: new Date().toISOString() }).catch(() => {});
+          // Non-fatal, but the builder is a thenable with no .catch() — await it and read
+          // the returned { error } instead, with a try/catch for transport failures.
+          try {
+            const { error: _ccuErr } = await supabase.from('creator_code_uses').insert({ code_id: codeRow.id, user_id: data.user.id, used_at: new Date().toISOString() });
+            if (_ccuErr) console.error('[signup] creator_code_uses insert failed:', _ccuErr.message);
+          } catch (e) { console.error('[signup] creator_code_uses insert threw:', e.message); }
         }
       }
     }
