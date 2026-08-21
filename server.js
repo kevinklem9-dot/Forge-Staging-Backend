@@ -852,7 +852,12 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
               if (coachBio) update.coach_bio = coachBio;
               if (coachTitle) update.coach_title = coachTitle;
             }
-            await supabase.from('profiles').update(update).eq('id', userId);
+            // ENTITLEMENT-BEARING. Supabase RESOLVES with { error } rather than rejecting, so a
+            // discarded error would mark the event processed and return 200 while the coach's plan
+            // never activated — the same silent orphaning as the .catch()/idempotency incident.
+            // Throwing lands in the handler's catch: no marker is written, so Stripe retries.
+            const { error: coachSetupErr } = await supabase.from('profiles').update(update).eq('id', userId);
+            if (coachSetupErr) throw coachSetupErr;
           }
           break;
         }
@@ -861,12 +866,14 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
 
         if (billing === 'lifetime') {
           // Founding member — set lifetime status
-          await supabase.from('profiles').update({
+          // ENTITLEMENT-BEARING — must throw. See the note on the coach update above.
+          const { error: lifetimeErr } = await supabase.from('profiles').update({
             subscription_tier: tier,
             subscription_status: 'lifetime',
             lifetime_tier: tier,
             stripe_customer_id: session.customer,
           }).eq('id', userId);
+          if (lifetimeErr) throw lifetimeErr;
 
           // Update Mailchimp — tag as upgraded (fire-and-forget)
           const userEmailLT = session.customer_details?.email
@@ -915,12 +922,15 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
           });
         } else {
           // Subscription — set active
-          await supabase.from('profiles').update({
+          // ENTITLEMENT-BEARING — this is THE write that silently failed in the double-charge
+          // incident. It must throw so the event is left unmarked and Stripe retries.
+          const { error: subActivateErr } = await supabase.from('profiles').update({
             subscription_tier: tier,
             subscription_status: 'active',
             stripe_customer_id: session.customer,
             stripe_subscription_id: session.subscription,
           }).eq('id', userId);
+          if (subActivateErr) throw subActivateErr;
 
           // Update Mailchimp — tag as upgraded, remove trial tag (fire-and-forget)
           const userEmail = session.customer_details?.email || session.customer_email || null;
@@ -975,19 +985,23 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         const { data: coachProfile } = await supabase.from('profiles')
           .select('id').eq('coach_stripe_subscription_id', sub.id).maybeSingle();
         if (coachProfile) {
-          await supabase.from('profiles').update({
+          // ENTITLEMENT-BEARING (revocation): a silent miss leaves a cancelled coach active.
+          const { error: coachCancelErr } = await supabase.from('profiles').update({
             coach_plan_status: 'cancelled',
           }).eq('id', coachProfile.id);
+          if (coachCancelErr) throw coachCancelErr;
           break;
         }
         // Fall through to individual subscription
         const { data: profile } = await supabase.from('profiles')
           .select('id').eq('stripe_subscription_id', sub.id).maybeSingle();
         if (profile) {
-          await supabase.from('profiles').update({
+          // ENTITLEMENT-BEARING (revocation).
+          const { error: subExpireErr } = await supabase.from('profiles').update({
             subscription_status: 'expired',
             subscription_tier: 'iron',
           }).eq('id', profile.id);
+          if (subExpireErr) throw subExpireErr;
         }
         break;
       }
@@ -1010,7 +1024,9 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             updateData.coach_plan = planFromPrice;
             updateData.coach_commission_rate = COACH_PLAN_CONFIG[planFromPrice]?.commissionRate || 0;
           }
-          await supabase.from('profiles').update(updateData).eq('id', coachProfile.id);
+          // ENTITLEMENT-BEARING: syncs coach plan + commission on renewal/downgrade.
+          const { error: coachSyncErr } = await supabase.from('profiles').update(updateData).eq('id', coachProfile.id);
+          if (coachSyncErr) throw coachSyncErr;
           break;
         }
         // Fall through to individual subscription
@@ -1023,7 +1039,9 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
           const tierFromPrice = priceId ? getTierFromPriceId(priceId) : null;
           const updateData = { subscription_status: status };
           if (tierFromPrice) updateData.subscription_tier = tierFromPrice;
-          await supabase.from('profiles').update(updateData).eq('id', profile.id);
+          // ENTITLEMENT-BEARING: this is the branch that syncs tier + status on every renewal.
+          const { error: subSyncErr } = await supabase.from('profiles').update(updateData).eq('id', profile.id);
+          if (subSyncErr) throw subSyncErr;
         }
         break;
       }
@@ -1033,7 +1051,9 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         const { data: profile } = await supabase.from('profiles')
           .select('id').eq('stripe_customer_id', invoice.customer).maybeSingle();
         if (profile) {
-          await supabase.from('profiles').update({ subscription_status: 'past_due' }).eq('id', profile.id);
+          // ENTITLEMENT-BEARING: past_due drives the dunning/paywall state.
+          const { error: pastDueErr } = await supabase.from('profiles').update({ subscription_status: 'past_due' }).eq('id', profile.id);
+          if (pastDueErr) throw pastDueErr;
         }
         break;
       }
@@ -1064,13 +1084,19 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             .eq('stripe_customer_id', customerId)
             .maybeSingle();
           if (!profile) break;
-          await supabase.from('profiles')
+          const { error: refundErr } = await supabase.from('profiles')
             .update({
               subscription_status: 'expired',
               subscription_tier: 'iron',
               lifetime_tier: null
             })
             .eq('id', profile.id);
+          // Throws into THIS branch's own catch below, which logs and lets the webhook still
+          // return 200. Deliberate: it makes an otherwise completely invisible query error
+          // visible in the logs without changing this branch's documented isolation. The
+          // failure direction here is "user keeps access after a refund", not "user paid and
+          // got nothing", so it is not worth a retry loop. See known-bugs.md.
+          if (refundErr) throw refundErr;
           console.log('[webhook] charge.refunded → access revoked for', profile.id);
         } catch(e) {
           console.error('[webhook] charge.refunded error:', e.message);
@@ -1089,7 +1115,7 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             .eq('stripe_customer_id', customerId)
             .maybeSingle();
           if (!profile) break;
-          await supabase.from('profiles')
+          const { error: disputeErr } = await supabase.from('profiles')
             .update({
               subscription_status: 'expired',
               subscription_tier: 'iron',
@@ -1097,6 +1123,9 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
               is_frozen: true
             })
             .eq('id', profile.id);
+          // Throws into this branch's own catch below — log-only, same reasoning as
+          // charge.refunded above.
+          if (disputeErr) throw disputeErr;
           console.log('[webhook] charge.dispute.created → account frozen for', profile.id);
         } catch(e) {
           console.error('[webhook] charge.dispute.created error:', e.message);
