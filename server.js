@@ -1569,6 +1569,14 @@ app.get('/api/vapid-public-key', (req, res) => {
 // signup consent copy and on every write to profiles.age via PATCH /api/profile.
 const MIN_SIGNUP_AGE = 18;
 
+// Body-stat bounds for profiles.height_cm / profiles.weight_kg. Mirrored client-side as
+// FORGE_MIN_HEIGHT_CM / … in app.html, where they are UX only — this is the enforcement.
+// Both are decimals, so they get a finite-number range test, NOT the integer test age uses.
+const MIN_HEIGHT_CM = 100;
+const MAX_HEIGHT_CM = 250;
+const MIN_WEIGHT_KG = 30;
+const MAX_WEIGHT_KG = 300;
+
 // The literal "Last updated" string from privacy.html / terms.html. Stored per account at
 // signup so a future policy change is detectable and re-consent can be targeted at the
 // users who accepted the older text. Bump this whenever those documents change.
@@ -2354,15 +2362,24 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
       if (age < MIN_SIGNUP_AGE)
         return res.status(400).json({ error: 'under_minimum_age', minimum: MIN_SIGNUP_AGE });
     }
-    if (body.height_cm !== undefined) {
+    // Height and weight. Same shape as the age gate above and the same reason for it:
+    // the codes are machine-readable so the client can map real copy. They used to return
+    // the human strings 'Invalid height' / 'Invalid weight', which no client branch
+    // matched — so an out-of-range value fell through submitOnboarding's retry loop and
+    // surfaced as "check your connection", which is not what went wrong.
+    // Decimals are legitimate here (72.5kg, 178.5cm), so this is a FINITE-NUMBER range
+    // test, not the Number.isInteger test age uses. Number.isFinite also rejects the
+    // NaN/Infinity that Number() yields for junk, and min/max ride along so the client
+    // renders the bounds without duplicating them.
+    if (body.height_cm !== undefined && body.height_cm !== null) {
       const h = Number(body.height_cm);
-      if (isNaN(h) || h < 100 || h > 250)
-        return res.status(400).json({ error: 'Invalid height' });
+      if (!Number.isFinite(h) || h < MIN_HEIGHT_CM || h > MAX_HEIGHT_CM)
+        return res.status(400).json({ error: 'invalid_height', min: MIN_HEIGHT_CM, max: MAX_HEIGHT_CM });
     }
-    if (body.weight_kg !== undefined) {
+    if (body.weight_kg !== undefined && body.weight_kg !== null) {
       const w = Number(body.weight_kg);
-      if (isNaN(w) || w < 25 || w > 400)
-        return res.status(400).json({ error: 'Invalid weight' });
+      if (!Number.isFinite(w) || w < MIN_WEIGHT_KG || w > MAX_WEIGHT_KG)
+        return res.status(400).json({ error: 'invalid_weight', min: MIN_WEIGHT_KG, max: MAX_WEIGHT_KG });
     }
     if (body.target_weight_kg !== undefined && body.target_weight_kg !== null) {
       const tw = Number(body.target_weight_kg);
