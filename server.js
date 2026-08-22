@@ -1198,10 +1198,20 @@ async function handleReferralConversion(userId) {
     if (!referrer) return;
     const stats = referrer.referral_stats || {};
     stats.conversions = (stats.conversions || 0) + 1;
+    // referral_stats.credits is ACCRUED ON PURPOSE BUT NOT SURFACED OR REDEEMABLE.
+    // There is no reward attached to it yet: nothing reads this counter, no Stripe coupon
+    // or account credit is created, and no trial is extended by it. It is kept running so
+    // that whenever the free-month reward is actually built, there is a per-referrer record
+    // of what was earned and it can be honoured retroactively.
+    // Until then it must stay out of every user-facing surface. The push below used to
+    // claim "a free month has been added to your account" and the Account panel showed a
+    // "Free months" tile counting it — both promised a grant that never happened.
+    // Do NOT display this number or promise a reward against it until the reward exists.
     stats.credits = (stats.credits || 0) + 1;
     await supabase.from('profiles').update({ referral_stats: stats }).eq('id', referrerId);
-    // Send push notification to referrer
-    await sendPushToUser(referrerId, 'FORGE', 'Someone you referred just joined FORGE. A free month has been added to your account.');
+    // Push to the referrer. States only what actually happened. This helper fires from the
+    // Stripe conversion webhook, so the referred user has SUBSCRIBED, not merely signed up.
+    await sendPushToUser(referrerId, 'FORGE', 'Someone you referred just subscribed to FORGE.');
   } catch(e) { console.error('handleReferralConversion error:', e.message); }
 }
 
