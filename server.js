@@ -631,6 +631,7 @@ async function sendEmail(to, subject, html) {
 //   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS session_duration_mins int DEFAULT 60;
 //   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS session_duration_varies boolean DEFAULT false;
 //   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS session_duration_by_day jsonb DEFAULT null;
+//   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS currency text DEFAULT 'chf';
 // PATCH /api/profile degrades gracefully if profiles.units / enabled_features is still
 // absent, and the frontend caches both in localStorage, so the app works either way.
 const BOOT_MIGRATIONS = [
@@ -646,6 +647,10 @@ const BOOT_MIGRATIONS = [
   // Daily workout reminder: preferred LOCAL time ('HH:MM') + IANA timezone. NULL = no reminder.
   `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS reminder_time text DEFAULT NULL`,
   `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS reminder_timezone text DEFAULT 'UTC'`,
+  // Multi-currency. Stores the user's DISPLAY preference only. The currency actually
+  // charged is resolved at checkout, where an existing Stripe customer's locked currency
+  // always wins over this value (see resolveCheckoutCurrency).
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS currency text DEFAULT 'chf'`,
 ];
 (async () => {
   for (const sql of BOOT_MIGRATIONS) {
@@ -673,6 +678,10 @@ try {
 // The _promo keys stay in this map PERMANENTLY, even after launch pricing ends — removing
 // them would make getTierFromPriceId() return null for launch-priced subscribers and stop
 // their tier syncing on renewal.
+// MULTI-CURRENCY: each Price carries currency_options for CHF/EUR/GBP/USD, so there is
+// still exactly ONE Price ID per tier/billing pair and this map keeps its 16 keys. The
+// currency is chosen per Checkout Session, never by swapping the Price — which is why
+// getTierFromPriceId() and getCoachPlanFromPriceId() keep resolving for every currency.
 const STRIPE_PRICES = {
   iron_monthly:         process.env.STRIPE_PRICE_IRON_MONTHLY,
   iron_annual:          process.env.STRIPE_PRICE_IRON_ANNUAL,
@@ -685,13 +694,108 @@ const STRIPE_PRICES = {
   iron_founding:        process.env.STRIPE_PRICE_IRON_FOUNDING,
   forge_founding:       process.env.STRIPE_PRICE_FORGE_FOUNDING,
   // Coach plans — create in Stripe dashboard, set as env vars on Railway
-  coach_starter_monthly: process.env.STRIPE_PRICE_COACH_STARTER_MONTHLY || '',
-  coach_starter_annual:  process.env.STRIPE_PRICE_COACH_STARTER_ANNUAL  || '',
-  coach_pro_monthly:     process.env.STRIPE_PRICE_COACH_PRO_MONTHLY     || '',
-  coach_pro_annual:      process.env.STRIPE_PRICE_COACH_PRO_ANNUAL      || '',
-  coach_elite_monthly:   process.env.STRIPE_PRICE_COACH_ELITE_MONTHLY   || '',
-  coach_elite_annual:    process.env.STRIPE_PRICE_COACH_ELITE_ANNUAL    || '',
+  coach_starter_monthly: process.env.STRIPE_PRICE_COACH_STARTER_MONTHLY,
+  coach_starter_annual:  process.env.STRIPE_PRICE_COACH_STARTER_ANNUAL,
+  coach_pro_monthly:     process.env.STRIPE_PRICE_COACH_PRO_MONTHLY,
+  coach_pro_annual:      process.env.STRIPE_PRICE_COACH_PRO_ANNUAL,
+  coach_elite_monthly:   process.env.STRIPE_PRICE_COACH_ELITE_MONTHLY,
+  coach_elite_annual:    process.env.STRIPE_PRICE_COACH_ELITE_ANNUAL,
 };
+
+// ── BOOT-TIME PRICE CHECK ──────────────────────────────
+// A missing price env var used to surface only at checkout, as a generic 400 in front of
+// a paying customer — a deploy mistake charged to the user. Report it once, loudly, at
+// boot instead. Deliberately does NOT crash: an unset coach price must not take down the
+// whole API for individual subscribers (and vice versa).
+function stripePriceEnvName(key) {
+  return 'STRIPE_PRICE_' + key.toUpperCase();
+}
+(function checkStripePrices() {
+  if (!process.env.STRIPE_SECRET_KEY) return; // Stripe disabled entirely — already warned above
+  const missing = Object.keys(STRIPE_PRICES).filter(k => !STRIPE_PRICES[k]);
+  if (!missing.length) {
+    console.log(`Stripe prices ✓ — all ${Object.keys(STRIPE_PRICES).length} price IDs set`);
+    return;
+  }
+  console.error('');
+  console.error('════════════════════════════════════════════════════════════');
+  console.error(`  STRIPE PRICE CONFIG INCOMPLETE — ${missing.length} of ${Object.keys(STRIPE_PRICES).length} unset`);
+  console.error('  Checkout for these plans WILL fail with 400 for real users.');
+  console.error('  Set them on Railway, then redeploy:');
+  missing.forEach(k => console.error(`    ${k.padEnd(22)} → ${stripePriceEnvName(k)}`));
+  console.error('════════════════════════════════════════════════════════════');
+  console.error('');
+})();
+
+// ── MULTI-CURRENCY ─────────────────────────────────────
+// One Price ID per tier/billing pair, each carrying currency_options for these four.
+const SUPPORTED_CURRENCIES = ['chf', 'eur', 'gbp', 'usd'];
+const DEFAULT_CURRENCY = 'chf';
+
+// Never trust a client-supplied currency. Anything that is not a plain string naming a
+// supported currency falls back to the default rather than reaching Stripe. The typeof
+// guard matters: String(['usd']) is 'usd', so without it a one-element array would be
+// silently accepted as a currency.
+function normaliseCurrency(raw) {
+  if (typeof raw !== 'string') return DEFAULT_CURRENCY;
+  const c = raw.trim().toLowerCase();
+  return SUPPORTED_CURRENCIES.includes(c) ? c : DEFAULT_CURRENCY;
+}
+
+// THE CRITICAL RULE — a Stripe customer's currency is set by their FIRST payment and is
+// immutable thereafter. It always beats whatever the client asked for.
+//
+// Passing a currency that disagrees with a locked customer makes sessions.create throw.
+// OMITTING it is worse: Stripe silently bills the locked currency while the user is
+// looking at a screen priced in a different one. Resolving server-side prevents both.
+//
+// Returns { currency, locked, supported }. A locked currency is returned VERBATIM even
+// when it is outside SUPPORTED_CURRENCIES (an old customer from before this change, say)
+// — the customer is charged in it regardless, so the honest move is to surface it and let
+// sessions.create fail loudly with a mapped code rather than mis-price the screen.
+async function resolveCheckoutCurrency(customerId, requested) {
+  const wanted = normaliseCurrency(requested);
+  if (!stripe || !customerId) return { currency: wanted, locked: false, supported: true };
+  try {
+    const customer = await stripe.customers.retrieve(customerId);
+    if (customer && !customer.deleted && customer.currency) {
+      const locked = String(customer.currency).toLowerCase();
+      return { currency: locked, locked: true, supported: SUPPORTED_CURRENCIES.includes(locked) };
+    }
+  } catch (e) {
+    // Non-fatal: fall back to the requested currency. If it turns out to conflict with a
+    // lock we could not read, sessions.create throws and classifyCurrencyError maps it.
+    console.warn(`[currency] could not read customer ${customerId}: ${e.message}`);
+  }
+  return { currency: wanted, locked: false, supported: true };
+}
+
+// profiles.currency arrives via BOOT_MIGRATIONS, which is best-effort (no run_sql RPC = no
+// column until the SQL is run by hand). Guarded the same way as isMissingProgrammeTypeColumn:
+// the error must name the column AND look like an absent-column error, so a CHECK or NOT NULL
+// violation surfaces instead of being silently retried away.
+//   PGRST204 = not in PostgREST's schema cache (DDL leaves that cache stale)
+//   42703    = Postgres "column does not exist"
+function isMissingCurrencyColumn(error) {
+  if (!error) return false;
+  const msg = (error.message || '').toLowerCase();
+  if (!msg.includes('currency')) return false;
+  return error.code === 'PGRST204' || error.code === '42703'
+    || msg.includes('schema cache') || msg.includes('does not exist');
+}
+
+// Map Stripe's currency failures onto distinct codes instead of collapsing every failure
+// into a generic 500, so the frontend can correct its display rather than say "try again".
+//   currency_locked_mismatch — customer is already locked to a different currency
+//   currency_unsupported     — the Price has no currency_options entry for this currency
+// Returns null for anything that is not a currency problem.
+function classifyCurrencyError(err) {
+  const msg = String((err && (err.raw && err.raw.message)) || (err && err.message) || '').toLowerCase();
+  const param = String((err && (err.raw && err.raw.param)) || (err && err.param) || '').toLowerCase();
+  if (!msg.includes('currency') && param !== 'currency') return null;
+  if (msg.includes('customer')) return 'currency_locked_mismatch';
+  return 'currency_unsupported';
+}
 
 // ── COACH PLAN CONFIG ──────────────────────────────────
 // Seat limits and commission rates per coach plan. Shared with frontend.
@@ -2435,11 +2539,18 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
       'days_per_week','preferred_days','equipment','diet_style','diet_restrictions',
       'injuries','target_weight_kg','onboarding_complete','preferred_language','units',
       'enabled_features','session_duration_mins','session_duration_varies','session_duration_by_day',
-      'reminder_time','reminder_timezone'];
+      'reminder_time','reminder_timezone','currency'];
     const update = { updated_at: new Date().toISOString() };
     allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
     // Units may only be 'kg' or 'lbs' — drop anything else so a bad value can't persist.
     if (update.units !== undefined && update.units !== 'kg' && update.units !== 'lbs') delete update.units;
+    // Currency is a DISPLAY preference only — checkout re-resolves it and an existing
+    // customer's locked Stripe currency always wins. Drop anything unsupported so a bad
+    // value can't persist and mis-price the upgrade sheet.
+    if (update.currency !== undefined) {
+      const c = typeof update.currency === 'string' ? update.currency.trim().toLowerCase() : null;
+      if (c && SUPPORTED_CURRENCIES.includes(c)) update.currency = c; else delete update.currency;
+    }
     // session_duration_by_day must be a plain object (e.g. { monday: 60 }) or null — drop
     // anything else so a bad value can't poison the jsonb column.
     if (update.session_duration_by_day !== undefined &&
@@ -2470,7 +2581,7 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
     if (error) {
       // If error is about a column the DB doesn't have yet (preferred_days, units, or
       // enabled_features not migrated), retry without it so the rest of the update still lands.
-      if (error.message?.includes('preferred_days') || error.message?.includes('units') || error.message?.includes('enabled_features') || error.message?.includes('session_duration') || error.message?.includes('reminder_')) {
+      if (error.message?.includes('preferred_days') || error.message?.includes('units') || error.message?.includes('enabled_features') || error.message?.includes('session_duration') || error.message?.includes('reminder_') || error.message?.includes('currency')) {
         delete update.preferred_days;
         delete update.units;
         delete update.enabled_features;
@@ -2479,6 +2590,7 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
         delete update.session_duration_by_day;
         delete update.reminder_time;
         delete update.reminder_timezone;
+        delete update.currency;
         const { data: data2, error: err2 } = await supabase
           .from('profiles').update(update).eq('id', req.user.id).select().maybeSingle();
         if (err2) throw err2;
@@ -4081,11 +4193,40 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
     const coachUsage = await getCoachUsage(req.user.id);
 
     // Include stripe_subscription_id so frontend can detect paid subscribers
-    const { data: profile } = await supabase
+    let { data: profile, error: profileErr } = await supabase
       .from('profiles')
-      .select('stripe_subscription_id')
+      .select('stripe_subscription_id, stripe_customer_id, currency')
       .eq('id', req.user.id)
       .maybeSingle();
+    // If profiles.currency has not been migrated yet, that select errors and `profile` comes
+    // back null — which would silently drop stripe_subscription_id and renewalDate for EVERY
+    // user, a regression on behaviour that has nothing to do with currency. Retry without it.
+    if (profileErr && isMissingCurrencyColumn(profileErr)) {
+      console.warn('[currency] profiles.currency not migrated yet — serving subscription state without it');
+      ({ data: profile } = await supabase
+        .from('profiles')
+        .select('stripe_subscription_id, stripe_customer_id')
+        .eq('id', req.user.id)
+        .maybeSingle());
+    }
+
+    // Resolve the currency the upgrade sheet must render in. The stored profile value is
+    // only a preference — if this user already has a Stripe customer, that customer's
+    // currency is immutable and is what they will actually be charged in, so it wins here
+    // exactly as it wins at checkout. Costs one extra Stripe call, and only for users who
+    // have reached checkout at least once; everyone still on trial skips it.
+    let currency = normaliseCurrency(profile?.currency);
+    let currencyLocked = false;
+    if (profile?.stripe_customer_id) {
+      const resolved = await resolveCheckoutCurrency(profile.stripe_customer_id, profile?.currency);
+      currency = resolved.currency;
+      currencyLocked = !!resolved.locked;
+      // Keep the stored preference truthful when the lock disagrees with it.
+      if (currencyLocked && currency !== profile?.currency && SUPPORTED_CURRENCIES.includes(currency)) {
+        supabase.from('profiles').update({ currency }).eq('id', req.user.id)
+          .then(() => {}, () => {});
+      }
+    }
 
     // Fetch renewal date from Stripe if active subscriber
     let renewalDate = null;
@@ -4108,6 +4249,9 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
       hasUnlimitedCoach: hasAccess('unlimited_coach', accessTier, isExempt),
       stripe_subscription_id: profile?.stripe_subscription_id || null,
       renewalDate,
+      currency,
+      currencyLocked,
+      supportedCurrencies: SUPPORTED_CURRENCIES,
     });
   } catch(err) {
     console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
@@ -4119,9 +4263,12 @@ app.get('/api/subscription', requireAuth, loadSubscription, async (req, res) => 
 // ═══════════════════════════════════════════════════════
 
 app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
+  // Declared out here so the catch can report which currency was attempted — a const
+  // inside try{} is not in scope in catch{}.
+  let currency = null;
   try {
     if (!stripe) return res.status(503).json({ error: 'Payment service unavailable' });
-    const { tier, billing } = req.body;
+    const { tier, billing, currency: requestedCurrency } = req.body;
     if (!tier || !billing) return res.status(400).json({ error: 'Missing tier or billing' });
 
     // Validate tier + billing against an allow-list — never trust raw client values.
@@ -4170,6 +4317,21 @@ app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
       await supabase.from('profiles').update({ stripe_customer_id: customerId }).eq('id', userId);
     }
 
+    // Resolve the currency BEFORE building the session. A customer who has paid before is
+    // locked to that currency in Stripe forever — their lock wins and the requested value is
+    // discarded. Only a brand-new (or never-charged) customer gets what they asked for.
+    const resolved = await resolveCheckoutCurrency(customerId, requestedCurrency);
+    currency = resolved.currency;
+    if (resolved.locked && currency !== normaliseCurrency(requestedCurrency)) {
+      console.log(`[currency] user ${userId} requested ${normaliseCurrency(requestedCurrency)} but is locked to ${currency} — using the lock`);
+    }
+    // Keep the stored display preference in step with what Stripe will actually charge.
+    // Fire-and-forget: a failed write must not block checkout.
+    if (SUPPORTED_CURRENCIES.includes(currency)) {
+      supabase.from('profiles').update({ currency }).eq('id', userId)
+        .then(() => {}, () => {});
+    }
+
     const isSubscription = billing !== 'lifetime';
     const frontendUrl = process.env.FRONTEND_URL || 'https://klemforge.com';
     const appUrl = frontendUrl.replace(/\/$/, '') + '/app.html';
@@ -4178,10 +4340,14 @@ app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
       customer: customerId,
       payment_method_types: ['card'],
       line_items: [{ price: priceId, quantity: 1 }],
+      // One Price ID serves every currency — the Price's currency_options entry is selected
+      // by this field. Always sent, never omitted: omitting it lets Stripe silently bill a
+      // locked customer in their old currency against a differently-priced screen.
+      currency,
       mode: isSubscription ? 'subscription' : 'payment',
       success_url: `${appUrl}?payment=success&tier=${tier}&billing=${billing}`,
       cancel_url: `${appUrl}?payment=cancelled`,
-      metadata: { user_id: userId, tier, billing, is_promo: String(!!is_promo) },
+      metadata: { user_id: userId, tier, billing, is_promo: String(!!is_promo), currency },
       allow_promotion_codes: true,
     };
 
@@ -4192,9 +4358,31 @@ app.post('/api/stripe/create-checkout', requireAuth, async (req, res) => {
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
-    res.json({ url: session.url, session_id: session.id });
+    // Return the RESOLVED currency, not the requested one, so the frontend can correct a
+    // display that disagrees with the customer's lock.
+    res.json({
+      url: session.url,
+      session_id: session.id,
+      currency,
+      currency_locked: !!resolved.locked,
+    });
   } catch (err) {
     console.error('Stripe checkout error:', err.message);
+    // Currency failures are a distinct, actionable class — don't bury them in a generic 500.
+    const currencyCode = classifyCurrencyError(err);
+    if (currencyCode) {
+      console.error(`[currency] checkout rejected (${currencyCode}):`, err.message);
+      if (!res.headersSent) {
+        return res.status(400).json({
+          error: currencyCode === 'currency_locked_mismatch'
+            ? 'Your account is already billed in a different currency.'
+            : 'That currency is not available for this plan.',
+          code: currencyCode,
+          currency,
+        });
+      }
+      return;
+    }
     console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -7413,9 +7601,11 @@ app.post('/api/coach/setup', requireAuth, async (req, res) => {
 // ── Coach checkout — called only when the trial has expired (or user upgrades early).
 // Creates a Stripe subscription session with NO trial (the in-app trial was already used).
 app.post('/api/coach/create-checkout', requireAuth, async (req, res) => {
+  // Hoisted so the catch can report the attempted currency (see the user checkout).
+  let currency = null;
   try {
     if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
-    const { plan, billing } = req.body || {};
+    const { plan, billing, currency: requestedCurrency } = req.body || {};
 
     const { data: profile } = await supabase.from('profiles')
       .select('stripe_customer_id, name, coach_plan, coach_billing_preference').eq('id', req.user.id).maybeSingle();
@@ -7439,6 +7629,21 @@ app.post('/api/coach/create-checkout', requireAuth, async (req, res) => {
       await supabase.from('profiles').update({ stripe_customer_id: customerId }).eq('id', req.user.id);
     }
 
+    // Same immutability rule as the user checkout, and it matters MORE here: this handler
+    // shares profiles.stripe_customer_id with /api/stripe/create-checkout, so a coach who
+    // first paid as an individual is ALREADY currency-locked by that earlier purchase.
+    // resolveCheckoutCurrency reads the lock off the shared customer, so that case resolves
+    // to the individual-purchase currency here without any coach-specific handling.
+    const resolved = await resolveCheckoutCurrency(customerId, requestedCurrency);
+    currency = resolved.currency;
+    if (resolved.locked && currency !== normaliseCurrency(requestedCurrency)) {
+      console.log(`[currency] coach ${req.user.id} requested ${normaliseCurrency(requestedCurrency)} but is locked to ${currency} — using the lock`);
+    }
+    if (SUPPORTED_CURRENCIES.includes(currency)) {
+      supabase.from('profiles').update({ currency }).eq('id', req.user.id)
+        .then(() => {}, () => {});
+    }
+
     const frontendUrl = process.env.FRONTEND_URL || 'https://klemforge.com';
     const appUrl = frontendUrl.replace(/\/$/, '') + '/app.html';
 
@@ -7454,6 +7659,8 @@ app.post('/api/coach/create-checkout', requireAuth, async (req, res) => {
       customer: customerId,
       payment_method_types: ['card'],
       line_items: [{ price: priceId, quantity: 1 }],
+      // Selects the Price's currency_options entry. Never omitted — see the user checkout.
+      currency,
       mode: 'subscription',
       success_url: `${appUrl}?coach_payment=success`,
       cancel_url: `${appUrl}?coach_payment=cancelled`,
@@ -7463,9 +7670,29 @@ app.post('/api/coach/create-checkout', requireAuth, async (req, res) => {
       allow_promotion_codes: true,
     });
 
-    res.json({ url: session.url, session_id: session.id });
+    // Resolved currency, not the requested one — the frontend corrects its display from this.
+    res.json({
+      url: session.url,
+      session_id: session.id,
+      currency,
+      currency_locked: !!resolved.locked,
+    });
   } catch(err) {
     console.error('Coach create-checkout error:', err.message);
+    const currencyCode = classifyCurrencyError(err);
+    if (currencyCode) {
+      console.error(`[currency] coach checkout rejected (${currencyCode}):`, err.message);
+      if (!res.headersSent) {
+        return res.status(400).json({
+          error: currencyCode === 'currency_locked_mismatch'
+            ? 'Your account is already billed in a different currency.'
+            : 'That currency is not available for this plan.',
+          code: currencyCode,
+          currency,
+        });
+      }
+      return;
+    }
     console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
