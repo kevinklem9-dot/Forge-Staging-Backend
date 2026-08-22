@@ -631,7 +631,8 @@ async function sendEmail(to, subject, html) {
 //   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS session_duration_mins int DEFAULT 60;
 //   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS session_duration_varies boolean DEFAULT false;
 //   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS session_duration_by_day jsonb DEFAULT null;
-//   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS currency text DEFAULT 'chf';
+//   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS currency text;
+//   ALTER TABLE profiles   ALTER COLUMN currency DROP DEFAULT;
 // PATCH /api/profile degrades gracefully if profiles.units / enabled_features is still
 // absent, and the frontend caches both in localStorage, so the app works either way.
 const BOOT_MIGRATIONS = [
@@ -650,7 +651,17 @@ const BOOT_MIGRATIONS = [
   // Multi-currency. Stores the user's DISPLAY preference only. The currency actually
   // charged is resolved at checkout, where an existing Stripe customer's locked currency
   // always wins over this value (see resolveCheckoutCurrency).
-  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS currency text DEFAULT 'chf'`,
+  //
+  // NO DEFAULT, deliberately. This column shipped as DEFAULT 'chf' and that broke the
+  // landing-page handoff: every new row carried an explicit 'chf' that was indistinguishable
+  // from a deliberate Swiss choice, so it outranked the visitor's stored currency at
+  // app.html's resolveDisplayCurrency() and a GBP visitor landed on CHF prices. NULL is the
+  // only honest representation of "no preference chosen yet" — keep it that way.
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS currency text`,
+  // Self-heals an environment created before the above lost its default. ADD COLUMN IF NOT
+  // EXISTS is a no-op once the column exists, so it can never remove the old default on its
+  // own. Dropping a default that is not there is also a no-op, so this is safe to re-run.
+  `ALTER TABLE profiles ALTER COLUMN currency DROP DEFAULT`,
 ];
 (async () => {
   for (const sql of BOOT_MIGRATIONS) {
@@ -1698,7 +1709,7 @@ const PRIVACY_POLICY_VERSION = 'August 2026';
 
 // ── SIGNUP — Check email + create account ──────
 app.post('/api/signup', signupLimiter, async (req, res) => {
-  const { email, password, name, language, accepted_terms } = req.body;
+  const { email, password, name, language, accepted_terms, currency } = req.body;
   if (!email || !password || !name) return res.status(400).json({ error: 'All fields required.' });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Invalid email address.' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
@@ -1743,6 +1754,15 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
       // ONE payload shared by both write paths below (the retry loop AND the upsert
       // fallback). Consent must ride on both — writing it on only one of them lets an
       // account exist with no consent record whenever the retry loop exhausts.
+      // The visitor's currency choice, carried over from the landing page so it survives
+      // signup. STRICTLY OPTIONAL: an absent or invalid value OMITS the field rather than
+      // substituting a default. Writing a fallback here would recreate the exact bug this
+      // fixes — a defaulted 'chf' that reads as a deliberate choice and outranks everything.
+      const signupCurrency = (typeof currency === 'string' &&
+        SUPPORTED_CURRENCIES.includes(currency.trim().toLowerCase()))
+          ? currency.trim().toLowerCase()
+          : null;
+
       const profilePayload = {
         name,
         subscription_tier: 'iron',
@@ -1750,7 +1770,8 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
         trial_ends_at: trialEndsAt,
         preferred_language: language || 'en',
         terms_accepted_at: new Date().toISOString(),
-        privacy_policy_version: PRIVACY_POLICY_VERSION
+        privacy_policy_version: PRIVACY_POLICY_VERSION,
+        ...(signupCurrency ? { currency: signupCurrency } : {})
       };
       // If the consent migration has not been run yet those two columns do not exist and
       // the write fails wholesale — which would break signup for everyone. Detect that
@@ -1761,6 +1782,13 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
         delete profilePayload.terms_accepted_at;
         delete profilePayload.privacy_policy_version;
         console.error('[signup] consent columns missing — run the consent migration. Profile written without a consent record.');
+      };
+      // Same protection for profiles.currency. isMissingCurrencyColumn() is the shared
+      // two-guard detector (names the column AND looks like an absent-column error), so a
+      // CHECK or NOT NULL violation still surfaces instead of being silently stripped.
+      const stripCurrency = () => {
+        delete profilePayload.currency;
+        console.error('[signup] profiles.currency missing — run the currency migration. Profile written without a currency preference.');
       };
 
       let profileSet = false;
@@ -1774,17 +1802,25 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
           .maybeSingle();
         if (updated?.id) { profileSet = true; break; }
         if (isMissingConsentColumn(updateErr)) stripConsent();
+        if (isMissingCurrencyColumn(updateErr)) stripCurrency();
         if (attempt === 5) console.error('Profile update failed after 5 attempts:', updateErr?.message);
       }
-      // If profile row still doesn't exist, upsert it — same payload, consent included.
+      // If profile row still doesn't exist, upsert it — same payload, consent AND currency
+      // included. Postgres reports one missing column at a time, so a database lacking BOTH
+      // the consent columns and currency needs more than one strip: loop, strip whatever the
+      // error names, retry. Bounded at 3 (first attempt + one per optional column group) and
+      // breaks immediately on success or on any error that is not a missing column.
       if (!profileSet) {
-        const { error: upsertErr } = await supabase.from('profiles').upsert({
-          id: data.user.id,
-          ...profilePayload
-        });
-        if (isMissingConsentColumn(upsertErr)) {
-          stripConsent();
-          await supabase.from('profiles').upsert({ id: data.user.id, ...profilePayload });
+        for (let i = 0; i < 3; i++) {
+          const { error: upsertErr } = await supabase.from('profiles').upsert({
+            id: data.user.id,
+            ...profilePayload
+          });
+          if (!upsertErr) break;
+          let stripped = false;
+          if (isMissingConsentColumn(upsertErr))  { stripConsent();  stripped = true; }
+          if (isMissingCurrencyColumn(upsertErr)) { stripCurrency(); stripped = true; }
+          if (!stripped) break;
         }
       }
 
