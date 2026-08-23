@@ -1862,7 +1862,7 @@ app.get('/api/vapid-public-key', (req, res) => {
 });
 
 // Minimum age to hold a FORGE account. Must stay in step with terms.html section 03
-// ("You must be at least 18 years old") and privacy.html section 10. Enforced on the
+// ("You must be at least 18 years old") and privacy.html section 14. Enforced on the
 // signup consent copy and on every write to profiles.age via PATCH /api/profile.
 const MIN_SIGNUP_AGE = 18;
 
@@ -1874,10 +1874,23 @@ const MAX_HEIGHT_CM = 250;
 const MIN_WEIGHT_KG = 30;
 const MAX_WEIGHT_KG = 300;
 
-// The literal "Last updated" string from privacy.html / terms.html. Stored per account at
-// signup so a future policy change is detectable and re-consent can be targeted at the
-// users who accepted the older text. Bump this whenever those documents change.
-const PRIVACY_POLICY_VERSION = 'August 2026';
+// The version of privacy.html / terms.html in force. Stored per account at signup so a
+// future policy change is detectable and re-consent can be targeted at the users who
+// accepted the older text. Bump this whenever those documents change.
+//
+// DATE-GRANULAR ON PURPOSE. This used to hold the documents' literal "Last updated" string
+// ('August 2026'), which broke the moment the documents were rewritten inside the same
+// month: acceptors of the old text and acceptors of the rewrite carried an identical stamp,
+// so the re-consent query this column exists for could not tell them apart. An ISO date is
+// unique per revision.
+//
+// EXISTING ROWS KEEP 'August 2026' AND MUST NOT BE BACKFILLED — that string is the record
+// that those accounts accepted the PRE-rewrite text. Overwriting it would destroy the exact
+// distinction this change restores.
+//
+// Written once, at signup, into profiles.privacy_policy_version (~line 1950). Nothing reads
+// it back on any request path and no surface renders it, so the format is free to change.
+const PRIVACY_POLICY_VERSION = '2026-08-23';
 
 // ── SIGNUP — Check email + create account ──────
 app.post('/api/signup', signupLimiter, async (req, res) => {
@@ -2785,7 +2798,7 @@ app.patch('/api/profile', requireAuth, async (req, res) => {
     const body = req.body;
 
     // A) Numeric range validation
-    // Minimum age is 18 — matches terms.html section 03 and privacy.html section 10.
+    // Minimum age is 18 — matches terms.html section 03 and privacy.html section 14.
     // This is the ONLY real enforcement point: both write paths (the onboarding submit
     // and a raw PATCH) land here, so raising the floor here raises it everywhere.
     // The two failure codes are deliberately distinct. `invalid_age` means the value is
