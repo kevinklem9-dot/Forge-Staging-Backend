@@ -291,15 +291,24 @@ const EXERCISE_NAME_MAP = {
 // AI-assisted normalisation cache — maps unknown names to MuscleWiki names
 const aiExerciseNameCache = new Map();
 
-async function normaliseExerciseNameWithAI(name, exercises) {
+// `equipment` gates this the same way it gates resolveExerciseName. Inert today (the
+// catalogue stub returns []), but guarded now so repopulating the catalogue cannot open
+// a second upgrade path that bypasses the manual-map gate entirely.
+async function normaliseExerciseNameWithAI(name, exercises, equipment) {
   if (!exercises || !name) return null;
+  const tier = equipmentTierFrom(equipment);
 
-  // Check AI cache first
+  // Check AI cache first. Gated on read — see the cache note in resolveExerciseName.
   const cached = aiExerciseNameCache.get(name.toLowerCase().trim());
-  if (cached !== undefined) return cached; // cached null = confirmed no match
+  if (cached !== undefined) return equipmentAllowedForTier(cached, tier) ? cached : null; // cached null = confirmed no match
 
   try {
-    const exerciseList = exercises.slice(0, 500).map(e => e.name).join(', ');
+    // Offer only what the user's tier can actually perform, so the model cannot pick a
+    // barbell movement in the first place. At full_gym this filter passes everything and
+    // the list is identical to before.
+    const eligible = exercises.filter(e => equipmentAllowedForTier(e.name, tier));
+    if (!eligible.length) return null; // nothing to match against — skip the doomed call
+    const exerciseList = eligible.slice(0, 500).map(e => e.name).join(', ');
     // Use global anthropic instance — don't re-instantiate
     const msg = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
@@ -311,9 +320,11 @@ async function normaliseExerciseNameWithAI(name, exercises) {
     });
 
     const result = msg.content[0].text.trim();
-    const matched = result === 'NONE' ? null : (exercises.find(e => e.name === result)?.name || null);
+    const matched = result === 'NONE' ? null : (eligible.find(e => e.name === result)?.name || null);
+    // Cache the RAW catalogue match, never the tier-filtered one: the cache is shared
+    // across all users and keyed by name only. The gate is applied on the way out.
     aiExerciseNameCache.set(name.toLowerCase().trim(), matched);
-    return matched;
+    return equipmentAllowedForTier(matched, tier) ? matched : null;
   } catch(e) {
     console.error('AI exercise normalisation error:', e.message);
     return null;
@@ -475,25 +486,112 @@ const MANUAL_EXERCISE_MAP = {
   'dumbbell tricep kickback':'Dumbbell Tricep Kickback',
 };
 
+// ── EQUIPMENT TIER GUARD (resolver) ──────────────────
+// profiles.equipment is a comma-joined multi-select of the three onboarding options.
+// resolveExerciseName below may normalise a name, but must NEVER raise an exercise into
+// a tier the user does not own. Stripping the literal token 'bodyweight' and looking the
+// bare name up in MANUAL_EXERCISE_MAP turned 'Bodyweight Squat' into 'Barbell Squat' for
+// a bands-and-bodyweight user — deterministically, with no AI call involved.
+//
+// MANUAL_EXERCISE_MAP itself is NOT modified: it is correct for a full_gym user. Only its
+// APPLICATION is gated.
+const EQUIPMENT_TIER_ORDER = ['minimal', 'home_gym', 'full_gym'];
+
+// Equipment classes each tier grants. null = no restriction at all.
+const EQUIPMENT_TIER_ALLOWS = {
+  minimal:  ['bodyweight', 'bands'],
+  home_gym: ['bodyweight', 'bands', 'dumbbell', 'barbell', 'weighted', 'ab_wheel'],
+  full_gym: null,
+};
+
+// Equipment implied by a resolved exercise NAME. Reading the name (not a catalogue field)
+// keeps this working whatever shape the exercise objects take. Order matters: 'smith
+// machine' and 'trap bar' must be tested before the bare 'machine' / 'bar' families they
+// contain.
+const EQUIPMENT_NAME_SIGNALS = [
+  { re: /\bsmith\s+machine\b/i, equip: 'machine'    },
+  { re: /\btrap\s+bar\b/i,      equip: 'barbell'    },
+  { re: /\bez[\s-]?bar\b/i,     equip: 'barbell'    },
+  { re: /\bbarbell\b/i,         equip: 'barbell'    },
+  { re: /\bdumbbell\b/i,        equip: 'dumbbell'   },
+  { re: /\bkettlebell\b/i,      equip: 'kettlebell' },
+  { re: /\bcable\b/i,           equip: 'cable'      },
+  { re: /\bmachine\b/i,         equip: 'machine'    },
+  { re: /\bweighted\b/i,        equip: 'weighted'   },
+  { re: /\bab\s+wheel\b/i,      equip: 'ab_wheel'   },
+  { re: /\bbands?\b/i,          equip: 'bands'      },
+  { re: /\bbodyweight\b/i,      equip: 'bodyweight' },
+];
+
+// The equipment step is a MULTI-select, so the HIGHEST tier ticked wins: someone who
+// ticked Full Gym as well as Minimal does own the full gym. Empty or unrecognised falls
+// back to full_gym — the same default buildPlanPrompt uses, so nothing changes for a
+// profile that predates this guard.
+function equipmentTierFrom(equipment) {
+  if (!equipment) return 'full_gym';
+  const raw = String(equipment).toLowerCase();
+  let best = -1;
+  for (let i = 0; i < EQUIPMENT_TIER_ORDER.length; i++) {
+    if (raw.includes(EQUIPMENT_TIER_ORDER[i])) best = i;
+  }
+  return best === -1 ? 'full_gym' : EQUIPMENT_TIER_ORDER[best];
+}
+
+function exerciseEquipmentFromName(name) {
+  if (!name) return null;
+  for (const sig of EQUIPMENT_NAME_SIGNALS) if (sig.re.test(name)) return sig.equip;
+  return null; // no equipment word in the name — nothing to gate on
+}
+
+// True when `resolvedName` is reachable with what `tier` grants. A name carrying no
+// equipment word is allowed: this guard only ever BLOCKS a named upgrade, it never
+// invents a restriction. full_gym short-circuits to true, so its behaviour is untouched.
+function equipmentAllowedForTier(resolvedName, tier) {
+  const allows = EQUIPMENT_TIER_ALLOWS[tier];
+  if (!allows) return true;
+  const equip = exerciseEquipmentFromName(resolvedName);
+  if (!equip) return true;
+  return allows.includes(equip);
+}
+
 // Resolve AI exercise name -> exact MuscleWiki name
 // Priority: manual map -> fuzzy cache match -> AI normalisation
-async function resolveExerciseName(name, exercises) {
+// `equipment` is the user's profiles.equipment string. It gates EVERY mapping so the
+// resolver can never hand back an exercise the user has no equipment for. Omitting the
+// argument resolves at full_gym, which is exactly the pre-existing behaviour.
+async function resolveExerciseName(name, exercises, equipment) {
   if (!name) return null;
   const lower = name.toLowerCase().trim();
+  const tier = equipmentTierFrom(equipment);
 
-  // 1. Manual map (instant)
-  if (MANUAL_EXERCISE_MAP[lower]) return MANUAL_EXERCISE_MAP[lower];
+  // 1. Manual map (instant). A blocked mapping returns null rather than a substitute, so
+  //    the caller keeps the model's original name instead of gaining equipment the user
+  //    does not own — every call site already guards on a truthy result.
+  if (MANUAL_EXERCISE_MAP[lower]) {
+    const mapped = MANUAL_EXERCISE_MAP[lower];
+    return equipmentAllowedForTier(mapped, tier) ? mapped : null;
+  }
 
-  // 2. Stripped manual map (remove equipment prefix)
-  const stripped = lower.replace(/^(barbell|dumbbell|cable|machine|kettlebell|ez bar|ez-bar|bodyweight|bw|db|bb|kb)\s+/i, '');
-  if (stripped !== lower && MANUAL_EXERCISE_MAP[stripped]) return MANUAL_EXERCISE_MAP[stripped];
+  // 2. Stripped manual map (remove equipment prefix). 'bodyweight'/'bw' are stripped only
+  //    for a user who owns other equipment. At minimal tier that token IS the exercise:
+  //    stripping it is what turned 'Bodyweight Squat' into 'squat' -> 'Barbell Squat'.
+  const stripRe = tier === 'minimal'
+    ? /^(barbell|dumbbell|cable|machine|kettlebell|ez bar|ez-bar|db|bb|kb)\s+/i
+    : /^(barbell|dumbbell|cable|machine|kettlebell|ez bar|ez-bar|bodyweight|bw|db|bb|kb)\s+/i;
+  const stripped = lower.replace(stripRe, '');
+  if (stripped !== lower && MANUAL_EXERCISE_MAP[stripped]) {
+    const mapped = MANUAL_EXERCISE_MAP[stripped];
+    return equipmentAllowedForTier(mapped, tier) ? mapped : null;
+  }
 
-  // 3. AI cache
+  // 3. AI cache. The cache is process-wide and keyed by NAME only, so it stores the raw
+  //    catalogue match and the tier gate is applied on read — a minimal-tier user must
+  //    never record a miss that a full_gym user then inherits.
   const aiCached = aiExerciseNameCache.get(lower);
-  if (aiCached !== undefined) return aiCached;
+  if (aiCached !== undefined) return equipmentAllowedForTier(aiCached, tier) ? aiCached : null;
 
   // 4. AI normalisation (async, uses claude-haiku)
-  const aiResult = await normaliseExerciseNameWithAI(name, exercises);
+  const aiResult = await normaliseExerciseNameWithAI(name, exercises, equipment);
   return aiResult;
 }
 
@@ -2113,7 +2211,7 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
                 continue;
               }
               // Not an exact match — resolve via manual map / AI
-              const mwName = await resolveExerciseName(ex.name, mwExercises);
+              const mwName = await resolveExerciseName(ex.name, mwExercises, profile.equipment);
               if (mwName) {
                 const mwEx = mwExercises.find(e => e.name === mwName);
                 ex.name = mwName;
@@ -5066,7 +5164,7 @@ app.post('/api/programmes/generate', requireAuth, loadSubscription, async (req, 
             for (const ex of (day.exercises || [])) {
               const exact = mwExercises.find(e => e.name.toLowerCase() === ex.name.toLowerCase());
               if (exact) { ex.name = exact.name; ex.mw_id = exact.id; continue; }
-              const mwName = await resolveExerciseName(ex.name, mwExercises);
+              const mwName = await resolveExerciseName(ex.name, mwExercises, profile.equipment);
               if (mwName) { const mwEx = mwExercises.find(e => e.name === mwName); ex.name = mwName; if (mwEx) ex.mw_id = mwEx.id; }
             }
           }
@@ -5988,7 +6086,7 @@ app.get('/api/exercise/test-video', requireAuth, requireAdmin, async (req, res) 
     }
 
     // Step 2: Resolve name
-    const resolvedName = await resolveExerciseName(name, exercises);
+    const resolvedName = await resolveExerciseName(name, exercises, req.query.equipment);
     trace.push({ step: 'resolve_name', input: name, resolved: resolvedName });
 
     // Step 3: Find match in cache
@@ -6146,6 +6244,10 @@ app.get('/api/exercise/buftest', requireAuth, requireAdmin, async (req, res) => 
 app.post('/api/exercise/remap-plan', requireAuth, async (req, res) => {
   try {
     const exercises = await getMuscleWikiExercises();
+    // The resolver is equipment-aware: without the profile this endpoint would rewrite a
+    // correct bodyweight plan into barbell movements AND persist the result.
+    const { data: eqProfile } = await supabase
+      .from('profiles').select('equipment').eq('id', req.user.id).maybeSingle();
     if (!exercises) return res.json({ success: false, error: 'Cache not ready' });
 
     const { data: planRow } = await supabase
@@ -6157,7 +6259,7 @@ app.post('/api/exercise/remap-plan', requireAuth, async (req, res) => {
     const plan = planRow.plan_data;
     for (const day of (plan.workout_plan?.days || [])) {
       for (const ex of (day.exercises || [])) {
-        const mwName = await resolveExerciseName(ex.name, exercises);
+        const mwName = await resolveExerciseName(ex.name, exercises, eqProfile?.equipment);
         if (mwName && mwName !== ex.name) {
           ex.name = mwName;
           changed++;
@@ -7390,7 +7492,7 @@ app.post('/api/coach/clients/:clientId/generate-programme', requireAuth, require
             for (const ex of (day.exercises || [])) {
               const exact = mwExercises.find(e => e.name.toLowerCase() === ex.name.toLowerCase());
               if (exact) { ex.name = exact.name; ex.mw_id = exact.id; continue; }
-              const mwName = await resolveExerciseName(ex.name, mwExercises);
+              const mwName = await resolveExerciseName(ex.name, mwExercises, profile.equipment);
               if (mwName) { const mwEx = mwExercises.find(e => e.name === mwName); ex.name = mwName; if (mwEx) ex.mw_id = mwEx.id; }
             }
           }
