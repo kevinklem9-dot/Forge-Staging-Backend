@@ -8,6 +8,9 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const Anthropic = require('@anthropic-ai/sdk').default;
 const { createClient } = require('@supabase/supabase-js');
+// Canonical exercise catalogue — see exercise-catalogue.js. Mirrored inline in app.html
+// as EXERCISE_DB; the two must be reconciled on every change.
+const { EXERCISE_CATALOGUE } = require('./exercise-catalogue');
 
 const app = express();
 app.set('trust proxy', 1); // Required for Railway — enables X-Forwarded-For
@@ -123,9 +126,23 @@ async function getYouTubeVideoId(exerciseName) {
   }
 }
 
-// Keep getMuscleWikiExercises as a stub — still used by plan prompt injection
+// Keep getMuscleWikiExercises as a stub. It still returns [] BY DESIGN: several consumers
+// read it, and one of them — POST /api/exercise/remap-plan — is fired automatically 5s
+// after every login (app.html, "api('/api/exercise/remap-plan'"). It rewrites the user's
+// SAVED plan in place and persists it. Pointing this at a real catalogue would therefore
+// mass-rewrite every existing plan in the database on each user's next login, and because
+// buildPlanPrompt asks the model to write exercise names in the user's own language, it
+// would run non-English plans through Haiku against an English list and English-ify them.
+// Use getExerciseCatalogue() for anything that needs the real data.
 async function getMuscleWikiExercises() {
   return mwExerciseCache || [];
+}
+
+// The real exercise catalogue — canonical copy in exercise-catalogue.js, mirrored inline
+// in app.html as EXERCISE_DB for the offline programme builder. Consumed by
+// buildPlanPrompt so the model picks from movements the user can actually perform.
+function getExerciseCatalogue() {
+  return EXERCISE_CATALOGUE;
 }
 
 
@@ -552,6 +569,58 @@ function equipmentAllowedForTier(resolvedName, tier) {
   const equip = exerciseEquipmentFromName(resolvedName);
   if (!equip) return true;
   return allows.includes(equip);
+}
+
+// Catalogue entries the user's equipment tier allows. Reads the catalogue's own
+// `equipment` field — authoritative data, unlike the name-signal classifier above, which
+// the resolver only needs because it works on model-invented strings. Empty catalogue or
+// empty tier both yield [], which callers treat as "inject nothing".
+function filterCatalogueForTier(catalogue, equipment) {
+  if (!Array.isArray(catalogue) || !catalogue.length) return [];
+  const allows = EQUIPMENT_TIER_ALLOWS[equipmentTierFrom(equipment)];
+  if (!allows) return catalogue.slice();
+  return catalogue.filter(e => allows.includes(e.equipment));
+}
+
+// ── EQUIPMENT CONSTRAINT — PROMPT TEXT ───────────────
+// profiles.equipment stores an internal enum token (minimal / home_gym / full_gym) whose
+// meaning exists ONLY in a frontend i18n string and never leaves the browser. It must never
+// reach a prompt raw: the model has no way to know what 'minimal' permits. These render it
+// in plain English.
+//
+// Register matters as much as content. The old line was a bullet — "- Equipment: minimal" —
+// sitting between "- Height: 180cm" and "- Diet style: anything", which reads as
+// descriptive metadata, not as a rule. The prompt already has a register for real rules
+// ("EXERCISE DATABASE — CRITICAL RULE:", "You MUST", "Do NOT"). This matches it.
+const EQUIPMENT_CONSTRAINT_TEXT = {
+  minimal: {
+    has: 'resistance bands and their own bodyweight',
+    forbid: 'Do NOT program any exercise that requires a barbell, dumbbells, kettlebells, a cable machine, or any gym machine.',
+  },
+  home_gym: {
+    has: 'resistance bands, their own bodyweight, dumbbells and a barbell',
+    forbid: 'Do NOT program any exercise that requires a cable machine, a gym machine, or a kettlebell.',
+  },
+  full_gym: {
+    has: 'a fully equipped gym — barbells, dumbbells, cables, machines and kettlebells are all available',
+    forbid: null, // nothing is withheld, so nothing is forbidden and no block is emitted
+  },
+};
+
+// Plain-English description of what the user has, for the PROFILE bullet.
+function equipmentPlainText(equipment) {
+  return EQUIPMENT_CONSTRAINT_TEXT[equipmentTierFrom(equipment)].has;
+}
+
+// The binding constraint block. Returns '' for full_gym: a user with everything gains no
+// restriction, so their prompt stays functionally equivalent to before this change.
+function equipmentConstraintBlock(equipment) {
+  const t = EQUIPMENT_CONSTRAINT_TEXT[equipmentTierFrom(equipment)];
+  if (!t.forbid) return '';
+  return `EQUIPMENT — CRITICAL RULE:
+This person trains with ${t.has}. That is the complete list of what they have access to.
+${t.forbid}
+EVERY exercise you program MUST be performable with ${t.has}. If a movement you would normally choose needs equipment they do not have, choose a different movement that does not. Do NOT assume access to a gym.`;
 }
 
 // Resolve AI exercise name -> exact MuscleWiki name
@@ -2156,7 +2225,9 @@ app.post('/api/generate-plan', requireAuth, async (req, res) => {
 
     // Fetch MuscleWiki exercise list to inject into prompt
     const mwExercises = await getMuscleWikiExercises();
-    const prompt = buildPlanPrompt(profile, language, mwExercises);
+    // Real catalogue for the PROMPT only. mwExercises (still the MuscleWiki-shaped stub)
+    // continues to feed the remap gate below — see getExerciseCatalogue for why.
+    const prompt = buildPlanPrompt(profile, language, getExerciseCatalogue());
 
     // Try up to 2 times in case of JSON parse failure
     let plan = null;
@@ -3879,6 +3950,39 @@ app.get('/api/metrics/latest', requireAuth, async (req, res) => {
 
 // ── PROMPT BUILDERS ────────────────────────────
 function buildPlanPrompt(profile, language, mwExercises) {
+  // ── EXERCISE CATALOGUE INJECTION ──────────────────────
+  // Filtered to what this user's equipment tier allows, so the model is never shown a
+  // movement they cannot perform. Categories are DERIVED from the filtered set, not
+  // hardcoded — the old six-element array omitted Bands entirely, so a bands-and-bodyweight
+  // user could never have been offered a band exercise even with a populated catalogue.
+  //
+  // An empty catalogue omits the block ENTIRELY. The old guard was `mwExercises ?`, and []
+  // is truthy, so every plan for every user shipped a "CRITICAL RULE" ordering the model to
+  // copy verbatim from a list that was not there.
+  const tierExercises = filterCatalogueForTier(mwExercises, profile.equipment);
+  const byEquipment = {};
+  for (const e of tierExercises) (byEquipment[e.equipment] = byEquipment[e.equipment] || []).push(e.name);
+  const catalogueBlock = tierExercises.length
+    ? `EXERCISE DATABASE — CRITICAL RULE:
+You MUST use exercise names EXACTLY as they appear in this list. Copy the name character-for-character. Do NOT paraphrase, abbreviate, or invent names.
+If an exercise is not in this list, pick the closest one that IS in the list.
+${Object.keys(byEquipment).sort().map(k => k.toUpperCase() + ': ' + byEquipment[k].slice(0, 50).join(' | ')).join('\n')}
+REPEAT: Every exercise "name" field must be copied verbatim from the list above.`
+    : '';
+
+  // Equipment constraint, as its own CRITICAL RULE block rather than a PROFILE bullet.
+  // Empty string for full_gym — a user with everything gains no restriction.
+  const equipmentBlock = equipmentConstraintBlock(profile.equipment);
+
+  // Exemplar for the JSON schema below, taken from the user's OWN tier-filtered catalogue.
+  // Two reasons. A minimal user must not meet a barbell name anywhere in their prompt — the
+  // schema example is the most imitated text in it. And the old exemplar, "Barbell Bench
+  // Press", named an exercise that is NOT in the catalogue the prompt had just ordered the
+  // model to copy from verbatim; the catalogue calls it "Bench Press".
+  const exampleEx = tierExercises.find(e => e.type === 'compound' && (e.primary || []).includes('chest'))
+    || tierExercises.find(e => e.type === 'compound')
+    || null;
+  const exampleExName = exampleEx ? exampleEx.name : 'Push Up';
   const langNames = {en:'English',es:'Spanish',fr:'French',de:'German',it:'Italian',pt:'Portuguese',nl:'Dutch',uk:'Ukrainian',fi:'Finnish',ar:'Arabic',zh:'Chinese',ja:'Japanese'};
   const langName = (language && language !== 'en') ? (langNames[language] || 'English') : 'English';
   // Sanitise all string fields to prevent JSON issues
@@ -3906,7 +4010,7 @@ PROFILE:
 - Training days per week: ${profile.days_per_week || 4}
 - Preferred training days: ${safe(profile.preferred_days, 'flexible')}
 - Session length: ${durationContext} Size each day's exercise count and total volume to fit the available time (account for warm-up and rest between sets).
-- Equipment: ${safe(profile.equipment, 'full_gym')}
+- Equipment available: ${equipmentPlainText(profile.equipment)}
 - Diet style: ${safe(profile.diet_style, 'anything')}
 - Diet restrictions: ${safe(profile.diet_restrictions, 'none')}
 - Injuries or limitations: ${safe(profile.injuries, 'none')}${
@@ -3915,14 +4019,7 @@ PROFILE:
   : ''
 }
 
-${mwExercises ? `EXERCISE DATABASE — CRITICAL RULE:
-You MUST use exercise names EXACTLY as they appear in this list. Copy the name character-for-character. Do NOT paraphrase, abbreviate, or invent names.
-If an exercise is not in this list, pick the closest one that IS in the list.
-${['Barbell','Dumbbell','Cable','Machine','Bodyweight','Kettlebell'].map(cat => {
-  const exs = mwExercises.filter(e => e.category === cat).map(e => e.name).slice(0, 50);
-  return exs.length ? cat.toUpperCase() + ': ' + exs.join(' | ') : '';
-}).filter(Boolean).join('\n')}
-REPEAT: Every exercise "name" field must be copied verbatim from the list above.` : ''}
+${equipmentBlock ? equipmentBlock + '\n\n' : ''}${catalogueBlock}
 
 CRITICAL INSTRUCTIONS:
 1. Respond ONLY with a single valid JSON object. No text before or after it.
@@ -3944,7 +4041,7 @@ Use EXACTLY this JSON structure:
         "muscles": ["Chest", "Shoulders", "Triceps"],
         "exercises": [
           {
-            "name": "Barbell Bench Press",
+            "name": "${exampleExName}",
             "note": "Full ROM, control the negative",
             "sets": "4",
             "reps": "6-8",
@@ -4020,6 +4117,11 @@ function buildCoachPrompt(profile, planData, recentHistory, context, language, a
     ? `\nLANGUAGE: You MUST respond entirely in ${langNames[language] || language}. Every word of your response must be in ${langNames[language] || language}. Do not switch to English under any circumstances.`
     : '';
 
+  // Equipment constraint. The old prompt carried the raw enum token as a bare suffix on the
+  // Training line ("4 days/week, minimal") and put no equipment condition on ANY PLAN_UPDATE
+  // type — the chat could introduce a barbell for a bands-only user and it would be applied.
+  const equipmentBlock = equipmentConstraintBlock(profile?.equipment);
+
   return `IMPORTANT: Never output your internal reasoning, thinking process, JSON structures, or technical plan instructions in plain text. Your visible response must only contain natural coaching language. PLAN_UPDATE tags are processed automatically and never shown to users.
 
 You are a world-class personal trainer and nutrition coach embedded in the FORGE fitness app. You are coaching a specific client. Be direct, specific, and actionable. No fluff. Use their exact numbers when relevant.${contextStr}${langStr}
@@ -4030,9 +4132,11 @@ CLIENT PROFILE:
 - Height: ${profile?.height_cm}cm, Weight: ${profile?.weight_kg}kg
 - Goal: ${profile?.goal}
 - Experience: ${profile?.experience}
-- Training: ${profile?.days_per_week} days/week, ${profile?.equipment}
+- Training: ${profile?.days_per_week} days/week
+- Equipment available: ${equipmentPlainText(profile?.equipment)}
 - Diet: ${profile?.diet_style} — restrictions: ${profile?.diet_restrictions || 'none'}
 - Injuries: ${profile?.injuries || 'none'}
+${equipmentBlock ? `\n` + equipmentBlock : ''}
 
 FULL WORKOUT PROGRAMME:
 ${fullPlanStr}
@@ -4070,10 +4174,10 @@ PLAN UPDATE TYPES — use exactly as shown:
 <PLAN_UPDATE>{"type":"reschedule_days","mapping":[{"from_day_index":0,"to_day_index":4}],"summary":"Moved Monday workout to Friday"}</PLAN_UPDATE>
 
 2. SWAP AN EXERCISE:
-<PLAN_UPDATE>{"type":"swap_exercise","day_index":0,"old_exercise":"Bench Press","new_exercise":{"name":"Dumbbell Press","note":"Full ROM","sets":"4","reps":"8-10","rest":"2 min","rpe":8},"summary":"Swapped Bench Press for Dumbbell Press on Monday"}</PLAN_UPDATE>
+<PLAN_UPDATE>{"type":"swap_exercise","day_index":0,"old_exercise":"Current Exercise Name","new_exercise":{"name":"Replacement Exercise Name","note":"Full ROM","sets":"4","reps":"8-10","rest":"2 min","rpe":8},"summary":"Swapped Current Exercise Name for Replacement Exercise Name on Monday"}</PLAN_UPDATE>
 
 3. CHANGE EXERCISE SETS/REPS:
-<PLAN_UPDATE>{"type":"update_exercise","day_index":0,"exercise_name":"Bench Press","changes":{"sets":"5","reps":"3-5"},"summary":"Updated Bench Press to 5x3-5"}</PLAN_UPDATE>
+<PLAN_UPDATE>{"type":"update_exercise","day_index":0,"exercise_name":"Exercise Name","changes":{"sets":"5","reps":"3-5"},"summary":"Updated Exercise Name to 5x3-5"}</PLAN_UPDATE>
 
 4. CHANGE NUTRITION MACROS:
 <PLAN_UPDATE>{"type":"update_nutrition","changes":{"calories":3100,"protein_g":200,"carbs_g":360,"fat_g":90},"summary":"Updated macros to 3100 kcal"}</PLAN_UPDATE>
@@ -4094,13 +4198,13 @@ PLAN UPDATE TYPES — use exactly as shown:
 9. RENAME A DAY'S LABEL (e.g. "Push A" → "Chest & Triceps"):
 <PLAN_UPDATE>{"type":"rename_day","day_index":0,"label":"Chest & Triceps","summary":"Renamed Monday to Chest and Triceps"}</PLAN_UPDATE>
 
-- Add a training day: <PLAN_UPDATE>{"type":"add_day","day":{"day_index":4,"day_name":"Friday","label":"Lower Body B","exercises":[{"name":"Squat","note":"Full depth","sets":"4","reps":"6-8","rest":"3 min","rpe":8}]},"summary":"Added Friday lower body session"}</PLAN_UPDATE>
+- Add a training day: <PLAN_UPDATE>{"type":"add_day","day":{"day_index":4,"day_name":"Friday","label":"Lower Body B","exercises":[{"name":"Exercise Name","note":"Full depth","sets":"4","reps":"6-8","rest":"3 min","rpe":8}]},"summary":"Added Friday lower body session"}</PLAN_UPDATE>
 
 - Remove a training day: <PLAN_UPDATE>{"type":"remove_day","day_index":4,"summary":"Removed Friday session"}</PLAN_UPDATE>
 
 - Update goals/split: <PLAN_UPDATE>{"type":"update_goals","goal":"hypertrophy","days_per_week":4,"split_type":"Upper/Lower","summary":"Updated to 4-day upper/lower split"}</PLAN_UPDATE>
 
-- Replace entire workout plan: <PLAN_UPDATE>{"type":"replace_workout_plan","workout":{"days_per_week":4,"split_type":"Push/Pull/Legs","goal":"muscle","days":[{"day_index":0,"day_name":"Monday","label":"Push A","exercises":[{"name":"Bench Press","note":"Controlled descent","sets":"4","reps":"6-8","rest":"3 min","rpe":8}]}]},"summary":"Complete new 4-day Push/Pull/Legs programme"}</PLAN_UPDATE>
+- Replace entire workout plan: <PLAN_UPDATE>{"type":"replace_workout_plan","workout":{"days_per_week":4,"split_type":"Push/Pull/Legs","goal":"muscle","days":[{"day_index":0,"day_name":"Monday","label":"Push A","exercises":[{"name":"Exercise Name","note":"Controlled descent","sets":"4","reps":"6-8","rest":"3 min","rpe":8}]}]},"summary":"Complete new 4-day Push/Pull/Legs programme"}</PLAN_UPDATE>
 
 - Replace entire nutrition plan: <PLAN_UPDATE>{"type":"replace_nutrition_plan","nutrition":{"calories":3000,"protein_g":180,"carbs_g":350,"fat_g":85,"meals":[{"name":"Breakfast","time":"7:00 AM","kcal":700,"protein_g":50,"carbs_g":80,"fat_g":20,"foods":[{"name":"Oats","amount":"80g"},{"name":"Whey protein","amount":"1 scoop"}]}]},"summary":"New nutrition plan at 3000 kcal"}</PLAN_UPDATE>
 
@@ -4115,6 +4219,7 @@ CRITICAL RULES FOR PLAN EDITING:
 - Before adding a day, check the existing days in the plan. Do not add a day that already exists at that day_index
 - Before removing a day, verify it exists in the plan first
 - The plan shown in your context is the current live plan — treat it as ground truth
+- EQUIPMENT IS BINDING ON EVERY EDIT. Any exercise you introduce through ANY tag — swap_exercise, update_day, add_day, replace_workout_plan, replace_entire_plan — MUST be performable with the equipment listed in CLIENT PROFILE above. Never introduce an exercise that needs equipment they do not have, even if the user asks for it by name: say what they cannot do and offer a movement they can.
 
 RULES:
 - NEVER mention day_index, field names, JSON structure, or any technical implementation detail in your conversational response. These are for tags only — the user never sees them.
@@ -4146,9 +4251,15 @@ function buildCheckinPrompt(profile, planData, recentHistory, sessionSummary, fe
     ? `\nLANGUAGE: You MUST respond entirely in ${langNames[language] || language}. Every word must be in ${langNames[language] || language}.`
     : '';
 
+  // Equipment. This prompt omitted it entirely, yet its PLAN_UPDATE tag reaches the same
+  // shared applyPlanUpdate() as the coach chat — see the note in the closing rules below.
+  const equipmentBlock = equipmentConstraintBlock(profile?.equipment);
+
   return `You are a world-class personal trainer doing a post-workout check-in with your client. Be warm but direct. Acknowledge how they felt, give specific feedback on their session, and adapt their plan if needed.${langStr}
 
 CLIENT: ${profile?.name || 'User'}, ${profile?.age}yo ${profile?.sex}, Goal: ${profile?.goal}
+- Equipment available: ${equipmentPlainText(profile?.equipment)}
+${equipmentBlock ? `\n` + equipmentBlock : ''}
 
 TODAY'S SESSION:
 ${sessionSummary}
@@ -4177,7 +4288,8 @@ PLAN EDITING: If you decide to adapt the plan based on their feedback, include a
 The tag will be hidden from the user — only your text is shown. Always explain any changes you make in your text response.
 
 - NEVER mention day_index, field names, JSON structure, or any technical implementation detail in your response. These are for tags only.
-- ALWAYS refer to days by their name (Monday, Tuesday etc) or their label in conversation. Never say 'day_index 0' or similar to the user.`;
+- ALWAYS refer to days by their name (Monday, Tuesday etc) or their label in conversation. Never say 'day_index 0' or similar to the user.
+- EQUIPMENT: only ever adjust sets, reps, weight or RPE on exercises ALREADY in their programme. Do NOT rename an exercise, do NOT swap one for another, and do NOT introduce a new exercise here. If their programme genuinely needs a different movement, say so in your reply and tell them to ask the AI coach — never do it from this tag.`;
 }
 
 
@@ -5144,7 +5256,8 @@ app.post('/api/programmes/generate', requireAuth, loadSubscription, async (req, 
     };
 
     const mwExercises = await getMuscleWikiExercises();
-    const prompt = buildPlanPrompt(profile, language, mwExercises);
+    // Real catalogue for the PROMPT only; the remap gate below still reads mwExercises.
+    const prompt = buildPlanPrompt(profile, language, getExerciseCatalogue());
 
     let plan = null, lastError = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -7462,7 +7575,9 @@ app.post('/api/coach/clients/:clientId/generate-programme', requireAuth, require
     const brief = b.brief ? String(b.brief).slice(0, 500).trim() : '';
 
     const mwExercises = await getMuscleWikiExercises();
-    let prompt = buildPlanPrompt(profile, language, mwExercises);
+    // Real catalogue for the PROMPT only. mwExercises (still the MuscleWiki-shaped stub)
+    // continues to feed the remap gate below — see getExerciseCatalogue for why.
+    let prompt = buildPlanPrompt(profile, language, getExerciseCatalogue());
     if (brief) {
       prompt += `\n\nCOACH BRIEF (instructions from the coach — follow these over the defaults above):\n${brief}`;
     }
