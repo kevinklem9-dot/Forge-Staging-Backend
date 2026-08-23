@@ -1499,9 +1499,14 @@ async function handleReferralConversion(userId) {
 
 app.use(express.json({ limit: '500kb' }));
 
-// Rate limiting — protect against abuse. Skipped entirely outside production so
-// staging (NODE_ENV=development) never blocks testing.
-const skipNonProd = (req) => process.env.NODE_ENV !== 'production';
+// Rate limiting — protect against abuse.
+// FAIL-CLOSED (pre-launch security pass): limits apply UNLESS NODE_ENV is EXPLICITLY
+// 'development'. The old predicate was `NODE_ENV !== 'production'`, which disabled every
+// limiter whenever the variable was missing, blank or misspelled — a one-character typo in
+// a Railway variable silently removed all rate limiting, announced only by a log line.
+// Staging deliberately sets NODE_ENV=development, so its behaviour is UNCHANGED: it still
+// skips every limiter. Production, an unset value and any typo are now all protected.
+const skipNonProd = (req) => String(process.env.NODE_ENV || '').trim().toLowerCase() === 'development';
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 500, skip: skipNonProd });
 const chatLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, skip: skipNonProd });
 const planLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 20, skip: skipNonProd, message: { error: 'Too many plan generations — try again in an hour.' } });
@@ -1876,7 +1881,12 @@ const PRIVACY_POLICY_VERSION = 'August 2026';
 
 // ── SIGNUP — Check email + create account ──────
 app.post('/api/signup', signupLimiter, async (req, res) => {
-  const { email, password, name, language, accepted_terms, currency } = req.body;
+  const { email, password, name, language, accepted_terms, currency, marketing_opt_in } = req.body;
+  // MARKETING CONSENT — separate from accepted_terms and NOT required.
+  // accepted_terms covers Terms + Privacy + age. It has never covered marketing email, so it
+  // cannot carry it. This is its own unticked checkbox at all three signup entry points.
+  // Strict true: absent / null / 'false' / anything else is a NO.
+  const marketingOptIn = marketing_opt_in === true;
   if (!email || !password || !name) return res.status(400).json({ error: 'All fields required.' });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Invalid email address.' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
@@ -1938,6 +1948,9 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
         preferred_language: language || 'en',
         terms_accepted_at: new Date().toISOString(),
         privacy_policy_version: PRIVACY_POLICY_VERSION,
+        // The auditable record of the marketing choice. Mailchimp tags are a mailing tool,
+        // not a consent log — this column is what proves what the user actually ticked.
+        marketing_opt_in: marketingOptIn,
         ...(signupCurrency ? { currency: signupCurrency } : {})
       };
       // If the consent migration has not been run yet those two columns do not exist and
@@ -1957,6 +1970,16 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
         delete profilePayload.currency;
         console.error('[signup] profiles.currency missing — run the currency migration. Profile written without a currency preference.');
       };
+      // Same protection for profiles.marketing_opt_in. Until the marketing-consent migration
+      // is run the column does not exist and the whole write would fail — which would break
+      // signup for everyone. Drop the field, keep the rest of the profile, log loudly.
+      const isMissingMarketingColumn = (err) =>
+        !!err && err.message?.includes('marketing_opt_in') &&
+        /column|does not exist|schema cache/i.test(err.message || '');
+      const stripMarketing = () => {
+        delete profilePayload.marketing_opt_in;
+        console.error('[signup] profiles.marketing_opt_in missing — run the marketing-consent migration. Profile written without a marketing consent record.');
+      };
 
       let profileSet = false;
       for (let attempt = 1; attempt <= 5; attempt++) {
@@ -1970,6 +1993,7 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
         if (updated?.id) { profileSet = true; break; }
         if (isMissingConsentColumn(updateErr)) stripConsent();
         if (isMissingCurrencyColumn(updateErr)) stripCurrency();
+        if (isMissingMarketingColumn(updateErr)) stripMarketing();
         if (attempt === 5) console.error('Profile update failed after 5 attempts:', updateErr?.message);
       }
       // If profile row still doesn't exist, upsert it — same payload, consent AND currency
@@ -1977,21 +2001,28 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
       // the consent columns and currency needs more than one strip: loop, strip whatever the
       // error names, retry. Bounded at 3 (first attempt + one per optional column group) and
       // breaks immediately on success or on any error that is not a missing column.
+      // Bound is 4: first attempt + one per optional column group (consent, currency,
+      // marketing). Raise this if another optional group is ever added.
       if (!profileSet) {
-        for (let i = 0; i < 3; i++) {
+        for (let i = 0; i < 4; i++) {
           const { error: upsertErr } = await supabase.from('profiles').upsert({
             id: data.user.id,
             ...profilePayload
           });
           if (!upsertErr) break;
           let stripped = false;
-          if (isMissingConsentColumn(upsertErr))  { stripConsent();  stripped = true; }
-          if (isMissingCurrencyColumn(upsertErr)) { stripCurrency(); stripped = true; }
+          if (isMissingConsentColumn(upsertErr))   { stripConsent();   stripped = true; }
+          if (isMissingCurrencyColumn(upsertErr))  { stripCurrency();  stripped = true; }
+          if (isMissingMarketingColumn(upsertErr)) { stripMarketing(); stripped = true; }
           if (!stripped) break;
         }
       }
 
-      // Add to Mailchimp audience (fire-and-forget)
+      // Add to Mailchimp audience (fire-and-forget).
+      // status:'subscribed' stays as-is ON PURPOSE. The 7-day welcome sequence it triggers is
+      // TRANSACTIONAL — it explains the trial the user just started. Marketing is separated by
+      // TAG, not by audience: the 'marketing_opt_in' tag below is added only when the second,
+      // unticked checkbox was ticked, and every promotional send must segment on that tag.
       if (process.env.MAILCHIMP_API_KEY &&
           process.env.MAILCHIMP_AUDIENCE_ID) {
         const mcServer = process.env.MAILCHIMP_SERVER
@@ -2021,7 +2052,9 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
               FNAME: firstName,
               LNAME: lastName
             },
-            tags: ['trial']
+            // Same audience, never a second one. 'trial' is lifecycle; 'marketing_opt_in'
+            // is consent. Segment promotional campaigns on the second tag.
+            tags: marketingOptIn ? ['trial', 'marketing_opt_in'] : ['trial']
           })
         })
         .then(async res => {
@@ -2654,6 +2687,91 @@ app.get('/api/profile', requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ profile: data });
   } catch (err) {
+    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── MARKETING EMAIL CONSENT ────────────────────
+// Backs the Account panel toggle. Someone who declined at signup can opt in later, and
+// someone who opted in can withdraw it — GDPR requires withdrawal to be as easy as giving it.
+//
+// ORDER MATTERS: Mailchimp is written FIRST, the profiles column SECOND. If the tag write
+// fails the request 502s and the stored consent is left untouched, so the database and the
+// mailing tool can never disagree about what the user asked for. No rollback path exists
+// because there is nothing to roll back.
+//
+// Same audience, same member, ONE tag:
+//   POST /lists/{AUDIENCE_ID}/members/{md5(lowercase email)}/tags
+//   { tags: [{ name: 'marketing_opt_in', status: 'active' | 'inactive' }] }
+// 'inactive' is how Mailchimp REMOVES a tag. It does not unsubscribe the member, which is
+// correct: the transactional 7-day welcome sequence is unaffected in either direction.
+// Scoped to req.user.id — this endpoint can only ever change the caller's own consent.
+app.post('/api/marketing-consent', requireAuth, async (req, res) => {
+  const optIn = req.body?.opt_in === true;
+  const email = req.user?.email;
+  if (!email) return res.status(400).json({ error: 'No email on account.' });
+
+  try {
+    if (process.env.MAILCHIMP_API_KEY && process.env.MAILCHIMP_AUDIENCE_ID) {
+      const mcServer = process.env.MAILCHIMP_SERVER || 'us1';
+      const subscriberHash = require('crypto')
+        .createHash('md5')
+        .update(email.toLowerCase())
+        .digest('hex');
+      const mcUrl = `https://${mcServer}.api.mailchimp.com/3.0/lists/${process.env.MAILCHIMP_AUDIENCE_ID}/members/${subscriberHash}/tags`;
+
+      // Awaited, NOT fire-and-forget like the other Mailchimp calls: the user is watching
+      // this one and needs a truthful answer. Bounded so a slow Mailchimp cannot hold the
+      // request open indefinitely.
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      try {
+        const mcRes = await fetch(mcUrl, {
+          method: 'POST',
+          signal: controller.signal,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Basic ' +
+              Buffer.from('anystring:' + process.env.MAILCHIMP_API_KEY).toString('base64')
+          },
+          body: JSON.stringify({
+            tags: [{ name: 'marketing_opt_in', status: optIn ? 'active' : 'inactive' }]
+          })
+        });
+        // 404 = this email is not in the audience (account pre-dates Mailchimp, or the
+        // signup add failed). There is nothing to tag, and creating the member here would
+        // be a subscribe the user never asked for. Treat as done — the profiles column
+        // below is the consent record that matters.
+        if (!mcRes.ok && mcRes.status !== 404) {
+          const bodyText = await mcRes.text().catch(() => '');
+          console.error('[mailchimp] marketing tag failed:', mcRes.status, bodyText.slice(0, 300));
+          return res.status(502).json({ error: 'marketing_sync_failed' });
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    const { error } = await supabase
+      .from('profiles')
+      .update({ marketing_opt_in: optIn })
+      .eq('id', req.user.id);
+    if (error) {
+      // Fail loudly rather than silently: a toggle that reports success while storing
+      // nothing is worse than one that says the migration has not been run.
+      if (error.message?.includes('marketing_opt_in')) {
+        console.error('[marketing-consent] profiles.marketing_opt_in missing — run marketing-consent-migration.sql.');
+        return res.status(503).json({ error: 'marketing_column_missing' });
+      }
+      throw error;
+    }
+
+    res.json({ success: true, marketing_opt_in: optIn });
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      console.error('[mailchimp] marketing tag timed out');
+      return res.status(504).json({ error: 'marketing_sync_timeout' });
+    }
     console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -4906,7 +5024,33 @@ app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, re
       return res.status(403).json({ error: 'Cannot delete the admin account.' });
     }
 
-    // Delete all user data from every table first
+    // Delete all user data from every table first.
+    //
+    // ── WHAT IS AND IS NOT LISTED HERE (pre-launch audit) ────────────────────────────
+    // Every coach_* table below CASCADES to profiles on BOTH its coach_id and client_id
+    // columns, so the `profiles` delete further down already removes exactly the right rows
+    // and nothing more — an explicit delete here would be redundant, not safer:
+    //   coach_notes             coach_id → profiles(id) ON DELETE CASCADE
+    //                           client_id → profiles(id) ON DELETE CASCADE
+    //   coach_messages          both columns ON DELETE CASCADE
+    //   coach_session_feedback  both columns ON DELETE CASCADE
+    //   coach_manual_reviews    both columns ON DELETE CASCADE
+    //   coach_ai_review_settings both columns ON DELETE CASCADE
+    // That two-column cascade is also what keeps a CLIENT deletion off the coach's other
+    // data: a note about client B carries client_id = B, so deleting client A never matches it.
+    //
+    // coach_commissions is DELIBERATELY NOT DELETED. Its client_id is
+    //   client_id uuid REFERENCES profiles(id) ON DELETE SET NULL
+    // which is the correct design, not an oversight: the row is the COACH's financial record
+    // of a payment that really happened, and SET NULL already strips the deleted person from
+    // it. Deleting it would destroy the coach's earnings ledger to erase data that is already
+    // gone. (coach_programmes has the same SET NULL shape and is left alone for the same
+    // reason — a template the coach built is the coach's work, not the client's data.)
+    //
+    // The three below DO need explicit deletes — none of them cascades:
+    //   coach_clients.client_id  → profiles(id) ON DELETE SET NULL  (leaves a ghost roster row)
+    //   trial_feedback.user_id   → no foreign key at all
+    //   creator_code_uses.user_id→ no foreign key at all
     await Promise.all([
       supabase.from('exercise_history').delete().eq('user_id', userId),
       supabase.from('session_logs').delete().eq('user_id', userId),
@@ -4924,7 +5068,33 @@ app.delete('/api/admin/users/:userId', requireAuth, requireAdmin, async (req, re
       supabase.from('ai_coach_usage').delete().eq('user_id', userId),
       supabase.from('programmes').delete().eq('user_id', userId),
       supabase.from('monthly_reviews').delete().eq('user_id', userId),
+
+      // coach_clients — SCOPED TO client_id ONLY, never coach_id.
+      // Rows where the deleted user is the COACH already cascade away with the profile.
+      // Rows where they are the CLIENT would survive with client_id set to NULL, leaving a
+      // ghost entry on their coach's roster. Matching on client_id deletes exactly the one
+      // connection that belonged to this person and leaves every other client of that coach
+      // untouched.
+      supabase.from('coach_clients').delete().eq('client_id', userId),
+
+      // No FK on either of these, so nothing removes them when the profile goes.
+      supabase.from('trial_feedback').delete().eq('user_id', userId),
+      supabase.from('creator_code_uses').delete().eq('user_id', userId),
     ]);
+
+    // coach_clients again — PENDING INVITATIONS, matched on email rather than id.
+    // An invite that was never accepted has client_id NULL and the person's address sitting
+    // in invited_email, so neither the cascade nor the client_id delete above touches it and
+    // their email survives the account. Scoped to this one address: it clears the invite from
+    // every coach who sent one to this person and touches nobody else's invitations.
+    // Separate from the Promise.all because it needs targetUser, which may be null.
+    if (targetUser?.email) {
+      const { error: inviteErr } = await supabase
+        .from('coach_clients')
+        .delete()
+        .eq('invited_email', targetUser.email);
+      if (inviteErr) console.error('[admin-delete] pending invite cleanup failed:', inviteErr.message);
+    }
 
     // Delete profile row
     await supabase.from('profiles').delete().eq('id', userId);
