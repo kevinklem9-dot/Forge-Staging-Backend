@@ -3170,6 +3170,26 @@ function applyPlanUpdate(plan, instruction) {
 
 // ── POST-WORKOUT CHECK-IN ──────────────────────
 app.post('/api/checkin', requireAuth, loadSubscription, async (req, res) => {
+  // ── TRANSPORT STATE ─────────────────────────────────────────────────────────
+  // Declared before the try so the catch can always clear the heartbeat. sendResponse
+  // keeps a REAL status while the headers are still open and degrades to a 200-with-error
+  // body once writeHead(200) has committed them — the same trade-off /api/generate-plan
+  // and the coach generators accept in exchange for keep-alive.
+  let heartbeat = null;
+  const sendResponse = (status, data) => {
+    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+    if (res.writableEnded) return;
+    if (res.headersSent) res.end(JSON.stringify(data));
+    else res.status(status).json(data);
+  };
+
+  // Client-abort flag. Node keeps running this handler after the browser gives up, so a
+  // check-in the user was told had failed could still spend a month of AI quota. `close`
+  // before `writableEnded` is the abort signal — req.aborted is deprecated on Node 22.
+  // Read only by the quota increment below; the plan write is deliberately NOT guarded.
+  let clientGone = false;
+  res.on('close', () => { if (!res.writableEnded) clientGone = true; });
+
   try {
     // If this user's coach has disabled post-workout check-ins, skip silently
     // and tell the client there's nothing to show.
@@ -3188,6 +3208,23 @@ app.post('/api/checkin', requireAuth, loadSubscription, async (req, res) => {
         });
       }
     }
+
+    // ── TRANSPORT ─────────────────────────────────────────────────────────────
+    // Non-streaming Sonnet 5 call with up to 3 endpoint-level 529 retries on top of the
+    // SDK's own maxRetries: 2 — it can legitimately outlive any silent socket. Same
+    // chunked-heartbeat transport as /api/generate-plan and the coach generators, and
+    // the FIXED form: res.write('\n') sends a real byte, where res.write('') sends zero
+    // bytes under chunked encoding and never keeps the socket alive. /api/checkin is
+    // already in TIMEOUT_EXEMPT, so the 30s request timeout does not kill it.
+    // Everything above this line still returns a real status code (429 cap, 200 disabled).
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.writeHead(200); // commit headers as 200 up front (before the heartbeat flushes them)
+
+    heartbeat = setInterval(() => {
+      try { res.write('\n'); } catch(e) { clearInterval(heartbeat); heartbeat = null; }
+    }, 20000);
 
     const { session_summary, feeling, difficulty, messages, language } = req.body;
 
@@ -3293,17 +3330,23 @@ app.post('/api/checkin', requireAuth, loadSubscription, async (req, res) => {
     // accessTier is 'forge' during trial which would skip tracking entirely
     const actualTier = req.subscription?.tier || 'iron';
     const isExemptUser = req.subscription?.isExempt || false;
-    if (!isExemptUser && !hasAccess('unlimited_coach', actualTier, false)) {
+    // `clientGone` skips the increment when the browser already gave up: the user saw a
+    // failure message, so charging a month's AI quota for a reply they never received is
+    // pure loss to them. The AI call is already paid for either way. Bounded against abuse
+    // by checkinLimiter (5/min) and unreachable in normal use now the heartbeat holds the
+    // socket open.
+    if (!isExemptUser && !hasAccess('unlimited_coach', actualTier, false) && !clientGone) {
       await incrementCoachUsage(req.user.id);
     }
 
-    res.json({ reply: cleanReply, plan_update: planUpdate });
+    sendResponse(200, { reply: cleanReply, plan_update: planUpdate });
   } catch (err) {
     console.error('Checkin error:', err.status || '', err.message);
     if (err.message?.includes('overloaded') || err.status === 529) {
-      return res.status(503).json({ error: 'AI is busy — please try again in a moment.' });
+      return sendResponse(503, { error: 'AI is busy — please try again in a moment.' });
     }
-    console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+    console.error('Server error:', err);
+    sendResponse(500, { error: 'Internal server error' });
   }
 });
 
