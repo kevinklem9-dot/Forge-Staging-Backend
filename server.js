@@ -3168,6 +3168,73 @@ function applyPlanUpdate(plan, instruction) {
   return updated;
 }
 
+// ── CHECK-IN PLAN-EDIT ALLOW-LIST ──────────────
+// applyPlanUpdate above accepts all 14 PLAN_UPDATE types and has no idea who called it.
+// The post-workout check-in is NOT a conversation — the user tapped two buttons — so it
+// has no business replacing a workout plan, rescheduling the week, or renaming an
+// exercise into equipment the user does not own. Fix 3 asked the prompt not to. Prompt
+// text is the weakest layer; this is the same constraint in code.
+//
+// SCOPED AS A SANITISER AT THE PARSE BOUNDARY, NOT A FLAG ON applyPlanUpdate.
+// The check-in handler parses its tag exactly once and feeds the result to three separate
+// applyPlanUpdate calls (plan, workout programme, nutrition programme). Sanitising at the
+// single parse point covers all three by construction, and a future call site added inside
+// that handler inherits the restriction automatically — it passes the only instruction
+// variable in scope. There is no flag to forget. A third parameter on applyPlanUpdate
+// would fail exactly that way: omit it and the caller silently regains all 14 types.
+// /api/chat parses its own tags separately and never touches this — the coach chat keeps
+// the full set, deliberately.
+const CHECKIN_ALLOWED_UPDATE_TYPES = ['update_exercise', 'update_nutrition'];
+
+// Volume and intensity only. `name` is the one that matters: Object.assign in
+// applyPlanUpdate's update_exercise branch has no key restriction, so a bare
+// {"changes":{"name":"Barbell Squat"}} silently swaps the movement — and the equipment
+// with it. `weight` is not in today's exercise schema ({name, note, sets, reps, rest,
+// rpe}); it is allow-listed anyway so adding it later needs no change here.
+const CHECKIN_ALLOWED_EXERCISE_KEYS = ['sets', 'reps', 'weight', 'rpe'];
+
+// Returns a safe instruction, or null to mean "ignore this entirely". Never throws — a
+// rejected edit must still leave the check-in free to return its reply.
+function sanitiseCheckinPlanUpdate(instruction) {
+  const type = instruction?.type;
+
+  if (!CHECKIN_ALLOWED_UPDATE_TYPES.includes(type)) {
+    console.warn('[checkin] PLAN_UPDATE ignored — type not on the check-in allow-list:', type || '(none)');
+    return null;
+  }
+
+  // update_nutrition passes through untouched: macro and meal edits are the check-in's
+  // legitimate job, and its changes object carries no equipment risk.
+  if (type !== 'update_exercise') return instruction;
+
+  const changes = instruction.changes;
+  if (!changes || typeof changes !== 'object' || Array.isArray(changes)) {
+    console.warn('[checkin] update_exercise ignored — no usable `changes` object');
+    return null;
+  }
+
+  const kept = {};
+  const stripped = [];
+  for (const key of Object.keys(changes)) {
+    if (CHECKIN_ALLOWED_EXERCISE_KEYS.includes(key)) kept[key] = changes[key];
+    else stripped.push(key);
+  }
+
+  if (stripped.length) {
+    console.warn('[checkin] update_exercise keys stripped:', stripped.join(', '),
+                 '— kept:', Object.keys(kept).join(', ') || '(none)');
+  }
+
+  if (!Object.keys(kept).length) {
+    console.warn('[checkin] update_exercise ignored — every key was stripped');
+    return null;
+  }
+
+  // Clone rather than mutate, and spread first so type/day_index/exercise_name/summary
+  // survive intact — `summary` is what the client renders on the plan-update badge.
+  return { ...instruction, changes: kept };
+}
+
 // ── POST-WORKOUT CHECK-IN ──────────────────────
 app.post('/api/checkin', requireAuth, loadSubscription, async (req, res) => {
   // ── TRANSPORT STATE ─────────────────────────────────────────────────────────
@@ -3268,9 +3335,22 @@ app.post('/api/checkin', requireAuth, loadSubscription, async (req, res) => {
       .replace(/\bday_index\b/gi, '')
       .trim();
 
-    if (planUpdateMatch && planData) {
+    // Parse and sanitise BEFORE the apply/persist block. sanitiseCheckinPlanUpdate is the
+    // sole gate between a check-in reply and applyPlanUpdate; null means "ignore", which
+    // skips the whole block below — so a rejected type costs no plan write, no
+    // generated_at bump and no translations cache reset. Its own try/catch keeps a
+    // malformed tag from ever reaching the apply path.
+    let updateInstruction = null;
+    if (planUpdateMatch) {
       try {
-        const updateInstruction = JSON.parse(planUpdateMatch[1].trim());
+        updateInstruction = sanitiseCheckinPlanUpdate(JSON.parse(planUpdateMatch[1].trim()));
+      } catch (e) {
+        console.error('Checkin plan update parse error:', e.message);
+      }
+    }
+
+    if (updateInstruction && planData) {
+      try {
         const currentPlan = { workout: planData.workout_plan, nutrition: planData.nutrition_plan };
         const updatedPlan = applyPlanUpdate(currentPlan, updateInstruction);
         await supabase.from('plans').update({
