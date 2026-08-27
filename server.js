@@ -800,6 +800,7 @@ async function sendEmail(to, subject, html) {
 //   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS session_duration_by_day jsonb DEFAULT null;
 //   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS currency text;
 //   ALTER TABLE profiles   ALTER COLUMN currency DROP DEFAULT;
+//   ALTER TABLE profiles   ADD COLUMN IF NOT EXISTS signup_intent_coach boolean DEFAULT false;
 // PATCH /api/profile degrades gracefully if profiles.units / enabled_features is still
 // absent, and the frontend caches both in localStorage, so the app works either way.
 const BOOT_MIGRATIONS = [
@@ -829,6 +830,21 @@ const BOOT_MIGRATIONS = [
   // EXISTS is a no-op once the column exists, so it can never remove the old default on its
   // own. Dropping a default that is not there is also a no-op, so this is safe to re-run.
   `ALTER TABLE profiles ALTER COLUMN currency DROP DEFAULT`,
+  // COACH SIGN-UP INTENT. Set by /api/signup when the account was created on coaches.html;
+  // read by app.html's handleSession() to open coach setup instead of client onboarding;
+  // cleared by /api/coach/setup.
+  //
+  // A COLUMN, not a URL parameter, and that is the whole point. /api/signup always returns
+  // requires_confirmation, so the user leaves the browser for an email link before app.html
+  // ever loads — and the confirmation link lands on FRONTEND_URL (the root), carrying no
+  // query string of its own. Nothing client-side survives that trip: not a query parameter,
+  // not a hash, not sessionStorage, and not localStorage if they confirm on another device.
+  // The previous ?coach_signup=true deep-link died for exactly this reason.
+  //
+  // DEFAULT false, not null: every read is a strict `=== true`, and a three-state column
+  // would invite `!profile.signup_intent_coach` checks that treat "not yet migrated" as
+  // "declined". False is the honest value for every account that did not come from coaches.html.
+  `ALTER TABLE profiles ADD COLUMN IF NOT EXISTS signup_intent_coach boolean DEFAULT false`,
 ];
 (async () => {
   for (const sql of BOOT_MIGRATIONS) {
@@ -982,6 +998,15 @@ const COACH_PLAN_CONFIG = {
   pro:     { seatLimit: 30,       commissionRate: 15 },
   elite:   { seatLimit: Infinity, commissionRate: 20 },
 };
+
+// Feature set written on a FIRST coach setup by an account that never completed client
+// onboarding. Empty = every personal feature off. Mirrors FORGE_COACH_DEFAULT_FEATURES in
+// app.html; keep the two in step. profiles.enabled_features only ever gates PERSONAL panels
+// (AI plans, nutrition, progress, PRs, workout logging, human coach) and that account has
+// null age/weight/goal/equipment and no plan row, so each one opens empty. The coach's own
+// surfaces are unaffected: the AI Coach panel is never gated, and the Clients dashboard is
+// gated on account_type alone (requireCoach / isCoachAccount).
+const COACH_DEFAULT_FEATURES = [];
 
 // Map coach price IDs back to plan name — used by webhook
 function getCoachPlanFromPriceId(priceId) {
@@ -1894,7 +1919,14 @@ const PRIVACY_POLICY_VERSION = '2026-08-23';
 
 // ── SIGNUP — Check email + create account ──────
 app.post('/api/signup', signupLimiter, async (req, res) => {
-  const { email, password, name, language, accepted_terms, currency, marketing_opt_in } = req.body;
+  const { email, password, name, language, accepted_terms, currency, marketing_opt_in, signup_intent_coach } = req.body;
+  // COACH SIGN-UP INTENT — sent only by coaches.html, which is the coach landing page.
+  // Strict true, exactly like marketing consent below: absent / null / 'true' / anything
+  // else is a NO. This is a public POST, so a client-side value is never trusted as
+  // anything more than a hint — it grants no entitlement. All it does is decide which
+  // screen app.html opens first (see handleSession); becoming a coach still requires
+  // going through /api/coach/setup with its own trial and plan checks.
+  const signupIntentCoach = signup_intent_coach === true;
   // MARKETING CONSENT — separate from accepted_terms and NOT required.
   // accepted_terms covers Terms + Privacy + age. It has never covered marketing email, so it
   // cannot carry it. This is its own unticked checkbox at all three signup entry points.
@@ -1964,6 +1996,9 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
         // The auditable record of the marketing choice. Mailchimp tags are a mailing tool,
         // not a consent log — this column is what proves what the user actually ticked.
         marketing_opt_in: marketingOptIn,
+        // Which landing page this account was created on. Survives the email-confirmation
+        // round trip because it lives in the database, not the URL. See BOOT_MIGRATIONS.
+        signup_intent_coach: signupIntentCoach,
         ...(signupCurrency ? { currency: signupCurrency } : {})
       };
       // If the consent migration has not been run yet those two columns do not exist and
@@ -1993,6 +2028,19 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
         delete profilePayload.marketing_opt_in;
         console.error('[signup] profiles.marketing_opt_in missing — run the marketing-consent migration. Profile written without a marketing consent record.');
       };
+      // Same protection for profiles.signup_intent_coach. Until the boot migration lands the
+      // column does not exist and the whole write fails — which would break signup for
+      // everyone, including the client signups that never send the flag. Drop the field, keep
+      // the rest of the profile, log loudly. The cost of the degrade is that a coach who
+      // signed up on coaches.html is routed through client onboarding, i.e. exactly the old
+      // behaviour — never a broken account.
+      const isMissingIntentColumn = (err) =>
+        !!err && err.message?.includes('signup_intent_coach') &&
+        /column|does not exist|schema cache/i.test(err.message || '');
+      const stripIntent = () => {
+        delete profilePayload.signup_intent_coach;
+        console.error('[signup] profiles.signup_intent_coach missing — run the signup-intent migration. Coach sign-ups will fall back to client onboarding.');
+      };
 
       let profileSet = false;
       for (let attempt = 1; attempt <= 5; attempt++) {
@@ -2007,6 +2055,7 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
         if (isMissingConsentColumn(updateErr)) stripConsent();
         if (isMissingCurrencyColumn(updateErr)) stripCurrency();
         if (isMissingMarketingColumn(updateErr)) stripMarketing();
+        if (isMissingIntentColumn(updateErr)) stripIntent();
         if (attempt === 5) console.error('Profile update failed after 5 attempts:', updateErr?.message);
       }
       // If profile row still doesn't exist, upsert it — same payload, consent AND currency
@@ -2014,10 +2063,10 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
       // the consent columns and currency needs more than one strip: loop, strip whatever the
       // error names, retry. Bounded at 3 (first attempt + one per optional column group) and
       // breaks immediately on success or on any error that is not a missing column.
-      // Bound is 4: first attempt + one per optional column group (consent, currency,
-      // marketing). Raise this if another optional group is ever added.
+      // Bound is 5: first attempt + one per optional column group (consent, currency,
+      // marketing, signup intent). Raise this if another optional group is ever added.
       if (!profileSet) {
-        for (let i = 0; i < 4; i++) {
+        for (let i = 0; i < 5; i++) {
           const { error: upsertErr } = await supabase.from('profiles').upsert({
             id: data.user.id,
             ...profilePayload
@@ -2027,6 +2076,7 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
           if (isMissingConsentColumn(upsertErr))   { stripConsent();   stripped = true; }
           if (isMissingCurrencyColumn(upsertErr))  { stripCurrency();  stripped = true; }
           if (isMissingMarketingColumn(upsertErr)) { stripMarketing(); stripped = true; }
+          if (isMissingIntentColumn(upsertErr))    { stripIntent();    stripped = true; }
           if (!stripped) break;
         }
       }
@@ -8103,7 +8153,7 @@ app.post('/api/coach/setup', requireAuth, async (req, res) => {
     // guard in the Stripe webhook). maybeSingle() → null on a missing row (never throws).
     const { data: existingProfile } = await supabase
       .from('profiles')
-      .select('coach_trial_start, coach_plan_status')
+      .select('coach_trial_start, coach_plan_status, onboarding_complete')
       .eq('id', req.user.id)
       .maybeSingle();
     const hadPriorTrial = !!(existingProfile?.coach_trial_start);
@@ -8143,14 +8193,67 @@ app.post('/api/coach/setup', requireAuth, async (req, res) => {
       coach_commission_rate: planConfig.commissionRate,
       coach_bio: (bio || '').toString().slice(0, 200) || null,
       coach_title: (title || '').toString().slice(0, 100),
+      // ── THE ONBOARDING MARKER ──────────────────────────────────────────────────────────
+      // UNCONDITIONAL, and it must stay that way. onboarding_complete is otherwise written
+      // in exactly one place — /api/generate-plan succeeding (see 'Mark onboarding complete'
+      // above) — which is precisely the step a coach skips. Without this line a coach has no
+      // plan row and no flag, so app.html's handleSession() routes them to
+      // showScreen('onboarding') on EVERY subsequent sign-in, and the instant-launch cache
+      // path (cachedPlan && onboarding_complete === true) never applies to them either.
+      // Finishing coach setup IS finishing setup for a coach; this records that.
+      //
+      // Harmless on the other two paths through this endpoint: a plan upgrade and a
+      // re-activation both belong to accounts that already have it true.
+      onboarding_complete: true,
+      // Intent consumed. Set at /api/signup from coaches.html, acted on once by
+      // handleSession(), cleared here so the coach-setup overlay cannot reappear on later
+      // launches. Cleared for every path through this endpoint, not just first setup — an
+      // account that reaches coach setup at all has had its intent honoured.
+      signup_intent_coach: false,
     };
     // Remember the billing preference for when the user hits Stripe at trial end.
     if (['monthly', 'annual'].includes(billing)) updates.coach_billing_preference = billing;
 
-    const { error } = await supabase.from('profiles').update(updates).eq('id', userId);
+    // Switch the personal features off for a coach who arrived without client onboarding —
+    // see COACH_DEFAULT_FEATURES. GATED TWICE, and both gates matter:
+    //   !hadPriorTrial      — first coach setup only. This endpoint is also the plan-upgrade
+    //                         and re-activation path (openCoachSetup('plan')), which must
+    //                         never overwrite features the coach switched back on later.
+    //   !onboarding_complete — protects the trainer who used FORGE personally first and then
+    //                         became a coach from Account settings. Their panels are theirs.
+    const resetFeatures = !hadPriorTrial && existingProfile?.onboarding_complete !== true;
+    if (resetFeatures) updates.enabled_features = COACH_DEFAULT_FEATURES.slice();
+
+    // Two columns above are boot migrations that only land if the project defines the run_sql
+    // RPC (see BOOT_MIGRATIONS): enabled_features and signup_intent_coach. Where either is
+    // absent this whole update fails and coach setup 500s — turning a cosmetic default into a
+    // broken signup. Postgres names one missing column at a time, so loop: strip whatever the
+    // error names, retry. Same pattern as /api/signup and PATCH /api/profile. Bounded at 3
+    // (first attempt + one per optional column); breaks immediately on success or on any error
+    // that is not a missing column.
+    //
+    // account_type, the coach_* fields and onboarding_complete are NEVER stripped. Those are
+    // the point of the endpoint, and onboarding_complete in particular is what keeps the coach
+    // out of the client-onboarding loop — degrading it away would be worse than failing.
+    let error = null;
+    for (let i = 0; i < 3; i++) {
+      ({ error } = await supabase.from('profiles').update(updates).eq('id', userId));
+      if (!error) break;
+      let stripped = false;
+      if (updates.enabled_features !== undefined && error.message?.includes('enabled_features')) {
+        console.error('[coach/setup] profiles.enabled_features missing — run the enabled_features migration. Coach created without the feature default.');
+        delete updates.enabled_features; stripped = true;
+      }
+      if (updates.signup_intent_coach !== undefined && error.message?.includes('signup_intent_coach')) {
+        console.error('[coach/setup] profiles.signup_intent_coach missing — run the signup-intent migration. Coach created without clearing the intent flag.');
+        delete updates.signup_intent_coach; stripped = true;
+      }
+      if (!stripped) break;
+    }
     if (error) throw error;
 
-    res.json({ ok: true, plan, status: trialStatus });
+    // Tells the client to mirror the reset locally without waiting on a profile re-fetch.
+    res.json({ ok: true, plan, status: trialStatus, features_reset: updates.enabled_features !== undefined });
   } catch(err) {
     console.error('Coach setup error:', err.message);
     console.error('Server error:', err); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
