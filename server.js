@@ -3945,13 +3945,18 @@ app.get('/api/stats', requireAuth, async (req, res) => {
     // behaviour exactly. Date keys stay YYYY-MM-DD strings and weekday math is UTC, to
     // stay off-by-one-safe near midnight (see decisions.md -- logged_at is a DATE
     // column, never millisecond math).
-    const { data: planData } = await supabase
+    // ORDER BY generated_at. `plans` has no created_at column — ordering by it made
+    // PostgREST reject the whole query, and with the error unchecked planData came back
+    // undefined, so scheduledDayIndexes was always empty and every calendar day counted
+    // as a training day. The rest-day-aware streak below never actually saw a rest day.
+    const { data: planData, error: statsPlanErr } = await supabase
       .from('plans')
       .select('workout_plan')
       .eq('user_id', req.user.id)
-      .order('created_at', { ascending: false })
+      .order('generated_at', { ascending: false })
       .limit(1)
       .maybeSingle();
+    if (statsPlanErr) console.warn('[stats] plan lookup failed:', statsPlanErr.message);
     const scheduledDayIndexes = (planData?.workout_plan?.days || [])
       .map(d => d.day_index)
       .filter(i => typeof i === 'number'); // plan weekday convention: Mon=0 .. Sun=6
@@ -8685,8 +8690,11 @@ app.get('/api/coach/clients/:clientId/overview', requireAuth, requireCoach, asyn
       // REST-DAY AWARE (mirrors /api/stats): skip the client's scheduled rest days;
       // only a missed SCHEDULED TRAINING day ends the streak. No plan -> every day counts
       // (safe default = old consecutive-day behaviour). UTC weekday math, string date keys.
-      const { data: streakPlan } = await supabase.from('plans')
-        .select('workout_plan').eq('user_id', clientId).order('created_at', { ascending: false }).limit(1).maybeSingle();
+      // ORDER BY generated_at — see the note in /api/stats. Same defect, same effect:
+      // the client's rest days were invisible to this fallback.
+      const { data: streakPlan, error: streakPlanErr } = await supabase.from('plans')
+        .select('workout_plan').eq('user_id', clientId).order('generated_at', { ascending: false }).limit(1).maybeSingle();
+      if (streakPlanErr) console.warn('[coach-overview] streak plan lookup failed:', streakPlanErr.message);
       const scheduledDayIndexes = (streakPlan?.workout_plan?.days || [])
         .map(d => d.day_index).filter(i => typeof i === 'number');
       const isTrainingWeekday = (dateStr) => {
@@ -8716,8 +8724,13 @@ app.get('/api/coach/clients/:clientId/overview', requireAuth, requireCoach, asyn
     // Upcoming sessions — pull from active plan
     let upcoming = [];
     try {
-      const { data: plan } = await supabase.from('plans')
-        .select('workout_plan').eq('user_id', clientId).order('created_at', { ascending: false }).limit(1).maybeSingle();
+      // ORDER BY generated_at. This is why "Upcoming sessions" has never rendered: the
+      // query 400'd on the missing created_at column, and the surrounding try/catch could
+      // not help — PostgREST RETURNS errors, it does not throw them, so `plan` was simply
+      // undefined and `upcoming` stayed [].
+      const { data: plan, error: upcomingPlanErr } = await supabase.from('plans')
+        .select('workout_plan').eq('user_id', clientId).order('generated_at', { ascending: false }).limit(1).maybeSingle();
+      if (upcomingPlanErr) console.warn('[coach-overview] upcoming plan lookup failed:', upcomingPlanErr.message);
       const days = plan?.workout_plan?.days || plan?.workout_plan || [];
       if (Array.isArray(days)) upcoming = days.slice(0, 3);
     } catch(e) { /* plan structure may vary */ }
