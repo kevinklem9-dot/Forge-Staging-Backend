@@ -1612,10 +1612,45 @@ const TIMEOUT_EXEMPT = [
   // Coach-scoped AI nutrition generation — same reasoning, same mid-path clientId.
   /^\/api\/coach\/clients\/[^/]+\/generate-nutrition$/,
 ];
+// Firing the 408 is only half the job. res.setTimeout() does NOT abort the handler —
+// supabase-js queries carry no abort signal, so the work keeps running and calls its own
+// res.json() when the slow query finally resolves. That second send used to throw
+// ERR_HTTP_HEADERS_SENT on every route not exempted above (~137 of them), which is how a
+// background poll ended up logging "Server error: Cannot set headers after they are sent".
+//
+// So the timer now does two things: answer the client, then MARK THE REQUEST DEAD by
+// replacing this one response object's terminators with no-ops. The handler's later
+// res.json() becomes a silent no-op instead of a throw, and every `if (!res.headersSent)`
+// guard in the file still short-circuits correctly because headersSent stays true.
+//
+// Patched per-response and only on the timeout path, so the normal path costs nothing.
+// Deliberately NOT solved by adding more TIMEOUT_EXEMPT entries — exempting
+// /api/notifications/unread-counts is what hid this for as long as it did.
+function killLateResponse(req, res) {
+  res.locals.timedOut = true;
+  const noop = () => res;
+  // Body terminators — the ones a handler actually reaches after an await.
+  for (const m of ['json', 'jsonp', 'send', 'sendStatus', 'sendFile', 'download',
+                   'redirect', 'render', 'end',
+  // Header setters — these throw on their own once headers are out.
+                   'status', 'set', 'header', 'type', 'links', 'vary', 'append',
+                   'cookie', 'clearCookie', 'setHeader', 'removeHeader', 'writeHead']) {
+    res[m] = noop;
+  }
+  res.write = () => true; // node's write() contract is a boolean, not the response
+  console.warn(`[timeout] 30s — ${req.method} ${req.path} answered 408; late handler response suppressed`);
+}
+
 app.use((req, res, next) => {
   if (!TIMEOUT_EXEMPT.some(p => (typeof p === 'string' ? req.path.startsWith(p) : p.test(req.path)))) {
     res.setTimeout(30000, () => {
-      if (!res.headersSent) res.status(408).json({ error: 'Request timeout' });
+      // Headers already committed. The chunked-heartbeat endpoints call res.writeHead(200)
+      // up front and then hold the socket open with a 20s write, which resets this idle
+      // timer before it can fire — but if one ever does land here there is nothing to send
+      // and nothing to suppress, so leave it completely alone.
+      if (res.headersSent || res.writableEnded) return;
+      res.status(408).json({ error: 'Request timeout' });
+      killLateResponse(req, res);
     });
   }
   next();
@@ -3628,13 +3663,19 @@ app.post('/api/log', requireAuth, async (req, res) => {
     }
     const today = new Date().toISOString().split('T')[0];
 
-    // Save session log — upsert pattern: delete today's existing entry then insert fresh
+    // Save session log — upsert pattern: delete today's existing entry then insert fresh.
+    // logged_at is a DATE column (see decisions.md), so today's row is matched with a single
+    // .eq — exactly as the exercise_history delete below does. The previous bound pair,
+    //   .gte('logged_at', today).lt('logged_at', today + 'T23:59:59')
+    // was written for a timestamp column: Postgres coerces 'YYYY-MM-DDT23:59:59' to the SAME
+    // date, so the predicate reduced to `logged_at >= X AND logged_at < X` and matched nothing.
+    // A zero-row delete is not an error, so delError stayed null and nothing logged — every
+    // save inserted a second row instead of replacing the first.
     const { error: delError } = await supabase.from('session_logs')
       .delete()
       .eq('user_id', req.user.id)
       .eq('day_index', day_index)
-      .gte('logged_at', today)
-      .lt('logged_at', today + 'T23:59:59');
+      .eq('logged_at', today);
 
     if (delError) console.warn('session_logs delete warning:', delError.message);
 
@@ -6285,7 +6326,7 @@ app.post('/api/missions/:missionId/complete', requireAuth, async (req, res) => {
   } catch (err) {
     // Non-critical feature — log it but never surface a 404/500 to the client.
     console.warn('[missions] complete fallback for', key, '—', err.message);
-    res.json({ ok: true, mission: key, completed: true });
+    if (!res.headersSent) res.json({ ok: true, mission: key, completed: true });
   }
 });
 
@@ -6453,7 +6494,7 @@ app.get('/api/exercise/debug', requireAuth, requireAdmin, async (req, res) => {
       apiKeyPresent: !!apiKey,
     });
   } catch(err) {
-    console.error('Server error:', err); res.json({ error: 'Internal server error' });
+    console.error('Server error:', err); if (!res.headersSent) res.json({ error: 'Internal server error' });
   }
 });
 
@@ -6536,7 +6577,7 @@ app.get('/api/exercise/mw-debug', requireAuth, requireAdmin, async (req, res) =>
 
     res.json(results);
   } catch(e) {
-    console.error('Server error:', e); res.json({ error: 'Internal server error' });
+    console.error('Server error:', e); if (!res.headersSent) res.json({ error: 'Internal server error' });
   }
 });
 
@@ -6666,7 +6707,7 @@ app.get('/api/exercise/video-test', requireAuth, requireAdmin, async (req, res) 
       message: testReq.statusCode === 200 ? 'API key valid, cache ready' : 'API key issue: status ' + testReq.statusCode,
     });
   } catch(e) {
-    console.error('Server error:', e); res.json({ error: 'Internal server error', status: 0 });
+    console.error('Server error:', e); if (!res.headersSent) res.json({ error: 'Internal server error', status: 0 });
   }
 });
 
