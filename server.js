@@ -1033,6 +1033,190 @@ function getTierFromPriceId(priceId) {
   return map[priceId] || null;
 }
 
+// ── META CONVERSIONS API ───────────────────────────────
+// Server-side conversion reporting to Meta. The browser pixel on the four landing pages
+// already fires these events client-side and generates an event_id per event, which it
+// posts to /api/signup; passing that SAME id back to Meta from here is what makes Meta
+// DEDUPLICATE the browser event against the server event instead of counting one
+// conversion twice. Purchase has no browser counterpart at all — payment completes on
+// Stripe's own domain, where the pixel cannot see it — so the server is the only source.
+//
+// DEFENSIVE, in the same shape as the Resend block above: an unset token or pixel id
+// degrades to a logged no-op rather than crashing the server or breaking a request.
+// Compare sendEmail(): `if (!resend) { console.warn('[email] RESEND_API_KEY not set — skipping email:', subject); return false; }`
+//
+// PRODUCTION ONLY, FAIL-CLOSED. metaIsProduction() requires NODE_ENV to equal
+// 'production' EXACTLY after trim+lowercase — the same predicate style as skipNonProd
+// (~line 1560) but inverted so the safe default is SILENCE. Unset, blank, whitespace,
+// 'Production ' and any typo all normalise to something that is not 'production', so they
+// disable reporting. There is deliberately no `!== 'development'` test anywhere on this
+// path: that is the one-character-typo hole the rate-limit comment below describes, and
+// here it would let staging report test signups into the live ad account.
+// Staging sets NODE_ENV=development, so staging can never report.
+const META_CONVERSIONS_TOKEN = process.env.META_CONVERSIONS_TOKEN;
+const META_PIXEL_ID = process.env.META_PIXEL_ID;
+// Graph API version is pinned, not floating: an unpinned version silently changes payload
+// validation under the app. Override with META_API_VERSION on Railway when this one nears
+// Meta's ~2-year deprecation window.
+const META_API_VERSION = process.env.META_API_VERSION || 'v22.0';
+
+function metaConfigured() {
+  return Boolean(META_CONVERSIONS_TOKEN && META_PIXEL_ID);
+}
+function metaIsProduction() {
+  return String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production';
+}
+
+// ── BOOT-TIME META CHECK ───────────────────────────────
+// Same reasoning as checkStripePrices above: a missing env var must announce itself once,
+// loudly, at boot — not as silent under-reporting discovered weeks later in Events
+// Manager. Deliberately does NOT crash: ad reporting is not worth taking the API down.
+(function checkMetaConfig() {
+  if (!metaIsProduction()) {
+    console.log(`[meta] NODE_ENV is "${process.env.NODE_ENV || 'unset'}" — Conversions API reporting is OFF (production only)`);
+    return;
+  }
+  if (metaConfigured()) {
+    console.log('[meta] Conversions API ✓ — pixel ID + access token set');
+    return;
+  }
+  const missing = [
+    !META_CONVERSIONS_TOKEN && 'META_CONVERSIONS_TOKEN',
+    !META_PIXEL_ID && 'META_PIXEL_ID',
+  ].filter(Boolean);
+  console.error('');
+  console.error('════════════════════════════════════════════════════════════');
+  console.error(`  META CONVERSIONS API DISABLED — ${missing.length} of 2 unset`);
+  console.error('  Signups and payments will NOT be reported to Meta.');
+  console.error('  Ad optimisation will run blind. Nothing else is affected.');
+  console.error('  Set them on Railway, then redeploy:');
+  missing.forEach(k => console.error(`    ${k}`));
+  console.error('════════════════════════════════════════════════════════════');
+  console.error('');
+})();
+
+// SHA-256 of the trimmed, lowercased address — Meta's required normalisation for `em`.
+// A RAW EMAIL MUST NEVER LEAVE THIS PROCESS FOR META. This is the only function that
+// touches one, and it returns null for anything that is not a usable string so a bad
+// value can never fall through into the payload as a literal address.
+function metaHashEmail(email) {
+  if (typeof email !== 'string') return null;
+  const normalised = email.trim().toLowerCase();
+  if (!normalised) return null;
+  return require('crypto').createHash('sha256').update(normalised, 'utf8').digest('hex');
+}
+
+// event_id VALIDATION. On the signup path this value is CLIENT-SUPPLIED, so it is treated
+// as a hint and nothing more: a conservative charset and length, or it is discarded and
+// replaced with a fresh server-generated id. Discarding costs only the browser/server
+// dedup match for that one event — the conversion still fires, which is the priority.
+// Trusting it would put unvalidated client text into an outbound payload.
+const META_EVENT_ID_RE = /^[A-Za-z0-9._:-]{8,100}$/;
+function metaSafeEventId(raw) {
+  if (typeof raw !== 'string' || raw.length > 200) return require('crypto').randomUUID();
+  const trimmed = raw.trim();
+  if (!META_EVENT_ID_RE.test(trimmed)) return require('crypto').randomUUID();
+  return trimmed;
+}
+
+// _fbp / _fbc VALIDATION. Also CLIENT-SUPPLIED, and unlike event_id there is no sensible
+// substitute for a bad one — a fabricated click id is worse than none — so a value that
+// fails this test is simply OMITTED from user_data.
+//
+// Both cookies share one documented shape: fb.<subdomainIndex>.<creationTimeMs>.<payload>.
+// For _fbp the payload is a random number; for _fbc it is the fbclid from the landing URL,
+// which is base64url-ish and can run long — hence the generous last segment and the 400
+// char pre-guard. Anchored with bounded quantifiers, so a hostile long string fails fast.
+const META_BROWSER_ID_RE = /^fb\.[0-9]\.[0-9]{6,20}\.[A-Za-z0-9._-]{1,300}$/;
+function metaSafeBrowserId(raw) {
+  if (typeof raw !== 'string' || raw.length > 400) return null;
+  const trimmed = raw.trim();
+  return META_BROWSER_ID_RE.test(trimmed) ? trimmed : null;
+}
+
+// FIRE-AND-FORGET SENDER. Never awaited by a request path and NEVER throws or rejects:
+// every failure mode — non-production, missing config, no usable email, a rejected fetch,
+// a non-2xx from Meta — is caught and logged right here. The whole body sits inside one
+// try/catch, so the returned promise ALWAYS resolves and an ignored return value cannot
+// produce an unhandled rejection.
+//
+// Follows the file's existing outbound-call idiom, e.g. the Mailchimp tag call in the
+// webhook: `.catch(err => console.error('[mailchimp] Tag error:', err.message))`, and
+// sendEmail()'s `catch (err) { console.error('[email] Exception:', err.message); return false; }`
+//
+// The 8s AbortSignal mirrors why the Anthropic client above carries an explicit timeout:
+// "so a hung upstream call fails fast instead of holding a worker".
+async function metaSendEvent(eventName, { email, eventId, eventTime, value, currency, eventSourceUrl, fbp, fbc } = {}) {
+  try {
+    if (!metaIsProduction()) return false; // staging never reports — see the note above
+    if (!metaConfigured()) return false;   // already reported once, loudly, at boot
+
+    // Meta requires at least one identifier per event. Hashed email is the only one sent,
+    // so no hash means there is nothing to match on and the event would be rejected.
+    const hashedEmail = metaHashEmail(email);
+    if (!hashedEmail) {
+      console.warn('[meta] no usable email — skipping event:', eventName);
+      return false;
+    }
+
+    // Built field by field so an absent or rejected value is OMITTED rather than sent as
+    // null — Meta treats an explicit null as a value and warns on it.
+    const userData = { em: [hashedEmail] };
+    const safeFbp = metaSafeBrowserId(fbp);
+    const safeFbc = metaSafeBrowserId(fbc);
+    if (safeFbp) userData.fbp = safeFbp;
+    if (safeFbc) userData.fbc = safeFbc;
+
+    const customData = {};
+    if (Number.isFinite(value)) customData.value = Number(value.toFixed(2));
+    if (typeof currency === 'string' && currency.trim()) customData.currency = currency.trim().toUpperCase();
+
+    const resolvedEventId = metaSafeEventId(eventId);
+    const payload = {
+      data: [{
+        event_name: eventName,
+        event_time: Number.isFinite(eventTime) ? Math.floor(eventTime) : Math.floor(Date.now() / 1000),
+        event_id: resolvedEventId,
+        action_source: 'website',
+        ...(typeof eventSourceUrl === 'string' && eventSourceUrl ? { event_source_url: eventSourceUrl } : {}),
+        // HASHED EMAIL + THE TWO META COOKIE IDS, and nothing else. No name, no IP, no
+        // user agent, no external_id, and nothing from the fitness side of the product —
+        // no goal, weight, measurement, plan, session or any other health or training
+        // data. Keep it that way.
+        //
+        // fbp/fbc are Meta's OWN identifiers, written by Meta's own pixel script, and
+        // carry nothing about the person beyond "this browser, this ad click". They are
+        // sent UNHASHED because Meta requires that — hashing them would break matching.
+        // Absent on any request that did not forward them, which is every request from a
+        // page where the pixel never loaded.
+        user_data: userData,
+        ...(Object.keys(customData).length ? { custom_data: customData } : {}),
+      }],
+      // Token in the BODY, not the query string, so it cannot land in a URL log.
+      access_token: META_CONVERSIONS_TOKEN,
+    };
+
+    const r = await fetch(`https://graph.facebook.com/${META_API_VERSION}/${META_PIXEL_ID}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) {
+      // Read as text, not json: Meta's error bodies are not always JSON, and a parse
+      // failure here would throw away the status code that actually explains the failure.
+      const body = await r.text().catch(() => '');
+      console.error('[meta] Send failed:', r.status, eventName, body.slice(0, 500));
+      return false;
+    }
+    console.log('[meta]', eventName, 'sent ✓ event_id:', resolvedEventId);
+    return true;
+  } catch (err) {
+    console.error('[meta] Exception:', eventName, err.message);
+    return false;
+  }
+}
+
 // ── MIDDLEWARE ─────────────────────────────────
 const corsOptions = {
   origin: (origin, callback) => {
@@ -1440,6 +1624,86 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         break;
       }
     }
+
+    // ── META: Purchase (fire-and-forget) ─────────────────────────────────────────────
+    // PLACED AFTER THE ENTIRE SWITCH, ON PURPOSE, AND IT CHANGES NOTHING ABOVE IT.
+    // Every entitlement write inside checkout.session.completed — the coach plan update,
+    // the lifetime update, the subscription activation — throws on error so the event is
+    // left UNMARKED for Stripe's retry. Reaching this line therefore PROVES the
+    // entitlement write for this event succeeded. Nothing here can reorder, delay or
+    // interrupt those writes: there is no await, the sender cannot throw or reject, and a
+    // Meta outage or a 400 from Graph is caught and logged inside metaSendEvent. So a
+    // Meta failure can never prevent the profile update, block the idempotency marker
+    // below, or turn this 200 into a 500. The ordering fix documented at the top of this
+    // handler is untouched, as is the in-flight guard and both dedup markers.
+    //
+    // THIS IS THE CONVERSION THE BROWSER CANNOT SEE. Payment completes on Stripe's
+    // domain, so no pixel Purchase exists to deduplicate against — which is exactly why
+    // event_id is the STRIPE EVENT ID. It is stable across Stripe's own retries, so a
+    // redelivered webhook re-sends an identical event_id and Meta collapses it instead of
+    // double-counting revenue.
+    if (event.type === 'checkout.session.completed') {
+      const mSession = event.data.object || {};
+      const mAmountMinor = mSession.amount_total;
+      // amount_total is in the currency's SMALLEST unit. All four SUPPORTED_CURRENCIES
+      // (chf/eur/gbp/usd) are two-decimal, so /100 is correct for every one of them.
+      // Revisit this line if a zero-decimal currency (JPY, KRW) is ever added.
+      //
+      // STRICTLY > 0. A zero-total session is a no-card trial start or a setup-mode
+      // session, not revenue; reporting it as a Purchase would pad the conversion that
+      // drives ad optimisation with sales that never happened.
+      if (Number.isFinite(mAmountMinor) && mAmountMinor > 0 && mSession.currency) {
+        metaSendEvent('Purchase', {
+          email: mSession.customer_details?.email || mSession.customer_email || null,
+          eventId: event.id,
+          eventTime: event.created,
+          value: mAmountMinor / 100,
+          currency: mSession.currency,
+        });
+      } else {
+        console.log('[meta] Purchase skipped — no paid amount on session', mSession.id);
+      }
+    }
+
+    // ── WHY THERE IS NO Purchase ON invoice.payment_succeeded ────────────────────────
+    // A handler for it was written, tested and then deliberately REMOVED. Do not add one
+    // back without reading this, because the obvious version double-counts revenue.
+    //
+    // 1. IT WOULD REPORT THE SAME PAYMENT TWICE. Stripe fires invoice.payment_succeeded
+    //    on the first payment of a NEW subscription, with billing_reason
+    //    'subscription_create' — the identical payment the block above already reported
+    //    from the session. The two carry different event_ids, so Meta cannot collapse
+    //    them: every new subscriber would count as two Purchases at double the revenue.
+    //
+    // 2. THERE IS NOTHING LEFT FOR IT TO CATCH. Purchase is scoped to ACQUISITION only
+    //    (decision, 2026-09-03). Every FORGE subscription is born in a Checkout Session —
+    //    there is no stripe.subscriptions.create, no invoices.create and no invoices.pay
+    //    anywhere in this file — so checkout.session.completed already sees every
+    //    acquisition. Renewals ('subscription_cycle') are retention, not acquisition, and
+    //    are deliberately NOT reported: a renewal falls outside Meta's 7-day-click window
+    //    so it never attributes to a campaign, but it would still inflate the Purchase
+    //    totals and the ROAS column that ad spend is judged against. Proration
+    //    ('subscription_update') is expansion revenue, also not acquisition.
+    //
+    // 3. "FUTURE-PROOFING" IS THE TRAP. The tempting reason to keep an inert handler is a
+    //    future Stripe-side trial — but a trial conversion arrives as 'subscription_cycle',
+    //    indistinguishable from a renewal, so a renewals-off handler skips it anyway. It
+    //    would protect nothing while leaving a live path into Purchase guarded by a single
+    //    string comparison. That trade is all downside.
+    //
+    // FORGE's 7-day trial is APP-SIDE (profiles.trial_ends_at), not a Stripe trial: there
+    // is no trial_period_days in this file, and the card is collected only after the trial
+    // expires (see /api/coach/create-checkout). So a trial user who converts pays through
+    // Checkout like anyone else and is already reported above. Verified 2026-09-03.
+    //
+    // WHEN THIS SHOULD COME BACK: if trial_period_days is ever added to a Checkout
+    // Session, acquisition moves off checkout.session.completed and onto the first
+    // 'subscription_cycle' invoice — and that invoice must then be distinguished from a
+    // renewal, which billing_reason alone cannot do. Solve that first, or the same
+    // double-count returns wearing different clothes.
+    //
+    // invoice.payment_succeeded needs no entry in the switch above either; it is not
+    // enabled on the Stripe webhook endpoint, and it should stay that way.
 
     // ── MARK PROCESSED — only now that the work above has succeeded ──────────────────
     // Deliberately AFTER the switch. If anything above threw we fall to the catch, do NOT
@@ -2201,6 +2465,29 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
         }
       }
     }
+
+    // ── META: CompleteRegistration (fire-and-forget) ────────────────────────────────
+    // Deliberately at the single success exit. Every return above this point is a
+    // REJECTED signup — 400 on missing fields, bad email, short password or absent
+    // consent; 409 on a duplicate account — and none of those may report a conversion.
+    //
+    // event_id comes from the browser pixel via the request body, so it is CLIENT DATA
+    // and is validated inside metaSendEvent (metaSafeEventId): an absent, malformed or
+    // oversized value is replaced with a fresh server-generated UUID, so the event
+    // ALWAYS fires and the only thing lost is the browser/server dedup match for it.
+    // Not awaited — Meta can neither delay nor fail this response.
+    //
+    // fbp/fbc travel in the BODY because they cannot travel any other way: both are
+    // first-party cookies on the FRONTEND's domain, and this API is a different origin,
+    // so they are never attached to this request's Cookie header no matter what CORS
+    // allows. The landing pages read document.cookie and post them (metaBrowserIds()).
+    // Validated in metaSendEvent and omitted if malformed — never substituted.
+    metaSendEvent('CompleteRegistration', {
+      email,
+      eventId: req.body?.event_id,
+      fbp: req.body?.fbp,
+      fbc: req.body?.fbc,
+    });
 
     // Return success — user must confirm email before logging in
     res.json({ requires_confirmation: true, email });
